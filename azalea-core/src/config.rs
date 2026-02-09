@@ -1,6 +1,17 @@
-use std::{path::PathBuf, time::Duration};
+//! Central configuration schema for the core media pipeline.
+//!
+//! Prioritizes explicit limits over auto-tuning to make operational behavior predictable.
+//!
+//! Keep validation centralized to avoid duplicated guardrails in each stage.
+//! After validation, runtime checks can assume limits (timeouts, upload caps) are sane.
+//!
+//! Timeouts are non-zero and bounded (see `validate_timeout`).
+//! Upload size caps never exceed Discord's hard limit.
+//!
+//! Avoids runtime mutation; settings are treated as read-only after startup.
 
 use serde::Deserialize;
+use std::{path::PathBuf, time::Duration};
 
 /// User agent string for outgoing HTTP requests.
 pub const USER_AGENT: &str = "Azalea (https://github.com/yehezkieldio/azalea)";
