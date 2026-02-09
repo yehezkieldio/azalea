@@ -1,0 +1,258 @@
+//! Temp file lifecycle management for pipeline stages.
+//!
+//! ## Concurrency assumptions
+//! Cleanup runs on a background task, but drop handlers may also fall back to
+//! synchronous deletion if the queue is saturated.
+//!
+//! ## Trade-off acknowledgment
+//! We favor eventual cleanup over strict ordering; this avoids blocking hot
+//! pipeline paths on filesystem operations.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
+use tokio::sync::{Mutex, mpsc, watch};
+
+const CLEANUP_CHANNEL_CAPACITY: usize = 10_000;
+const CLEANUP_DRAIN_TIMEOUT_SECS: u64 = 5;
+
+/// Async temp file cleanup manager.
+///
+/// ## Invariants
+/// - Cleanup queue capacity is bounded (`CLEANUP_CHANNEL_CAPACITY`).
+/// - A shutdown signal drains pending work up to a deadline.
+#[derive(Clone, Debug)]
+pub struct TempFileCleanup {
+    inner: Arc<TempFileCleanupInner>,
+}
+
+#[derive(Debug)]
+struct TempFileCleanupInner {
+    tx: mpsc::Sender<PathBuf>,
+    cancel: watch::Sender<bool>,
+    join_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl TempFileCleanup {
+    /// Start the background cleanup task and its control channels.
+    ///
+    /// ## Rationale
+    /// Centralizes cleanup so pipeline code can rely on RAII guards.
+    pub fn new() -> Self {
+        let (tx, mut rx) = mpsc::channel::<PathBuf>(CLEANUP_CHANNEL_CAPACITY);
+        let (cancel, mut cancel_rx) = watch::channel(false);
+
+        let join_handle = match Handle::try_current() {
+            Ok(handle) => Some(handle.spawn(async move {
+                let mut draining = false;
+                loop {
+                    tokio::select! {
+                        _ = cancel_rx.changed(), if !draining => {
+                            if *cancel_rx.borrow() {
+                                // Stop accepting new paths and switch to draining mode.
+                                draining = true;
+                                rx.close();
+                                break;
+                            }
+                        }
+                        maybe_path = rx.recv(), if !draining => {
+                            match maybe_path {
+                                Some(path) => remove_path_async(&path).await,
+                                None => break,
+                            }
+                        }
+                    }
+                }
+
+                if draining {
+                    let deadline = Instant::now() + Duration::from_secs(CLEANUP_DRAIN_TIMEOUT_SECS);
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+
+                        match tokio::time::timeout(remaining, rx.recv()).await {
+                            // Drain queued paths until timeout or channel closes.
+                            Ok(Some(path)) => remove_path_async(&path).await,
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                tracing::debug!("Cleanup task shutting down");
+            })),
+            Err(_) => {
+                // No runtime available: drop receiver to force sync cleanup in guards.
+                drop(rx);
+                None
+            }
+        };
+
+        Self {
+            inner: Arc::new(TempFileCleanupInner {
+                tx,
+                cancel,
+                join_handle: Mutex::new(join_handle),
+            }),
+        }
+    }
+
+    /// Return a guard that schedules the path for deletion on drop.
+    ///
+    /// ## Postconditions
+    /// The returned guard is responsible for deleting `path` when dropped.
+    pub fn guard(&self, path: PathBuf) -> TempFileGuard {
+        TempFileGuard {
+            path,
+            tx: self.inner.tx.clone(),
+        }
+    }
+
+    /// Signal the cleanup task to shut down and await its completion.
+    ///
+    /// ## Edge-case handling
+    /// Shutdown drains queued paths up to a bounded timeout to avoid hang.
+    pub async fn shutdown(&self) {
+        let _ = self.inner.cancel.send(true);
+        if let Some(handle) = self.inner.join_handle.lock().await.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Default for TempFileCleanup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII guard that removes a temporary file when dropped.
+///
+/// ## Invariant-preserving notes
+/// Dropping a guard is idempotent; missing paths are ignored.
+#[derive(Debug)]
+pub struct TempFileGuard {
+    path: PathBuf,
+    tx: mpsc::Sender<PathBuf>,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.path.as_os_str().is_empty() {
+            return;
+        }
+
+        // Fall back to synchronous deletion when the cleanup queue is saturated.
+        if self.tx.try_send(self.path.clone()).is_err() {
+            // Synchronous delete keeps temp dirs bounded even under backpressure.
+            remove_path_sync(&self.path);
+        }
+    }
+}
+
+/// Perform synchronous cleanup of temp directory on shutdown.
+///
+/// ## Explicit non-goals
+/// This does not retry failures; it is a best-effort cleanup pass.
+///
+/// This is best-effort and intentionally ignores missing files.
+pub fn cleanup_temp_dir_sync(temp_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(path = %path.display(), error = %e, "Failed to cleanup temp file");
+                }
+            } else if path.is_dir()
+                && let Err(e) = std::fs::remove_dir_all(&path)
+            {
+                tracing::warn!(path = %path.display(), error = %e, "Failed to cleanup temp dir");
+            }
+        }
+    }
+}
+
+/// Remove temp entries older than the supplied age threshold.
+///
+/// ## Trade-off acknowledgment
+/// Best-effort cleanup; failures are logged and ignored.
+pub fn cleanup_temp_dir_older_than(temp_dir: &Path, max_age: Duration) -> usize {
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+
+    let Ok(entries) = std::fs::read_dir(temp_dir) else {
+        return 0;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "Failed to stat temp entry");
+                continue;
+            }
+        };
+
+        let modified = match metadata.modified() {
+            Ok(time) => time,
+            Err(_) => continue,
+        };
+
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if age < max_age {
+            continue;
+        }
+
+        let result = if metadata.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+
+        match result {
+            Ok(()) => {
+                removed += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "Failed to remove stale temp entry");
+            }
+        }
+    }
+
+    removed
+}
+
+async fn remove_path_async(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => {
+            if let Err(e) = tokio::fs::remove_dir_all(path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::trace!(path = %path.display(), error = %e, "TempFile cleanup failed");
+            }
+        }
+        Err(e) => {
+            tracing::trace!(path = %path.display(), error = %e, "TempFile cleanup failed");
+        }
+    }
+}
+
+fn remove_path_sync(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
