@@ -14,3 +14,6 @@ workspace = true
 anyhow = { workspace = true }
 serde = { workspace = true }
 schemars = { workspace = true, optional = true }
+regex = "1.12.3"
+smallvec = "1.15.1"
+tracing = { workspace = true }
