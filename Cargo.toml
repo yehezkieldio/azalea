@@ -1,32 +1,16 @@
 [workspace]
-members = [
-    "azalea",
-    "azalea-core",
-]
+members = ["azalea", "azalea-core"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
-panic = "abort"
-overflow-checks = true
-
-[profile.dev]
-opt-level = 0
-debug = true
-split-debuginfo = "unpacked"
-
-[profile.test]
-opt-level = 1
-
-[profile.dev.package."*"]
-opt-level = 2
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
 
 [workspace.lints.rust]
 # Use '#[allow(unsafe_code)]' and a mandatory 'Safety' comment
@@ -77,3 +61,22 @@ indexing_slicing = "warn"
 
 # Warns if a function returns Result/Option but never fails.
 unnecessary_wraps = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+overflow-checks = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+
+[profile.test]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
