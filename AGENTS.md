@@ -155,6 +155,42 @@ You are allowed and expected to:
 
 Stability is secondary to **correctness, clarity, and performance**.
 
+## Comment Hygiene
+
+Comments are part of the **semantic contract**, not narration.
+
+Do **not** explain syntax, restate names, or describe obvious control flow.
+Every comment must preserve **reasoning, constraints, or invariants** that would otherwise be lost during refactor.
+
+Add comments **only when at least one is true**:
+
+- The code enforces a non-obvious invariant or business rule
+- Correctness depends on ordering, coupling, or hidden assumptions
+- Refactoring this without context would likely introduce bugs
+- There is a safety, soundness, concurrency, or security implication
+- Performance depends on structure, data layout, or algorithm choice
+- An alternative was considered and deliberately rejected
+
+Prefer comments that explain **why**, **why not**, or **what must never change**, not *what happens*.
+
+### Placement Rules
+
+- Module-level: purpose, boundaries, non-goals, data flow
+- Function-level: preconditions, postconditions, invariants
+- Inline: only on load-bearing expressions, branches, or transformations
+- `unsafe`: mandatory justification and soundness conditions
+- Hot paths: mark and explain performance sensitivity
+
+### Prohibitions
+
+- No overcommenting
+- No speculative or “future work” comments
+- No comments that duplicate type information
+- No high-level restatement where local reasoning is needed
+
+**Heuristic**:
+If a competent Rust engineer unfamiliar with this code could safely refactor it without this comment, the comment does not belong.
+
 ## Philosophy
 
 Write Rust that reads like Rust.
