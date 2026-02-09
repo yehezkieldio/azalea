@@ -1,3 +1,9 @@
+//! Media helpers for parsing URLs and managing temporary files.
+//!
+//! ## Terminology
+//! - **Tweet link**: A normalized representation of an X/Twitter status URL.
+//! - **Temp guard**: RAII token that schedules cleanup on drop.
+
 pub mod tempfile;
 pub mod url;
 
