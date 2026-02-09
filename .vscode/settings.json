@@ -1,0 +1,12 @@
+{
+    "[rust]": {
+        "editor.formatOnSave": true,
+        "editor.inlayHints.enabled": "off"
+    },
+    "[json]": {
+        "editor.formatOnSave": true
+    },
+    "[toml]": {
+        "editor.formatOnSave": true
+    }
+}
