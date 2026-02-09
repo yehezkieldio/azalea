@@ -67,8 +67,8 @@ unnecessary_wraps = "warn"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 4
 strip = true
 panic = "abort"
 overflow-checks = true
