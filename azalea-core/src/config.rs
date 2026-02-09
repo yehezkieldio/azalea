@@ -1,14 +1,24 @@
-//! Central configuration schema for the core media pipeline.
+//! Central configuration schema for the core media engine.
 //!
-//! Prioritizes explicit limits over auto-tuning to make operational behavior predictable.
+//! ## Preconditions & postconditions
+//! - [`EngineSettings::validate`] must succeed before starting the engine.
+//! - After validation, runtime checks can assume limits (timeouts, upload caps) are sane.
 //!
-//! Keep validation centralized to avoid duplicated guardrails in each stage.
-//! After validation, runtime checks can assume limits (timeouts, upload caps) are sane.
+//! ## Invariants
+//! - Timeouts are non-zero and bounded (see `validate_timeout`).
+//! - Upload size caps never exceed Discord's hard limits.
 //!
-//! Timeouts are non-zero and bounded (see `validate_timeout`).
-//! Upload size caps never exceed Discord's hard limit.
+//! ## Design rationale & trade-offs
+//! - Keeps validation centralized to avoid duplicate guardrails in each stage.
+//! - Prioritizes explicit limits over auto-tuning to make operational behavior predictable.
 //!
-//! Avoids runtime mutation; settings are treated as read-only after startup.
+//! ## Rejected alternatives
+//! - Per-stage validation: rejected to avoid redundant checks and drift.
+//! - Auto-scaling limits: rejected to keep operational behavior deterministic.
+//!
+//! ## Non-goals
+//! - This module does **not** load environment variables directly; callers should do that.
+//! - It avoids runtime mutation; settings are treated as read-only after startup.
 
 use serde::Deserialize;
 use std::{path::PathBuf, time::Duration};
@@ -212,11 +222,14 @@ impl TranscodeSettings {
     /// Compute a thread budget that avoids over-subscribing CPU when multiple
     /// transcodes run concurrently.
     ///
+    /// ## Rationale
     /// Balances throughput with CPU contention by scaling per-task threads to
     /// the configured transcode concurrency.
     ///
+    /// ## Concurrency assumptions
     /// Callers should ensure `transcode_concurrency >= 1` (validated upstream).
     ///
+    /// ## Trade-off acknowledgment
     /// This favors predictable latency over squeezing maximum single-task speed.
     pub fn effective_ffmpeg_threads(&self, transcode_concurrency: u32) -> u32 {
         if self.ffmpeg_threads > 0 {
@@ -289,14 +302,18 @@ pub struct EngineSettings {
 impl EngineSettings {
     /// Validate configuration values and enforce hard safety limits.
     ///
-    /// Values are already deserialized into structured types.
+    /// ## Preconditions
+    /// - Values are already deserialized into structured types.
     ///
-    /// All numeric limits are within safe, documented ranges.
-    /// Timeouts are non-zero and bounded by a sane upper limit.
+    /// ## Postconditions
+    /// - All numeric limits are within safe, documented ranges.
+    /// - Timeouts are non-zero and bounded by a sane upper limit.
     ///
-    /// Discord upload size caps are enforced here to prevent runtime surprises.
+    /// ## Business rules
+    /// - Discord upload size caps are enforced here to prevent runtime surprises.
     ///
-    /// Some bounds are clamped via `bail!` rather than silently adjusted.
+    /// ## Non-obvious behavior
+    /// - Some bounds are clamped via `bail!` rather than silently adjusted.
     pub fn validate(&self) -> anyhow::Result<()> {
         let concurrency = &self.concurrency;
         if concurrency.pipeline == 0
