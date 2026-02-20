@@ -1,3 +1,4 @@
+mod disk;
 pub mod errors;
 mod ssrf;
 pub mod types;
