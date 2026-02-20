@@ -15,6 +15,15 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 schemars = { workspace = true, optional = true }
 regex = "1.12.3"
+reqwest = { version = "0.12", default-features = false, features = [
+    "brotli",
+    "deflate",
+    "gzip",
+    "json",
+    "rustls-tls",
+    "http2",
+    "stream",
+] }
 smallvec = "1.15.1"
 tracing = { workspace = true }
 tokio = { workspace = true, features = [

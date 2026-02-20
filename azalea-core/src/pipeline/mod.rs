@@ -1,4 +1,5 @@
 pub mod errors;
+mod ssrf;
 pub mod types;
 
 pub use errors::Error;
