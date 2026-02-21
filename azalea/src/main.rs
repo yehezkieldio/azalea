@@ -403,7 +403,8 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
 
             async {
                 let reply_message_id =
-                    discord::send_processing(&app.discord, job.channel_id, job.message_id).await;
+                    discord::send_processing(&app.discord, job.channel_id, job.source_message_id)
+                        .await;
 
                 let (progress_tx, progress_rx) = mpsc::channel(10);
                 let progress_updater = if let Some(msg_id) = reply_message_id {
@@ -473,9 +474,13 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
 
                 match outcome {
                     Ok(outcome) => {
-                        if let Err(e) =
-                            discord::delete_original(&app.discord, job.channel_id, job.message_id)
-                                .await
+                        if let Some(source_message_id) = job.source_message_id
+                            && let Err(e) = discord::delete_original(
+                                &app.discord,
+                                job.channel_id,
+                                source_message_id,
+                            )
+                            .await
                         {
                             tracing::warn!(error = %e, "Failed to delete original message");
                         }

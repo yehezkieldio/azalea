@@ -6,9 +6,16 @@
 
 use crate::app::App;
 use crate::config::ApplicationId;
+use crate::pipeline::{Job, RequestId};
+use azalea_core::media;
 use azalea_core::storage::Stage;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::sync::mpsc;
 use twilight_http::Client;
+use twilight_model::application::interaction::application_command::{
+    CommandDataOption, CommandOptionValue,
+};
 use twilight_model::application::command::CommandType;
 use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::channel::message::MessageFlags;
@@ -16,7 +23,7 @@ use twilight_model::http::interaction::{InteractionResponse, InteractionResponse
 use twilight_model::id::Id;
 use twilight_model::id::marker::InteractionMarker;
 use twilight_util::builder::InteractionResponseDataBuilder;
-use twilight_util::builder::command::{CommandBuilder, SubCommandBuilder};
+use twilight_util::builder::command::{CommandBuilder, StringBuilder, SubCommandBuilder};
 
 /// Register global slash commands for this application.
 ///
@@ -36,7 +43,16 @@ pub async fn register(client: &Client, application_id: ApplicationId) -> anyhow:
 ///
 /// ## Preconditions
 /// - Interaction data must be a command payload with name `azalea`.
-pub async fn handle_interaction(app: &App, interaction: Interaction) -> anyhow::Result<()> {
+pub async fn handle_interaction(
+    app: &App,
+    interaction: Interaction,
+    job_sender: &mpsc::Sender<Job>,
+) -> anyhow::Result<()> {
+    let interaction_id = interaction.id;
+    let token = interaction.token.clone();
+    let channel_id = interaction.channel.as_ref().map(|channel| channel.id);
+    let author_id = interaction.author_id();
+
     let Some(data) = interaction.data else {
         return Ok(());
     };
@@ -49,13 +65,19 @@ pub async fn handle_interaction(app: &App, interaction: Interaction) -> anyhow::
         return Ok(());
     }
 
-    let subcommand = command_data
-        .options
-        .first()
-        .map(|opt| opt.name.as_str())
-        .unwrap_or("status");
+    let (subcommand, options) = match command_data.options.first() {
+        Some(option) => match &option.value {
+            CommandOptionValue::SubCommand(options) => (option.name.as_str(), options.as_slice()),
+            _ => ("status", &[] as &[CommandDataOption]),
+        },
+        None => ("status", &[] as &[CommandDataOption]),
+    };
 
     let content = match subcommand {
+        "media" => {
+            handle_media_command(app, channel_id, author_id, interaction_id, options, job_sender)
+                .await
+        }
         "stats" => format_stats(app),
         "config" => format_config(app),
         _ => format_status(app).await,
@@ -75,8 +97,8 @@ pub async fn handle_interaction(app: &App, interaction: Interaction) -> anyhow::
     respond(
         &app.discord,
         app.config.application_id.get(),
-        interaction.id,
-        &interaction.token,
+        interaction_id,
+        &token,
         response,
     )
     .await?;
@@ -86,6 +108,10 @@ pub async fn handle_interaction(app: &App, interaction: Interaction) -> anyhow::
 
 fn build_commands() -> Vec<twilight_model::application::command::Command> {
     let command = CommandBuilder::new("azalea", "Azalea commands", CommandType::ChatInput)
+        .option(
+            SubCommandBuilder::new("media", "Process a tweet URL")
+                .option(StringBuilder::new("url", "Tweet URL to process").required(true)),
+        )
         .option(SubCommandBuilder::new("status", "Show bot status"))
         .option(SubCommandBuilder::new("stats", "Show pipeline statistics"))
         .option(SubCommandBuilder::new(
@@ -95,6 +121,81 @@ fn build_commands() -> Vec<twilight_model::application::command::Command> {
         .build();
 
     vec![command]
+}
+
+async fn handle_media_command(
+    app: &App,
+    channel_id: Option<Id<twilight_model::id::marker::ChannelMarker>>,
+    author_id: Option<Id<twilight_model::id::marker::UserMarker>>,
+    interaction_id: Id<InteractionMarker>,
+    options: &[CommandDataOption],
+    job_sender: &mpsc::Sender<Job>,
+) -> String {
+    let Some(channel_id) = channel_id else {
+        return "This command can only be used in a channel.".to_string();
+    };
+    let Some(author_id) = author_id else {
+        return "Could not determine the command author.".to_string();
+    };
+
+    if !app.user_rate_limiter.check(author_id).await {
+        return "⏳ You're sending requests too quickly. Please slow down.".to_string();
+    }
+    if !app.channel_rate_limiter.check(channel_id).await {
+        return "⏳ This channel is receiving too many requests. Please try again later.".to_string();
+    }
+
+    let url = match options
+        .iter()
+        .find(|option| option.name == "url")
+        .and_then(|option| match &option.value {
+            CommandOptionValue::String(value) => Some(value.as_str()),
+            _ => None,
+        }) {
+        Some(url) => url,
+        None => return "Missing required URL.".to_string(),
+    };
+
+    let mut tweet_urls = media::parse_tweet_urls(url).into_iter();
+    let Some(tweet_url) = tweet_urls.next() else {
+        return "Please provide a valid tweet URL.".to_string();
+    };
+    if tweet_urls.next().is_some() {
+        return "Please provide exactly one tweet URL per command.".to_string();
+    }
+
+    if app
+        .engine
+        .dedup
+        .is_duplicate(channel_id.get(), tweet_url.tweet_id)
+        .await
+    {
+        return "That tweet was already processed recently in this channel.".to_string();
+    }
+
+    let job = Job::new(
+        RequestId(app.next_request_id()),
+        channel_id,
+        interaction_id.get(),
+        None,
+        author_id,
+        tweet_url,
+    );
+
+    let enqueue = tokio::time::timeout(
+        Duration::from_millis(app.engine.config.pipeline.queue_backpressure_timeout_ms),
+        job_sender.send(job),
+    )
+    .await;
+
+    match enqueue {
+        Ok(Ok(())) => {
+            app.queue_depth.fetch_add(1, Ordering::Relaxed);
+            "Queued for processing.".to_string()
+        }
+        Ok(Err(_)) => "Job queue is unavailable right now. Please try again later.".to_string(),
+        Err(_) => "Queue is busy right now. Please try again in a moment.".to_string(),
+    }
 }
 
 /// Issue a single interaction response and propagate errors.

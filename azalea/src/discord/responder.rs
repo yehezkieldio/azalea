@@ -26,14 +26,14 @@ use twilight_model::id::{
 pub async fn send_processing(
     client: &Client,
     channel_id: Id<ChannelMarker>,
-    reply_to: Id<MessageMarker>,
+    reply_to: Option<Id<MessageMarker>>,
 ) -> Option<Id<MessageMarker>> {
-    match client
-        .create_message(channel_id)
-        .reply(reply_to)
-        .content("Processing your tweet...")
-        .await
-    {
+    let mut request = client.create_message(channel_id);
+    if let Some(reply_to) = reply_to {
+        request = request.reply(reply_to);
+    }
+
+    match request.content("Processing your tweet...").await {
         Ok(response) => response.model().await.ok().map(|m| m.id),
         Err(e) => {
             tracing::warn!(error = %e, "Failed to send processing message");

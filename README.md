@@ -6,7 +6,7 @@
 
 ---
 
-Azalea is a Discord bot that automatically handles X (formerly Twitter) media sharing in your server. When you mention the bot with a tweet link, it detects the media, downloads it, optimizes it to fit within Discord's upload limits, and re-uploads it directly to your channel.
+Azalea is a Discord bot that automatically handles X (formerly Twitter) media sharing in your server. Use `/azalea media <url>` with a tweet link, and it will detect the media, download it, optimize it to fit within Discord's upload limits, and re-upload it directly to your channel.
 
 ## License
 

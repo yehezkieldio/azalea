@@ -23,7 +23,8 @@ use twilight_model::id::{
 pub struct Job {
     pub request_id: RequestId,
     pub channel_id: Id<ChannelMarker>,
-    pub message_id: Id<MessageMarker>,
+    pub trigger_id: u64,
+    pub source_message_id: Option<Id<MessageMarker>>,
     pub author_id: Id<UserMarker>,
     pub tweet_url: TweetLink,
 }
@@ -33,14 +34,16 @@ impl Job {
     pub fn new(
         request_id: RequestId,
         channel_id: Id<ChannelMarker>,
-        message_id: Id<MessageMarker>,
+        trigger_id: u64,
+        source_message_id: Option<Id<MessageMarker>>,
         author_id: Id<UserMarker>,
         tweet_url: TweetLink,
     ) -> Self {
         Self {
             request_id,
             channel_id,
-            message_id,
+            trigger_id,
+            source_message_id,
             author_id,
             tweet_url,
         }
@@ -54,7 +57,7 @@ impl Job {
         CoreJob::new(
             self.request_id,
             self.channel_id.get(),
-            self.message_id.get(),
+            self.trigger_id,
             self.tweet_url.clone(),
         )
     }
