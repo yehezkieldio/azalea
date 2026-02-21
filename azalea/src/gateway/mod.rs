@@ -8,3 +8,6 @@
 pub mod dispatch;
 pub mod event;
 pub mod resume;
+
+pub use dispatch::run;
+pub use resume::{restore, save};
