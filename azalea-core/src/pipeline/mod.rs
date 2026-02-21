@@ -2,6 +2,7 @@ mod disk;
 pub mod download;
 pub mod errors;
 pub mod ffmpeg;
+pub mod optimize;
 mod process;
 pub mod quality;
 pub mod resolve;
