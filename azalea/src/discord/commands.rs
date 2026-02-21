@@ -23,7 +23,7 @@ use twilight_model::http::interaction::{InteractionResponse, InteractionResponse
 use twilight_model::id::Id;
 use twilight_model::id::marker::InteractionMarker;
 use twilight_util::builder::InteractionResponseDataBuilder;
-use twilight_util::builder::command::{CommandBuilder, StringBuilder, SubCommandBuilder};
+use twilight_util::builder::command::{CommandBuilder, StringBuilder};
 
 /// Register global slash commands for this application.
 ///
@@ -39,10 +39,10 @@ pub async fn register(client: &Client, application_id: ApplicationId) -> anyhow:
     Ok(())
 }
 
-/// Handle application commands for the `/azalea` namespace.
+/// Handle application commands.
 ///
 /// ## Preconditions
-/// - Interaction data must be a command payload with name `azalea`.
+/// - Interaction data must be a chat-input command payload.
 pub async fn handle_interaction(
     app: &App,
     interaction: Interaction,
@@ -61,26 +61,22 @@ pub async fn handle_interaction(
         return Ok(());
     };
 
-    if command_data.name != "azalea" {
-        return Ok(());
-    }
-
-    let (subcommand, options) = match command_data.options.first() {
-        Some(option) => match &option.value {
-            CommandOptionValue::SubCommand(options) => (option.name.as_str(), options.as_slice()),
-            _ => ("status", &[] as &[CommandDataOption]),
-        },
-        None => ("status", &[] as &[CommandDataOption]),
-    };
-
-    let content = match subcommand {
+    let content = match command_data.name.as_str() {
         "media" => {
-            handle_media_command(app, channel_id, author_id, interaction_id, options, job_sender)
-                .await
+            handle_media_command(
+                app,
+                channel_id,
+                author_id,
+                interaction_id,
+                command_data.options.as_slice(),
+                job_sender,
+            )
+            .await
         }
         "stats" => format_stats(app),
         "config" => format_config(app),
-        _ => format_status(app).await,
+        "status" => format_status(app).await,
+        _ => return Ok(()),
     };
 
     // Ephemeral responses keep status/config details from cluttering channels.
@@ -107,20 +103,15 @@ pub async fn handle_interaction(
 }
 
 fn build_commands() -> Vec<twilight_model::application::command::Command> {
-    let command = CommandBuilder::new("azalea", "Azalea commands", CommandType::ChatInput)
-        .option(
-            SubCommandBuilder::new("media", "Process a tweet URL")
-                .option(StringBuilder::new("url", "Tweet URL to process").required(true)),
-        )
-        .option(SubCommandBuilder::new("status", "Show bot status"))
-        .option(SubCommandBuilder::new("stats", "Show pipeline statistics"))
-        .option(SubCommandBuilder::new(
-            "config",
-            "Show configuration summary",
-        ))
-        .build();
-
-    vec![command]
+    vec![
+        CommandBuilder::new("media", "Process a tweet URL", CommandType::ChatInput)
+            .option(StringBuilder::new("url", "Tweet URL to process").required(true))
+            .build(),
+        CommandBuilder::new("status", "Show bot status", CommandType::ChatInput).build(),
+        CommandBuilder::new("stats", "Show pipeline statistics", CommandType::ChatInput).build(),
+        CommandBuilder::new("config", "Show configuration summary", CommandType::ChatInput)
+            .build(),
+    ]
 }
 
 async fn handle_media_command(
