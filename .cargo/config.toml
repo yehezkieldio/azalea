@@ -1,6 +1,3 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
-
 [target.'cfg(target_os = "linux")']
 linker = "clang"
 rustflags = [
