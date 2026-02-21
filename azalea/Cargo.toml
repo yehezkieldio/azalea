@@ -19,7 +19,7 @@ schemars = ["dep:schemars", "azalea-core/schemars"]
 [dependencies]
 anyhow = { workspace = true }
 azalea-core = { path = "../azalea-core" }
-dotenvy = "0.15.7"
+figment = { version = "0.10", features = ["toml"] }
 mimalloc = "0.1.48"
 moka = { workspace = true }
 serde = { workspace = true }
@@ -38,7 +38,6 @@ tokio-util = { version = "0.7", default-features = false, features = [
     "rt",
     "io",
 ] }
-toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",

@@ -12,12 +12,19 @@
 //! - TOML spec: <https://toml.io/en/>
 
 use azalea_core::config::EngineSettings;
+use figment::{
+    Figment,
+    providers::{Format, Serialized, Toml},
+};
 use serde::Deserialize;
+use serde_json::{Map, Number, Value};
+use std::fmt;
 use std::time::Duration;
 use twilight_model::id::{Id, marker::ApplicationMarker};
 
 /// Default configuration file path.
 const CONFIG_FILE: &str = "azalea.config.toml";
+const DOTENV_FILE: &str = ".env";
 
 /// Application ID wrapper for type safety.
 ///
@@ -51,6 +58,44 @@ impl<'de> Deserialize<'de> for ApplicationId {
         }
         Ok(Self::new(raw))
     }
+}
+
+/// Secret token used to authenticate with Discord.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct DiscordToken(Box<str>);
+
+impl DiscordToken {
+    pub fn new(value: String) -> Self {
+        Self(value.into_boxed_str())
+    }
+
+    #[cfg(test)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0.into()
+    }
+}
+
+impl fmt::Debug for DiscordToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DiscordToken(<redacted>)")
+    }
+}
+
+/// Auth-only settings loaded from environment sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthConfig {
+    pub discord_token: DiscordToken,
+}
+
+/// Fully loaded startup configuration.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub app: AppConfig,
+    pub auth: AuthConfig,
 }
 
 /// Runtime configuration.
@@ -104,34 +149,33 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Load configuration from the config file, falling back to defaults.
+    /// Load configuration from file + env sources using figment layering.
     ///
-    /// ## Edge-case handling
-    /// Missing config files fall back to defaults, but validation still applies.
-    pub fn load() -> anyhow::Result<Self> {
-        let mut config = match std::fs::read_to_string(CONFIG_FILE) {
+    /// Merge order (low → high):
+    /// 1. `azalea.config.toml`
+    /// 2. `.env`
+    /// 3. process environment
+    pub fn load() -> anyhow::Result<LoadedConfig> {
+        let config_file_contents = match std::fs::read_to_string(CONFIG_FILE) {
             Ok(contents) => {
-                let config: AppConfig = toml::from_str(&contents)?;
                 tracing::info!(path = CONFIG_FILE, "Loaded configuration");
-                config
+                Some(contents)
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!(path = CONFIG_FILE, "Config file not found, using defaults");
-                Self::default()
+                None
             }
             Err(err) => return Err(err.into()),
         };
 
-        // Allow env override for application id when the config leaves it unset.
-        if config.application_id.0 == 0
-            && let Ok(id_str) = std::env::var("APPLICATION_ID")
-            && let Ok(parsed) = id_str.parse::<u64>()
-        {
-            config.application_id = ApplicationId::new(parsed);
-        }
-
-        config.validate()?;
-        Ok(config)
+        let dotenv_entries = parse_dotenv_file(DOTENV_FILE)?;
+        let process_env = std::env::vars().collect::<Vec<_>>();
+        let sources = ConfigSources {
+            config_file_contents,
+            dotenv_entries,
+            process_env,
+        };
+        load_from_sources(sources)
     }
 
     /// Validate configuration values and enforce application constraints.
@@ -143,7 +187,9 @@ impl AppConfig {
     /// - All runtime constraints and core engine limits are satisfied.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.application_id.0 == 0 {
-            anyhow::bail!("application_id must be set (via config or APPLICATION_ID env var)");
+            anyhow::bail!(
+                "application_id must be set (via config, APPLICATION_ID, or AZALEA_APPLICATION_ID)"
+            );
         }
 
         if self.runtime.worker_threads == 0 {
@@ -171,6 +217,213 @@ impl AppConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ConfigSources {
+    config_file_contents: Option<String>,
+    dotenv_entries: Vec<(String, String)>,
+    process_env: Vec<(String, String)>,
+}
+
+fn load_from_sources(sources: ConfigSources) -> anyhow::Result<LoadedConfig> {
+    let mut figment = Figment::new();
+
+    if let Some(contents) = sources.config_file_contents {
+        figment = figment.merge(Toml::string(&contents));
+    }
+
+    if let Some(dotenv_overrides) = build_env_overrides(&sources.dotenv_entries) {
+        figment = figment.merge(Serialized::defaults(dotenv_overrides));
+    }
+
+    if let Some(process_overrides) = build_env_overrides(&sources.process_env) {
+        figment = figment.merge(Serialized::defaults(process_overrides));
+    }
+
+    let config: AppConfig = figment.extract()?;
+    config.validate()?;
+
+    let token = resolve_discord_token(&sources.dotenv_entries, &sources.process_env)?;
+    Ok(LoadedConfig {
+        app: config,
+        auth: AuthConfig {
+            discord_token: DiscordToken::new(token),
+        },
+    })
+}
+
+fn build_env_overrides(entries: &[(String, String)]) -> Option<Value> {
+    let mut root = Map::new();
+
+    for (key, raw_value) in entries {
+        let Some(path) = config_path_from_env_key(key) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+
+        let value = parse_env_scalar(raw_value);
+        insert_nested(&mut root, &path, value);
+    }
+
+    if root.is_empty() {
+        None
+    } else {
+        Some(Value::Object(root))
+    }
+}
+
+fn config_path_from_env_key(key: &str) -> Option<Vec<String>> {
+    let normalized = key.trim().to_ascii_uppercase();
+    if normalized.is_empty() || normalized == "DISCORD_TOKEN" {
+        return None;
+    }
+
+    if normalized == "APPLICATION_ID" || normalized == "AZALEA_APPLICATION_ID" {
+        return Some(vec!["application_id".to_string()]);
+    }
+
+    if let Some(suffix) = normalized.strip_prefix("AZALEA_") {
+        let shortcut = match suffix {
+            "WORKER_THREADS" => Some(vec!["runtime".to_string(), "worker_threads".to_string()]),
+            "MAX_BLOCKING_THREADS" => {
+                Some(vec!["runtime".to_string(), "max_blocking_threads".to_string()])
+            }
+            "THREAD_STACK_SIZE" => {
+                Some(vec!["runtime".to_string(), "thread_stack_size".to_string()])
+            }
+            _ => None,
+        };
+        if shortcut.is_some() {
+            return shortcut;
+        }
+
+        let parts = suffix
+            .split("__")
+            .filter(|part| !part.is_empty())
+            .map(|part| part.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            return Some(parts);
+        }
+    }
+
+    None
+}
+
+fn insert_nested(root: &mut Map<String, Value>, path: &[String], value: Value) {
+    let Some((head, tail)) = path.split_first() else {
+        return;
+    };
+
+    if tail.is_empty() {
+        root.insert(head.clone(), value);
+        return;
+    }
+
+    let entry = root
+        .entry(head.clone())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+
+    if let Value::Object(child) = entry {
+        insert_nested(child, tail, value);
+    }
+}
+
+fn parse_env_scalar(raw_value: &str) -> Value {
+    let value = raw_value.trim();
+    if value.eq_ignore_ascii_case("true") {
+        return Value::Bool(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return Value::Bool(false);
+    }
+    if let Ok(parsed) = value.parse::<i64>() {
+        return Value::Number(parsed.into());
+    }
+    if let Ok(parsed) = value.parse::<u64>() {
+        return Value::Number(parsed.into());
+    }
+    if let Ok(parsed) = value.parse::<f64>()
+        && let Some(number) = Number::from_f64(parsed)
+    {
+        return Value::Number(number);
+    }
+    Value::String(value.to_string())
+}
+
+fn parse_dotenv_file(path: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    parse_dotenv_contents(&contents)
+}
+
+fn parse_dotenv_contents(contents: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+    for (line_number, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            anyhow::bail!("Invalid .env entry at line {}", line_number + 1);
+        };
+
+        let key = raw_key.trim();
+        if key.is_empty() {
+            anyhow::bail!("Invalid .env key at line {}", line_number + 1);
+        }
+
+        let mut value = raw_value.trim().to_string();
+        if ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+            && value.len() >= 2
+        {
+            value = value[1..value.len() - 1].to_string();
+        }
+
+        entries.push((key.to_string(), value));
+    }
+    Ok(entries)
+}
+
+fn resolve_discord_token(
+    dotenv_entries: &[(String, String)],
+    process_env: &[(String, String)],
+) -> anyhow::Result<String> {
+    if let Some((_, value)) = process_env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("DISCORD_TOKEN"))
+    {
+        let token = value.trim();
+        if !token.is_empty() {
+            return Ok(token.to_string());
+        }
+        anyhow::bail!("DISCORD_TOKEN cannot be empty");
+    }
+
+    if let Some((_, value)) = dotenv_entries
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("DISCORD_TOKEN"))
+    {
+        let token = value.trim();
+        if !token.is_empty() {
+            return Ok(token.to_string());
+        }
+        anyhow::bail!("DISCORD_TOKEN cannot be empty");
+    }
+
+    anyhow::bail!("DISCORD_TOKEN must be set via environment or .env")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +435,79 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn load_precedence_defaults_toml_dotenv_env() -> anyhow::Result<()> {
+        let loaded = load_from_sources(ConfigSources {
+            config_file_contents: Some(
+                r#"
+                application_id = 11
+                [runtime]
+                worker_threads = 2
+                "#
+                .to_string(),
+            ),
+            dotenv_entries: vec![
+                ("APPLICATION_ID".to_string(), "22".to_string()),
+                ("AZALEA_RUNTIME__WORKER_THREADS".to_string(), "4".to_string()),
+                ("DISCORD_TOKEN".to_string(), "dotenv-token".to_string()),
+            ],
+            process_env: vec![
+                ("APPLICATION_ID".to_string(), "33".to_string()),
+                ("AZALEA_RUNTIME__WORKER_THREADS".to_string(), "6".to_string()),
+                ("DISCORD_TOKEN".to_string(), "env-token".to_string()),
+            ],
+        })?;
+
+        assert_eq!(loaded.app.application_id.0, 33);
+        assert_eq!(loaded.app.runtime.worker_threads, 6);
+        assert_eq!(loaded.auth.discord_token.as_str(), "env-token");
+        Ok(())
+    }
+
+    #[test]
+    fn load_supports_minimal_env_only() -> anyhow::Result<()> {
+        let loaded = load_from_sources(ConfigSources {
+            config_file_contents: None,
+            dotenv_entries: Vec::new(),
+            process_env: vec![
+                ("APPLICATION_ID".to_string(), "123456789".to_string()),
+                ("DISCORD_TOKEN".to_string(), "secret".to_string()),
+            ],
+        })?;
+
+        assert_eq!(loaded.app.application_id.0, 123456789);
+        assert_eq!(loaded.auth.discord_token.as_str(), "secret");
+        Ok(())
+    }
+
+    #[test]
+    fn load_fails_without_token() -> anyhow::Result<()> {
+        let result = load_from_sources(ConfigSources {
+            config_file_contents: Some("application_id = 123".to_string()),
+            dotenv_entries: Vec::new(),
+            process_env: Vec::new(),
+        });
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => anyhow::bail!("expected missing token error"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("DISCORD_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_dotenv_rejects_invalid_line() -> anyhow::Result<()> {
+        let result = parse_dotenv_contents("NO_EQUALS_LINE");
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => anyhow::bail!("expected dotenv parse error"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Invalid .env entry"));
+        Ok(())
     }
 }

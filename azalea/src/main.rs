@@ -30,7 +30,6 @@ use azalea_core::storage::Stage;
 use config::AppConfig;
 use mimalloc::MiMalloc;
 use std::{
-    env,
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
@@ -86,9 +85,9 @@ fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    dotenvy::dotenv().ok();
-
-    let config = AppConfig::load()?;
+    let loaded = AppConfig::load()?;
+    let token = loaded.auth.discord_token.into_inner();
+    let config = loaded.app;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.runtime.worker_threads)
@@ -97,14 +96,12 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    runtime.block_on(async_main(config))
+    runtime.block_on(async_main(config, token))
 }
 
 /// Async application bootstrap separated for testability and clearer error paths.
 ///
-/// ## Preconditions
-/// Environment variables (e.g., `DISCORD_TOKEN`) must be set by the caller.
-async fn async_main(config: AppConfig) -> anyhow::Result<()> {
+async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
     raise_fd_limit();
     let mut config = config;
     resolve_dependencies(&mut config.engine.binaries)?;
@@ -131,8 +128,6 @@ async fn async_main(config: AppConfig) -> anyhow::Result<()> {
     }
     // Initialize media regex once to avoid per-request overhead.
     media::init_regex();
-
-    let token = env::var("DISCORD_TOKEN")?;
 
     let discord = Client::builder()
         .token(token.clone())
