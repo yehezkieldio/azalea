@@ -1,4 +1,5 @@
 mod disk;
+pub mod download;
 pub mod errors;
 mod process;
 mod ssrf;

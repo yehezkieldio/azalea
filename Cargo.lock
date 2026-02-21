@@ -77,6 +77,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap",
+ "futures-util",
  "moka",
  "nix",
  "redb",
@@ -84,6 +85,7 @@ dependencies = [
  "reqwest",
  "schemars",
  "serde",
+ "serde_json",
  "smallvec",
  "tokio",
  "tracing",
