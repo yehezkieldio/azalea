@@ -1,0 +1,415 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppConfig",
+  "description": "Top-level application configuration.\n\n## Business rules\nAn application id is required, either via config file or environment.",
+  "type": "object",
+  "properties": {
+    "application_id": {
+      "$ref": "#/$defs/ApplicationId"
+    },
+    "binaries": {
+      "$ref": "#/$defs/BinarySettings"
+    },
+    "concurrency": {
+      "$ref": "#/$defs/ConcurrencySettings"
+    },
+    "http": {
+      "$ref": "#/$defs/HttpSettings"
+    },
+    "pipeline": {
+      "$ref": "#/$defs/PipelineSettings"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeConfig"
+    },
+    "storage": {
+      "$ref": "#/$defs/StorageSettings"
+    },
+    "transcode": {
+      "$ref": "#/$defs/TranscodeSettings"
+    }
+  },
+  "$defs": {
+    "ApplicationId": {
+      "description": "Application ID wrapper for type safety.\n\n## Invariants\n`0` is treated as invalid and rejected during deserialization.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "BinarySettings": {
+      "description": "External binary paths used by the pipeline.",
+      "type": "object",
+      "properties": {
+        "ffmpeg": {
+          "type": "string",
+          "default": "ffmpeg"
+        },
+        "ffprobe": {
+          "type": "string",
+          "default": "ffprobe"
+        },
+        "ytdlp": {
+          "type": "string",
+          "default": "yt-dlp"
+        }
+      }
+    },
+    "ConcurrencySettings": {
+      "description": "Concurrency configuration.",
+      "type": "object",
+      "properties": {
+        "download": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 4,
+          "minimum": 0
+        },
+        "pipeline": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 8,
+          "minimum": 0
+        },
+        "transcode": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "upload": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 2,
+          "minimum": 0
+        },
+        "ytdlp": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        }
+      }
+    },
+    "HardwareAcceleration": {
+      "description": "Hardware acceleration provider.",
+      "oneOf": [
+        {
+          "description": "Software encoding (CPU).",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "NVIDIA NVENC (NVIDIA GPUs).",
+          "type": "string",
+          "const": "nvenc"
+        },
+        {
+          "description": "VA-API (Intel/AMD on Linux).",
+          "type": "string",
+          "const": "vaapi"
+        },
+        {
+          "description": "VideoToolbox (Apple Silicon/macOS).",
+          "type": "string",
+          "const": "videotoolbox"
+        }
+      ]
+    },
+    "HttpSettings": {
+      "description": "HTTP client configuration.",
+      "type": "object",
+      "properties": {
+        "connect_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 10,
+          "minimum": 0
+        },
+        "pool_idle_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 90,
+          "minimum": 0
+        },
+        "pool_max_idle_per_host": {
+          "type": "integer",
+          "format": "uint",
+          "default": 4,
+          "minimum": 0
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        }
+      }
+    },
+    "PipelineSettings": {
+      "description": "Pipeline configuration.",
+      "type": "object",
+      "properties": {
+        "channel_rate_limit_requests": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 20,
+          "minimum": 0
+        },
+        "channel_rate_limit_window_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "download_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "max_download_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 524288000,
+          "minimum": 0
+        },
+        "min_disk_space_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 524288000,
+          "minimum": 0
+        },
+        "parallel_segment_threshold": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 4,
+          "minimum": 0
+        },
+        "queue_backpressure_timeout_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 1000,
+          "minimum": 0
+        },
+        "resolver_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 10,
+          "minimum": 0
+        },
+        "upload_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 120,
+          "minimum": 0
+        },
+        "user_rate_limit_requests": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 10,
+          "minimum": 0
+        },
+        "user_rate_limit_window_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "ytdlp_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
+          "minimum": 0
+        }
+      }
+    },
+    "QualityPreset": {
+      "description": "Quality preset for video processing.",
+      "oneOf": [
+        {
+          "description": "Prioritize speed over quality (lower resolution, higher compression).",
+          "type": "string",
+          "const": "fast"
+        },
+        {
+          "description": "Default behavior with moderate quality and processing time.",
+          "type": "string",
+          "const": "balanced"
+        },
+        {
+          "description": "Prioritize visual fidelity over processing time.",
+          "type": "string",
+          "const": "quality"
+        },
+        {
+          "description": "Aggressive compression to minimize file size.",
+          "type": "string",
+          "const": "size"
+        }
+      ]
+    },
+    "RuntimeConfig": {
+      "description": "Runtime configuration.\n\n## Constraints\nThread counts must be non-zero; stack size is clamped by validation.",
+      "type": "object",
+      "properties": {
+        "max_blocking_threads": {
+          "type": "integer",
+          "format": "uint",
+          "default": 16,
+          "minimum": 0
+        },
+        "thread_stack_size": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2097152,
+          "minimum": 0
+        },
+        "worker_threads": {
+          "type": "integer",
+          "format": "uint",
+          "default": 4,
+          "minimum": 0
+        }
+      }
+    },
+    "StorageSettings": {
+      "description": "Storage configuration.",
+      "type": "object",
+      "properties": {
+        "dedup_cache_size": {
+          "type": "integer",
+          "format": "uint",
+          "default": 1000,
+          "minimum": 0
+        },
+        "dedup_db_path": {
+          "type": "string",
+          "default": "azalea-dedup.redb"
+        },
+        "dedup_flush_interval_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "dedup_persistent": {
+          "type": "boolean",
+          "default": true
+        },
+        "dedup_ttl_hours": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 24,
+          "minimum": 0
+        },
+        "metrics_db_path": {
+          "type": "string",
+          "default": "azalea-metrics.redb"
+        },
+        "metrics_enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "resolver_cache_size": {
+          "type": "integer",
+          "format": "uint",
+          "default": 1000,
+          "minimum": 0
+        },
+        "resolver_cache_ttl_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 300,
+          "minimum": 0
+        },
+        "resolver_negative_ttl_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "temp_dir": {
+          "type": "string",
+          "default": "/tmp/azalea"
+        }
+      }
+    },
+    "TranscodeSettings": {
+      "description": "Transcoding configuration.",
+      "type": "object",
+      "properties": {
+        "audio_vbr_padding": {
+          "type": "number",
+          "format": "double",
+          "default": 1.1
+        },
+        "container_overhead_ratio": {
+          "type": "number",
+          "format": "double",
+          "default": 0.03
+        },
+        "ffmpeg_threads": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "ffmpeg_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 600,
+          "minimum": 0
+        },
+        "ffprobe_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
+          "minimum": 0
+        },
+        "hardware_acceleration": {
+          "$ref": "#/$defs/HardwareAcceleration"
+        },
+        "max_single_video_duration_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 120,
+          "minimum": 0
+        },
+        "max_upload_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 8388608,
+          "minimum": 0
+        },
+        "min_bitrate_kbps": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 400,
+          "minimum": 0
+        },
+        "quality_preset": {
+          "$ref": "#/$defs/QualityPreset"
+        },
+        "split_target_ratio": {
+          "type": "number",
+          "format": "double",
+          "default": 0.8
+        },
+        "transcode_target_ratio": {
+          "type": "number",
+          "format": "double",
+          "default": 0.85
+        },
+        "vaapi_device": {
+          "type": "string",
+          "default": "/dev/dri/renderD128"
+        },
+        "vbr_safety_margin": {
+          "type": "number",
+          "format": "double",
+          "default": 0.05
+        }
+      }
+    }
+  }
+}

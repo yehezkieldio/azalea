@@ -1,1 +1,4 @@
+.env
 target
+*.redb
+azalea-resume-info.json
