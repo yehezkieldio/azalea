@@ -298,6 +298,10 @@ fn config_path_from_env_key(key: &str) -> Option<Vec<String>> {
             return shortcut;
         }
 
+        if let Some(path) = config_path_from_single_underscore_key(suffix) {
+            return Some(path);
+        }
+
         let parts = suffix
             .split("__")
             .filter(|part| !part.is_empty())
@@ -306,6 +310,33 @@ fn config_path_from_env_key(key: &str) -> Option<Vec<String>> {
         if !parts.is_empty() {
             return Some(parts);
         }
+    }
+
+    None
+}
+
+fn config_path_from_single_underscore_key(suffix: &str) -> Option<Vec<String>> {
+    const SECTIONS: [&str; 7] = [
+        "RUNTIME",
+        "CONCURRENCY",
+        "HTTP",
+        "STORAGE",
+        "TRANSCODE",
+        "PIPELINE",
+        "BINARIES",
+    ];
+
+    for section in SECTIONS {
+        let Some(rest) = suffix.strip_prefix(section) else {
+            continue;
+        };
+        let Some(field) = rest.strip_prefix('_') else {
+            continue;
+        };
+        if field.is_empty() || field.starts_with('_') {
+            continue;
+        }
+        return Some(vec![section.to_ascii_lowercase(), field.to_ascii_lowercase()]);
     }
 
     None
@@ -496,6 +527,32 @@ mod tests {
         };
 
         assert!(err.to_string().contains("DISCORD_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_supports_single_underscore_env_paths() -> anyhow::Result<()> {
+        let loaded = load_from_sources(ConfigSources {
+            config_file_contents: Some(
+                r#"
+                application_id = 11
+                [pipeline]
+                max_download_bytes = 500
+                "#
+                .to_string(),
+            ),
+            dotenv_entries: Vec::new(),
+            process_env: vec![
+                ("APPLICATION_ID".to_string(), "123456789".to_string()),
+                (
+                    "AZALEA_PIPELINE_MAX_DOWNLOAD_BYTES".to_string(),
+                    "700".to_string(),
+                ),
+                ("DISCORD_TOKEN".to_string(), "secret".to_string()),
+            ],
+        })?;
+
+        assert_eq!(loaded.app.engine.pipeline.max_download_bytes, 700);
         Ok(())
     }
 
