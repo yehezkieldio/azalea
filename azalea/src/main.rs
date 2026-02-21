@@ -1,3 +1,4 @@
+mod app;
 mod concurrency;
 mod config;
 
