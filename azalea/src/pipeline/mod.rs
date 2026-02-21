@@ -3,16 +3,17 @@
 //!
 //! ## Data flow
 //! Gateway → [`Job`] → `azalea_core::pipeline::run` → [`upload::upload`].
-//!
+
+pub mod upload;
+
 use azalea_core::media::TweetLink;
 use azalea_core::pipeline::{Error as CoreError, Job as CoreJob};
+pub use azalea_core::pipeline::{Progress, RequestId};
 use std::fmt;
 use twilight_model::id::{
     Id,
     marker::{ChannelMarker, MessageMarker, UserMarker},
 };
-
-pub use azalea_core::pipeline::{Progress, RequestId};
 
 /// Input to the application pipeline.
 ///
