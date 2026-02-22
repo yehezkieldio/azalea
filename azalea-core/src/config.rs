@@ -442,6 +442,7 @@ impl Default for BinarySettings {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     #[test]
@@ -468,5 +469,52 @@ mod tests {
         let cfg = TranscodeSettings::default();
         let threads = cfg.effective_ffmpeg_threads(2);
         assert!(threads >= 2);
+    }
+
+    #[test]
+    fn validate_rejects_zero_concurrency() {
+        let mut config = EngineSettings::default();
+        config.concurrency.pipeline = 0;
+        let err = config
+            .validate()
+            .expect_err("zero concurrency must be invalid");
+        assert!(err.to_string().contains("concurrency"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_transcode_limits() {
+        let mut config = EngineSettings::default();
+        config.transcode.max_upload_bytes = 51 * 1024 * 1024;
+        let err = config
+            .validate()
+            .expect_err("upload size above discord cap must fail");
+        assert!(err.to_string().contains("50 MiB limit"));
+
+        let mut config = EngineSettings::default();
+        config.transcode.container_overhead_ratio = 0.0;
+        let err = config
+            .validate()
+            .expect_err("ratio outside (0, 1] must fail");
+        assert!(err.to_string().contains("container_overhead_ratio"));
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_timeouts() {
+        let mut config = EngineSettings::default();
+        config.http.connect_timeout_secs = 0;
+        let err = config.validate().expect_err("zero timeout must fail");
+        assert!(err.to_string().contains("connect_timeout_secs"));
+
+        let mut config = EngineSettings::default();
+        config.pipeline.upload_timeout_secs = 3601;
+        let err = config.validate().expect_err("timeout above max must fail");
+        assert!(err.to_string().contains("upload_timeout_secs"));
+    }
+
+    #[test]
+    fn upload_timeout_uses_pipeline_setting() {
+        let mut config = EngineSettings::default();
+        config.pipeline.upload_timeout_secs = 321;
+        assert_eq!(config.upload_timeout(), Duration::from_secs(321));
     }
 }
