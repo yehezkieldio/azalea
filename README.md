@@ -6,10 +6,226 @@
 
 ---
 
-Azalea is a Discord bot that automatically handles X (formerly Twitter) media sharing in your server. Use `/media <url>` with a tweet link, and it will detect the media, download it, optimize it to fit within Discord's upload limits, and re-upload it directly to your channel.
+Azalea is a Discord bot that fetches X (formerly Twitter) media directly into your server. Submit a tweet URL via `/media`, and Azalea resolves the video or image, transcodes it if necessary to fit within Discord's upload limit, and posts it as a native attachment. No embeds, no redirects, no third-party viewers. Videos that still exceed the upload limit after transcoding are automatically split into sequential segments and posted in order.
+
+> [!WARNING]
+> Azalea downloads media from X via unofficial third-party services. This almost certainly violates X's Terms of Service. This project is intended for experimental and personal use only. See [LEGAL.md](LEGAL.md) for details.
+
+## Features
+
+- **Dual Resolver with Automatic Fallback**: Resolves media via the VxTwitter API first; falls back to yt-dlp automatically if that request fails or returns incomplete data. Maximizes reliability and compatibility with various X content and account types.
+- **Size-Aware Transcoding**: Applies the cheapest viable strategy to bring a file under Discord's upload limit: pass-through, remux, transcode, or segment split. Re-encoding is performed only when strictly necessary. Performance-optimized presets balance speed and quality for typical X video content.
+- **Hardware-Accelerated Encoding**: Offloads H.264 encoding to VAAPI (Intel/AMD iGPUs on Linux), NVENC (NVIDIA GPUs), or VideoToolbox (Apple Silicon and macOS) when available on the host / with a compatible FFmpeg build, with libx264 as a software fallback.
+
+## Building from Source
+
+Currently there are no pre-built binaries available. The recommended installation method is building from source.
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) stable toolchain
+- [`mold`](https://github.com/rui314/mold) linker — Linux only, can be disabled in `.cargo/config.toml`
+- `ffmpeg` and `ffprobe` on your `PATH` — used for probing, remuxing, and transcoding
+- [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) on your `PATH` — used as the fallback resolver
+
+### Build
+
+```sh
+git clone https://github.com/yehezkieldio/azalea.git
+cd azalea
+cargo build --release -p azalea
+```
+
+The binary is placed at `./target/release/azalea`.
+
+## Quick Start
+
+### 1. Create a Discord application
+
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
+2. Under **Bot**, enable the bot and copy the token.
+3. Under **OAuth2 → URL Generator**, select the `applications.commands` and `bot` scopes with the `Send Messages`, `Attach Files`, and `Manage Messages` permissions. Use the generated URL to invite the bot to your server.
+4. Copy the **Application ID** from the General Information page.
+
+### 2. Configure
+
+Create `azalea.config.toml` in the directory you’ll run Azalea from:
+
+```toml
+application_id = 123456789012345678
+
+[transcode]
+quality_preset = "fast"        # fast | balanced | quality | size
+hardware_acceleration = "none" # none | vaapi | nvenc | videotoolbox
+max_upload_bytes = 8388608     # 8 MiB (Discord free tier default)
+```
+
+Provide the bot token via environment variable (or a `.env` file):
+
+```sh
+DISCORD_TOKEN=your_bot_token_here
+```
+
+### 3. Run
+
+```sh
+./target/release/azalea
+```
+
+Azalea registers slash commands on startup and begins accepting interactions immediately.
+
+## Docker
+
+Docker images are published to the GitHub Container Registry. The published tags are Linux-only (`linux/amd64`), and are split by runtime capability.
+
+| Tag      | Description                                                 |
+| -------- | ----------------------------------------------------------- |
+| `latest` | Software encoding only (libx264). Compatible with any host. |
+| `vaapi`  | VAAPI hardware acceleration for Intel/AMD iGPUs on Linux.   |
+
+### Software
+
+```sh
+docker run -d \
+  -e DISCORD_TOKEN=your_token \
+  -e APPLICATION_ID=your_app_id \
+  ghcr.io/yehezkieldio/azalea:latest
+```
+
+### VAAPI
+
+```sh
+docker run -d \
+  --device /dev/dri/renderD128:/dev/dri/renderD128 \
+  -e DISCORD_TOKEN=your_token \
+  -e APPLICATION_ID=your_app_id \
+  -e AZALEA_HARDWARE_ACCELERATION=vaapi \
+  -e AZALEA_VAAPI_DEVICE=/dev/dri/renderD128 \
+  ghcr.io/yehezkieldio/azalea:vaapi
+```
+
+Notes:
+- If you get permission errors on `/dev/dri/renderD128`, add `--group-add render --group-add video` (group names can vary by distro).
+- If VAAPI fails to initialize, verify the host supports it (e.g., `vainfo`) and that the correct VA drivers are installed.
+
+### NVENC
+
+To use NVIDIA acceleration in Docker you need **three** things:
+
+1. Linux host with an NVIDIA GPU and NVENC-capable driver
+2. GPU passthrough: install NVIDIA Container Toolkit on the host and run with `--gpus all`.
+3. An FFmpeg build that actually includes NVENC/NVDEC support (GPU access alone doesn’t add NVENC to a CPU-only FFmpeg binary).
+
+Azalea’s published `latest` image is meant as the CPU baseline. If you want NVENC, pick one of these approaches:
+
+#### Bring Your Own FFmpeg
+
+Mount a NVENC-capable `ffmpeg` and `ffprobe` into the container and point Azalea at them via `AZALEA_FFMPEG_PATH` and `AZALEA_FFPROBE_PATH`:
+
+```sh
+docker run -d \
+  --gpus all \
+  -v /usr/local/bin/ffmpeg:/opt/ffmpeg/ffmpeg:ro \
+  -v /usr/local/bin/ffprobe:/opt/ffmpeg/ffprobe:ro \
+  -e DISCORD_TOKEN=your_token \
+  -e APPLICATION_ID=your_app_id \
+  -e AZALEA_HARDWARE_ACCELERATION=nvenc \
+  -e AZALEA_FFMPEG_PATH=/opt/ffmpeg/ffmpeg \
+  -e AZALEA_FFPROBE_PATH=/opt/ffmpeg/ffprobe \
+  ghcr.io/yehezkieldio/azalea:latest
+```
+
+### VideoToolbox
+
+VideoToolbox is macOS-only and requires running FFmpeg natively on macOS (not inside a Linux container).
+
+If you want Apple hardware acceleration (Apple Silicon or Intel Macs), run Azalea natively on macOS and use the `videotoolbox` backend.
+
+## Configuration
+
+Configuration is loaded from three sources in ascending priority order:
+
+1. `azalea.config.toml`
+2. `.env` file
+3. Process environment variables
+
+`DISCORD_TOKEN` must always be provided via environment or `.env`.
+Most environment variables use the `AZALEA_` prefix (e.g., `AZALEA_HARDWARE_ACCELERATION`, `AZALEA_MAX_UPLOAD_BYTES`); exceptions are `APPLICATION_ID` and `DISCORD_TOKEN`.
+
+### JSON Schema
+
+A JSON Schema is available for editor autocompletion and inline docs:
+
+With Taplo:
+
+```toml
+#:schema https://raw.githubusercontent.com/yehezkieldio/azalea/refs/heads/master/azalea.schema.json
+```
+
+To generate the schema locally:
+
+```sh
+cargo run --features schemars --bin generate-schema
+```
+
+Generate a sample config with defaults:
+
+```sh
+cargo run -p azalea --bin generate-config
+```
+
+## Hardware Acceleration
+
+Hardware acceleration offloads H.264 encoding from the CPU to a dedicated hardware encoder via FFmpeg.
+It only affects the transcode step; pass-through and remux paths are unaffected.
+
+| Backend      | Config value   | Where it works                                                         | Status             |
+| ------------ | -------------- | ---------------------------------------------------------------------- | ------------------ |
+| Software     | `none`         | Any CPU (default, most compatible).                                    | Tested             |
+| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU with `/dev/dri/renderD128`.                     | Tested             |
+| NVENC        | `nvenc`        | Linux + NVIDIA GPU with NVENC-capable driver and NVENC-enabled FFmpeg. | Untested, see note |
+| VideoToolbox | `videotoolbox` | macOS only (Apple Silicon and Intel Macs).                             | Untested, see note |
+
+> NVENC and VideoToolbox support is implemented based on FFmpeg documentation and standard integration patterns, but has not been verified against real hardware. The code paths exist and should work in principle, but may require adjustments. Reports and fixes from users with access to this hardware are welcome.
+
+Example config:
+
+```toml
+[transcode]
+hardware_acceleration = "vaapi"
+vaapi_device = "/dev/dri/renderD128"
+```
+
+Or via environment:
+
+```sh
+AZALEA_HARDWARE_ACCELERATION=vaapi
+AZALEA_VAAPI_DEVICE=/dev/dri/renderD128
+```
+
+## Development
+
+Requires `just` and `cargo-nextest`.
+
+```sh
+just check
+just clippy
+just test
+just fmt
+```
+
+## Logging
+
+Log output is controlled by `RUST_LOG`.
+
+```sh
+RUST_LOG=info ./azalea
+RUST_LOG=azalea=debug ./azalea
+RUST_LOG=trace ./azalea
+```
 
 ## License
 
-Licensed under either the MIT License or the Apache License 2.0, at your option
+Licensed under either the MIT License or the Apache License 2.0, at your option.
 
-For detailed license information, please refer to the [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) files.
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) for details.
