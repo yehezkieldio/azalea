@@ -83,7 +83,7 @@ Docker images are published to the GitHub Container Registry. The published tags
 | `latest` | Software encoding only (libx264). Compatible with any host. |
 | `vaapi`  | VAAPI hardware acceleration for Intel/AMD iGPUs on Linux.   |
 
-### Software
+### Software (CPU)
 
 ```sh
 docker run -d \
@@ -92,7 +92,7 @@ docker run -d \
   ghcr.io/yehezkieldio/azalea:latest
 ```
 
-### VAAPI
+### VAAPI (Intel/AMD iGPU)
 
 ```sh
 docker run -d \
@@ -108,19 +108,19 @@ Notes:
 - If you get permission errors on `/dev/dri/renderD128`, add `--group-add render --group-add video` (group names can vary by distro).
 - If VAAPI fails to initialize, verify the host supports it (e.g., `vainfo`) and that the correct VA drivers are installed.
 
-### NVENC
+### NVENC (NVIDIA GPU)
 
-To use NVIDIA acceleration in Docker you need **three** things:
+Using NVIDIA acceleration requires three things:
 
-1. Linux host with an NVIDIA GPU and NVENC-capable driver
-2. GPU passthrough: install NVIDIA Container Toolkit on the host and run with `--gpus all`.
-3. An FFmpeg build that actually includes NVENC/NVDEC support (GPU access alone doesn’t add NVENC to a CPU-only FFmpeg binary).
+1. Linux host with an NVIDIA GPU and NVENC-capable driver.
+2. GPU passthrough: install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host and run with `--gpus all`.
+3. An FFmpeg build compiled with NVENC/NVDEC support. GPU passthrough alone does not enable NVENC in a CPU-only FFmpeg binary.
 
-Azalea’s published `latest` image is meant as the CPU baseline. If you want NVENC, pick one of these approaches:
+Azalea’s `latest` image is CPU-only. To enable NVENC:
 
 #### Bring Your Own FFmpeg
 
-Mount a NVENC-capable `ffmpeg` and `ffprobe` into the container and point Azalea at them via `AZALEA_FFMPEG_PATH` and `AZALEA_FFPROBE_PATH`:
+Mount an NVENC-enabled `ffmpeg`/`ffprobe` into the container and set the paths:
 
 ```sh
 docker run -d \
@@ -135,11 +135,11 @@ docker run -d \
   ghcr.io/yehezkieldio/azalea:latest
 ```
 
-### VideoToolbox
+> Ensure your FFmpeg build is NVENC-enabled. Prebuilt binaries or custom compilation may be required.
 
-VideoToolbox is macOS-only and requires running FFmpeg natively on macOS (not inside a Linux container).
+### VideoToolbox (macOS)
 
-If you want Apple hardware acceleration (Apple Silicon or Intel Macs), run Azalea natively on macOS and use the `videotoolbox` backend.
+VideoToolbox is macOS-only. Run Azalea natively on macOS to leverage Apple hardware acceleration and use the `videotoolbox` config option.
 
 ## Configuration
 
@@ -176,15 +176,15 @@ cargo run -p azalea --bin generate-config
 
 ## Hardware Acceleration
 
-Hardware acceleration offloads H.264 encoding from the CPU to a dedicated hardware encoder via FFmpeg.
-It only affects the transcode step; pass-through and remux paths are unaffected.
+Hardware acceleration offloads H.264 encoding to a dedicated hardware encoder via FFmpeg.
+Only transcode steps are affected; pass-through or remux paths remain CPU-bound.
 
-| Backend      | Config value   | Where it works                                                         | Status             |
-| ------------ | -------------- | ---------------------------------------------------------------------- | ------------------ |
-| Software     | `none`         | Any CPU (default, most compatible).                                    | Tested             |
-| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU with `/dev/dri/renderD128`.                     | Tested             |
-| NVENC        | `nvenc`        | Linux + NVIDIA GPU with NVENC-capable driver and NVENC-enabled FFmpeg. | Untested, see note |
-| VideoToolbox | `videotoolbox` | macOS only (Apple Silicon and Intel Macs).                             | Untested, see note |
+| Backend      | Config value   | Where it works                                                          | Status             |
+| ------------ | -------------- | ----------------------------------------------------------------------- | ------------------ |
+| Software     | `none`         | Any CPU (default, most compatible).                                     | Tested             |
+| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU with `/dev/dri/renderD128`.                      | Tested             |
+| NVENC        | `nvenc`        | Linux + NVIDIA GPU with NVENC-enabled FFmpeg. Requires GPU passthrough. | Untested, see note |
+| VideoToolbox | `videotoolbox` | macOS only (Apple Silicon or Intel).                                    | Untested, see note |
 
 > NVENC and VideoToolbox support is implemented based on FFmpeg documentation and standard integration patterns, but has not been verified against real hardware. The code paths exist and should work in principle, but may require adjustments. Reports and fixes from users with access to this hardware are welcome.
 
