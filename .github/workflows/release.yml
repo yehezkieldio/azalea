@@ -44,7 +44,7 @@ jobs:
                       type=semver,pattern={{version}},enable=${{ matrix.flavor == 'cpu' }}
                       type=raw,value=latest,enable=${{ matrix.flavor == 'cpu' }}
                       type=semver,pattern={{version}}-vaapi,enable=${{ matrix.flavor == 'vaapi' }}
-                      type=raw,value=latest-vaapi,enable=${{ matrix.flavor == 'vaapi' }}
+                      type=raw,value=vaapi,enable=${{ matrix.flavor == 'vaapi' }}
 
             - name: Build and Push
               id: build

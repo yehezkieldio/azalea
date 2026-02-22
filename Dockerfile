@@ -56,7 +56,6 @@ COPY --from=downloader /downloads/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=downloader /downloads/ffprobe /usr/local/bin/ffprobe
 COPY --from=builder /app/target/release/azalea /usr/local/bin/azalea
 USER azalea
-ENV LIBVA_DRIVER_NAME=iHD
 ENV RUST_LOG=info
 ENV PATH="/usr/local/bin:${PATH}"
 ENTRYPOINT ["azalea"]
