@@ -161,3 +161,29 @@ pub async fn restore(config: Config, shards: u32) -> Vec<Shard> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_info_none_detection_and_matching() {
+        let info = SessionInfo {
+            shard_id: 2,
+            shard_total: 8,
+            resume_url: None,
+            session: None,
+        };
+
+        assert!(info.is_none());
+        assert!(info.matches(ShardId::new(2, 8)));
+        assert!(!info.matches(ShardId::new(1, 8)));
+    }
+
+    #[test]
+    fn temp_file_name_is_scoped_to_resume_file() {
+        let temp = temp_file_name();
+        assert!(temp.starts_with(INFO_FILE));
+        assert!(temp.ends_with(".tmp"));
+    }
+}
