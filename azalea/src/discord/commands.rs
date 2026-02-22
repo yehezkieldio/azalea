@@ -13,10 +13,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use twilight_http::Client;
+use twilight_model::application::command::CommandType;
 use twilight_model::application::interaction::application_command::{
     CommandDataOption, CommandOptionValue,
 };
-use twilight_model::application::command::CommandType;
 use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::channel::message::MessageFlags;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
@@ -109,8 +109,12 @@ fn build_commands() -> Vec<twilight_model::application::command::Command> {
             .build(),
         CommandBuilder::new("status", "Show bot status", CommandType::ChatInput).build(),
         CommandBuilder::new("stats", "Show pipeline statistics", CommandType::ChatInput).build(),
-        CommandBuilder::new("config", "Show configuration summary", CommandType::ChatInput)
-            .build(),
+        CommandBuilder::new(
+            "config",
+            "Show configuration summary",
+            CommandType::ChatInput,
+        )
+        .build(),
     ]
 }
 
@@ -133,7 +137,8 @@ async fn handle_media_command(
         return "⏳ You're sending requests too quickly. Please slow down.".to_string();
     }
     if !app.channel_rate_limiter.check(channel_id).await {
-        return "⏳ This channel is receiving too many requests. Please try again later.".to_string();
+        return "⏳ This channel is receiving too many requests. Please try again later."
+            .to_string();
     }
 
     let url = match options
