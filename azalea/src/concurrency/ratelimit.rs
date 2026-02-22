@@ -66,3 +66,40 @@ impl RateLimiter {
         current < self.max_requests
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use twilight_model::id::{Id, marker::UserMarker};
+
+    #[tokio::test]
+    async fn zero_limit_disables_rate_limiting() {
+        let limiter = RateLimiter::new(0, 60);
+        let user = Id::<UserMarker>::new(1);
+        for _ in 0..10 {
+            assert!(limiter.check(user).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn per_user_limit_is_enforced() {
+        let limiter = RateLimiter::new(2, 60);
+        let user = Id::<UserMarker>::new(42);
+
+        assert!(limiter.check(user).await);
+        assert!(limiter.check(user).await);
+        assert!(!limiter.check(user).await);
+    }
+
+    #[tokio::test]
+    async fn users_are_isolated() {
+        let limiter = RateLimiter::new(1, 60);
+        let user_a = Id::<UserMarker>::new(1);
+        let user_b = Id::<UserMarker>::new(2);
+
+        assert!(limiter.check(user_a).await);
+        assert!(limiter.check(user_b).await);
+        assert!(!limiter.check(user_a).await);
+        assert!(!limiter.check(user_b).await);
+    }
+}
