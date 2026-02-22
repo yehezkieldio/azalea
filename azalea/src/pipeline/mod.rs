@@ -141,3 +141,43 @@ impl From<CoreError> for Error {
         Self::Core(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azalea_core::pipeline::Error as CorePipelineError;
+    use azalea_core::pipeline::errors::DownloadError;
+
+    #[test]
+    fn core_error_message_and_notify_policy_are_preserved() {
+        let core = CorePipelineError::Duplicate;
+        let app_error = Error::from(core);
+
+        assert_eq!(
+            app_error.user_message(),
+            "This tweet was already archived recently."
+        );
+        assert!(!app_error.should_notify_user());
+    }
+
+    #[test]
+    fn upload_errors_always_notify() {
+        let err = Error::UploadFailed {
+            part: 1,
+            total: 2,
+            source: Box::new(std::io::Error::other("network")),
+        };
+
+        assert!(err.should_notify_user());
+        assert_eq!(err.user_message(), "❌ Failed to upload media to Discord.");
+        assert!(err.to_string().contains("upload failed (1/2): network"));
+    }
+
+    #[test]
+    fn wrapped_core_error_display_is_stable() {
+        let err = Error::Core(CorePipelineError::DownloadFailed {
+            source: DownloadError::EmptyResponse,
+        });
+        assert!(err.to_string().contains("download failed: empty response"));
+    }
+}

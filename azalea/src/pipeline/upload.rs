@@ -340,3 +340,27 @@ fn jitter_millis(max_ms: u64) -> u64 {
 
     hasher.finish() % max_ms
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exponential_backoff_grows_and_caps() {
+        let a = exponential_backoff(0, 500, 2_000);
+        let b = exponential_backoff(1, 500, 2_000);
+        let c = exponential_backoff(8, 500, 2_000);
+
+        assert!(b >= a);
+        assert!(c <= Duration::from_millis(2_249));
+    }
+
+    #[test]
+    fn jitter_stays_within_requested_bound() {
+        for _ in 0..32 {
+            let jitter = jitter_millis(250);
+            assert!(jitter < 250);
+        }
+        assert_eq!(jitter_millis(0), 0);
+    }
+}
