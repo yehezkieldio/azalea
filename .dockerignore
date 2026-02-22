@@ -1,0 +1,10 @@
+.git
+.github
+.vscode
+target
+.env
+AGENTS.md
+azalea-dedup.redb
+azalea-metrics.redb
+azalea-resume-info.json
+cliff.toml
