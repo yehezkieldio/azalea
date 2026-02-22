@@ -11,6 +11,8 @@ Azalea is a Discord bot that fetches X (formerly Twitter) media directly into yo
 > [!WARNING]
 > Azalea downloads media from X via unofficial third-party services. This almost certainly violates X's Terms of Service. This project is intended for experimental and personal use only. See [LEGAL.md](LEGAL.md) for details.
 
+<div align="center"><img src="assets/demo.gif" alt="Demo" /></div>
+
 ## Features
 
 - **Dual Resolver with Automatic Fallback**: Resolves media via the VxTwitter API first; falls back to yt-dlp automatically if that request fails or returns incomplete data. Maximizes reliability and compatibility with various X content and account types.
