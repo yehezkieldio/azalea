@@ -1,0 +1,520 @@
+//! Generates a commented `azalea.config.toml` starter file.
+//!
+//! ## Usage
+//! `generate-config [output-path|-]` writes the template to a file or stdout.
+#![allow(unused_crate_dependencies)]
+
+#[path = "../config.rs"]
+#[allow(dead_code)]
+mod config;
+
+use anyhow::Result;
+use azalea_core::config::{HardwareAcceleration, QualityPreset};
+use std::io::{self, Write};
+
+const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
+    ("APPLICATION_ID", &[], "application_id"),
+    ("WORKER_THREADS", &[], "runtime.worker_threads"),
+    ("MAX_BLOCKING_THREADS", &[], "runtime.max_blocking_threads"),
+    ("THREAD_STACK_SIZE", &[], "runtime.thread_stack_size"),
+    ("DOWNLOAD", &[], "concurrency.download"),
+    ("UPLOAD", &[], "concurrency.upload"),
+    ("TRANSCODE", &[], "concurrency.transcode"),
+    ("YTDLP", &[], "concurrency.ytdlp"),
+    ("PIPELINE", &[], "concurrency.pipeline"),
+    ("POOL_MAX_IDLE_PER_HOST", &[], "http.pool_max_idle_per_host"),
+    ("POOL_IDLE_TIMEOUT_SECS", &[], "http.pool_idle_timeout_secs"),
+    ("CONNECT_TIMEOUT_SECS", &[], "http.connect_timeout_secs"),
+    ("TIMEOUT_SECS", &[], "http.timeout_secs"),
+    ("TEMP_DIR", &[], "storage.temp_dir"),
+    ("DEDUP_TTL_HOURS", &[], "storage.dedup_ttl_hours"),
+    ("DEDUP_CACHE_SIZE", &[], "storage.dedup_cache_size"),
+    ("DEDUP_PERSISTENT", &[], "storage.dedup_persistent"),
+    ("DEDUP_DB_PATH", &[], "storage.dedup_db_path"),
+    (
+        "DEDUP_FLUSH_INTERVAL_SECS",
+        &[],
+        "storage.dedup_flush_interval_secs",
+    ),
+    ("METRICS_DB_PATH", &[], "storage.metrics_db_path"),
+    ("METRICS_ENABLED", &[], "storage.metrics_enabled"),
+    ("RESOLVER_CACHE_TTL_SECS", &[], "storage.resolver_cache_ttl_secs"),
+    ("RESOLVER_CACHE_SIZE", &[], "storage.resolver_cache_size"),
+    (
+        "RESOLVER_NEGATIVE_TTL_SECS",
+        &[],
+        "storage.resolver_negative_ttl_secs",
+    ),
+    ("QUALITY_PRESET", &[], "transcode.quality_preset"),
+    (
+        "HARDWARE_ACCELERATION",
+        &[],
+        "transcode.hardware_acceleration",
+    ),
+    ("FFMPEG_THREADS", &[], "transcode.ffmpeg_threads"),
+    ("VAAPI_DEVICE", &[], "transcode.vaapi_device"),
+    ("MAX_UPLOAD_BYTES", &[], "transcode.max_upload_bytes"),
+    (
+        "CONTAINER_OVERHEAD_RATIO",
+        &[],
+        "transcode.container_overhead_ratio",
+    ),
+    ("VBR_SAFETY_MARGIN", &[], "transcode.vbr_safety_margin"),
+    ("TRANSCODE_TARGET_RATIO", &[], "transcode.transcode_target_ratio"),
+    ("SPLIT_TARGET_RATIO", &[], "transcode.split_target_ratio"),
+    ("AUDIO_VBR_PADDING", &[], "transcode.audio_vbr_padding"),
+    ("MIN_BITRATE_KBPS", &[], "transcode.min_bitrate_kbps"),
+    (
+        "MAX_SINGLE_VIDEO_DURATION_SECS",
+        &[],
+        "transcode.max_single_video_duration_secs",
+    ),
+    ("FFPROBE_TIMEOUT_SECS", &[], "transcode.ffprobe_timeout_secs"),
+    ("FFMPEG_TIMEOUT_SECS", &[], "transcode.ffmpeg_timeout_secs"),
+    (
+        "QUEUE_BACKPRESSURE_TIMEOUT_MS",
+        &[],
+        "pipeline.queue_backpressure_timeout_ms",
+    ),
+    ("DOWNLOAD_TIMEOUT_SECS", &[], "pipeline.download_timeout_secs"),
+    ("UPLOAD_TIMEOUT_SECS", &[], "pipeline.upload_timeout_secs"),
+    ("MIN_DISK_SPACE_BYTES", &[], "pipeline.min_disk_space_bytes"),
+    ("MAX_DOWNLOAD_BYTES", &[], "pipeline.max_download_bytes"),
+    ("RESOLVER_TIMEOUT_SECS", &[], "pipeline.resolver_timeout_secs"),
+    ("YTDLP_TIMEOUT_SECS", &[], "pipeline.ytdlp_timeout_secs"),
+    (
+        "USER_RATE_LIMIT_REQUESTS",
+        &[],
+        "pipeline.user_rate_limit_requests",
+    ),
+    (
+        "USER_RATE_LIMIT_WINDOW_SECS",
+        &[],
+        "pipeline.user_rate_limit_window_secs",
+    ),
+    (
+        "CHANNEL_RATE_LIMIT_REQUESTS",
+        &[],
+        "pipeline.channel_rate_limit_requests",
+    ),
+    (
+        "CHANNEL_RATE_LIMIT_WINDOW_SECS",
+        &[],
+        "pipeline.channel_rate_limit_window_secs",
+    ),
+    (
+        "PARALLEL_SEGMENT_THRESHOLD",
+        &[],
+        "pipeline.parallel_segment_threshold",
+    ),
+    ("FFMPEG", &["FFMPEG_PATH"], "binaries.ffmpeg"),
+    ("FFPROBE", &["FFPROBE_PATH"], "binaries.ffprobe"),
+    ("YTDLP_PATH", &[], "binaries.ytdlp"),
+];
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let output = args
+        .next()
+        .unwrap_or_else(|| "azalea.config.toml".to_string());
+
+    if args.next().is_some() {
+        anyhow::bail!("Usage: generate-config [output-path|-]");
+    }
+
+    let template = render_template();
+    if output == "-" {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        handle.write_all(template.as_bytes())?;
+    } else {
+        std::fs::write(&output, template)?;
+    }
+
+    Ok(())
+}
+
+fn render_template() -> String {
+    let app = config::AppConfig::default();
+    let runtime = &app.runtime;
+    let engine = &app.engine;
+    let mut out = String::new();
+
+    line(&mut out, "# azalea.config.toml");
+    line(
+        &mut out,
+        "# Generated by: cargo run -p azalea --bin generate-config",
+    );
+    line(
+        &mut out,
+        "# Required: set DISCORD_TOKEN in your environment or .env file.",
+    );
+    line(
+        &mut out,
+        "# Required: set application_id to your Discord application ID (non-zero).",
+    );
+    line(&mut out, "application_id = 0");
+    line(&mut out, "");
+
+    line(&mut out, "[runtime]");
+    line(
+        &mut out,
+        &format!("worker_threads = {}", runtime.worker_threads),
+    );
+    line(
+        &mut out,
+        &format!("max_blocking_threads = {}", runtime.max_blocking_threads),
+    );
+    line(
+        &mut out,
+        &format!("thread_stack_size = {}", runtime.thread_stack_size),
+    );
+    line(&mut out, "");
+
+    line(&mut out, "[concurrency]");
+    line(
+        &mut out,
+        &format!("download = {}", engine.concurrency.download),
+    );
+    line(&mut out, &format!("upload = {}", engine.concurrency.upload));
+    line(
+        &mut out,
+        &format!("transcode = {}", engine.concurrency.transcode),
+    );
+    line(&mut out, &format!("ytdlp = {}", engine.concurrency.ytdlp));
+    line(
+        &mut out,
+        &format!("pipeline = {}", engine.concurrency.pipeline),
+    );
+    line(&mut out, "");
+
+    line(&mut out, "[http]");
+    line(
+        &mut out,
+        &format!(
+            "pool_max_idle_per_host = {}",
+            engine.http.pool_max_idle_per_host
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "pool_idle_timeout_secs = {}",
+            engine.http.pool_idle_timeout_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!("connect_timeout_secs = {}", engine.http.connect_timeout_secs),
+    );
+    line(&mut out, &format!("timeout_secs = {}", engine.http.timeout_secs));
+    line(&mut out, "");
+
+    line(&mut out, "[storage]");
+    line(
+        &mut out,
+        &format!(
+            "temp_dir = {}",
+            toml_string(&engine.storage.temp_dir.to_string_lossy())
+        ),
+    );
+    line(
+        &mut out,
+        &format!("dedup_ttl_hours = {}", engine.storage.dedup_ttl_hours),
+    );
+    line(
+        &mut out,
+        &format!("dedup_cache_size = {}", engine.storage.dedup_cache_size),
+    );
+    line(
+        &mut out,
+        &format!("dedup_persistent = {}", engine.storage.dedup_persistent),
+    );
+    line(
+        &mut out,
+        &format!(
+            "dedup_db_path = {}",
+            toml_string(&engine.storage.dedup_db_path.to_string_lossy())
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "dedup_flush_interval_secs = {}",
+            engine.storage.dedup_flush_interval_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "metrics_db_path = {}",
+            toml_string(&engine.storage.metrics_db_path.to_string_lossy())
+        ),
+    );
+    line(
+        &mut out,
+        &format!("metrics_enabled = {}", engine.storage.metrics_enabled),
+    );
+    line(
+        &mut out,
+        &format!(
+            "resolver_cache_ttl_secs = {}",
+            engine.storage.resolver_cache_ttl_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "resolver_cache_size = {}",
+            engine.storage.resolver_cache_size
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "resolver_negative_ttl_secs = {}",
+            engine.storage.resolver_negative_ttl_secs
+        ),
+    );
+    line(&mut out, "");
+
+    line(&mut out, "[transcode]");
+    line(&mut out, "# possible values: fast, balanced, quality, size");
+    line(
+        &mut out,
+        &format!(
+            "quality_preset = {}",
+            toml_string(quality_preset_name(engine.transcode.quality_preset))
+        ),
+    );
+    line(
+        &mut out,
+        "# possible values: none, nvenc, vaapi, videotoolbox",
+    );
+    line(
+        &mut out,
+        &format!(
+            "hardware_acceleration = {}",
+            toml_string(hardware_acceleration_name(
+                engine.transcode.hardware_acceleration
+            ))
+        ),
+    );
+    line(
+        &mut out,
+        &format!("ffmpeg_threads = {}", engine.transcode.ffmpeg_threads),
+    );
+    line(
+        &mut out,
+        &format!(
+            "vaapi_device = {}",
+            toml_string(engine.transcode.vaapi_device.as_ref())
+        ),
+    );
+    line(
+        &mut out,
+        &format!("max_upload_bytes = {}", engine.transcode.max_upload_bytes),
+    );
+    line(
+        &mut out,
+        &format!(
+            "container_overhead_ratio = {}",
+            engine.transcode.container_overhead_ratio
+        ),
+    );
+    line(
+        &mut out,
+        &format!("vbr_safety_margin = {}", engine.transcode.vbr_safety_margin),
+    );
+    line(
+        &mut out,
+        &format!(
+            "transcode_target_ratio = {}",
+            engine.transcode.transcode_target_ratio
+        ),
+    );
+    line(
+        &mut out,
+        &format!("split_target_ratio = {}", engine.transcode.split_target_ratio),
+    );
+    line(
+        &mut out,
+        &format!("audio_vbr_padding = {}", engine.transcode.audio_vbr_padding),
+    );
+    line(
+        &mut out,
+        &format!("min_bitrate_kbps = {}", engine.transcode.min_bitrate_kbps),
+    );
+    line(
+        &mut out,
+        &format!(
+            "max_single_video_duration_secs = {}",
+            engine.transcode.max_single_video_duration_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "ffprobe_timeout_secs = {}",
+            engine.transcode.ffprobe_timeout_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!("ffmpeg_timeout_secs = {}", engine.transcode.ffmpeg_timeout_secs),
+    );
+    line(&mut out, "");
+
+    line(&mut out, "[pipeline]");
+    line(
+        &mut out,
+        &format!(
+            "queue_backpressure_timeout_ms = {}",
+            engine.pipeline.queue_backpressure_timeout_ms
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "download_timeout_secs = {}",
+            engine.pipeline.download_timeout_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!("upload_timeout_secs = {}", engine.pipeline.upload_timeout_secs),
+    );
+    line(
+        &mut out,
+        &format!(
+            "min_disk_space_bytes = {}",
+            engine.pipeline.min_disk_space_bytes
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "max_download_bytes = {}",
+            engine.pipeline.max_download_bytes
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "resolver_timeout_secs = {}",
+            engine.pipeline.resolver_timeout_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!("ytdlp_timeout_secs = {}", engine.pipeline.ytdlp_timeout_secs),
+    );
+    line(
+        &mut out,
+        &format!(
+            "user_rate_limit_requests = {}",
+            engine.pipeline.user_rate_limit_requests
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "user_rate_limit_window_secs = {}",
+            engine.pipeline.user_rate_limit_window_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "channel_rate_limit_requests = {}",
+            engine.pipeline.channel_rate_limit_requests
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "channel_rate_limit_window_secs = {}",
+            engine.pipeline.channel_rate_limit_window_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "parallel_segment_threshold = {}",
+            engine.pipeline.parallel_segment_threshold
+        ),
+    );
+    line(&mut out, "");
+
+    line(&mut out, "[binaries]");
+    line(
+        &mut out,
+        &format!(
+            "ffmpeg = {}",
+            toml_string(&engine.binaries.ffmpeg.to_string_lossy())
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "ffprobe = {}",
+            toml_string(&engine.binaries.ffprobe.to_string_lossy())
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "ytdlp = {}",
+            toml_string(&engine.binaries.ytdlp.to_string_lossy())
+        ),
+    );
+    line(&mut out, "");
+
+    line(&mut out, "# Environment variable reference");
+    line(
+        &mut out,
+        "# - DISCORD_TOKEN (required; only read from env or .env, not TOML)",
+    );
+    line(
+        &mut out,
+        "# - APPLICATION_ID maps to application_id (same target as AZALEA_APPLICATION_ID)",
+    );
+    for (key, aliases, path) in ENV_REFERENCES {
+        let mut names = vec![format!("AZALEA_{key}")];
+        names.extend(aliases.iter().map(|alias| format!("AZALEA_{alias}")));
+        line(
+            &mut out,
+            &format!("# - {} -> {}", names.join(", "), path),
+        );
+    }
+
+    out
+}
+
+fn quality_preset_name(value: QualityPreset) -> &'static str {
+    match value {
+        QualityPreset::Fast => "fast",
+        QualityPreset::Balanced => "balanced",
+        QualityPreset::Quality => "quality",
+        QualityPreset::Size => "size",
+    }
+}
+
+fn hardware_acceleration_name(value: HardwareAcceleration) -> &'static str {
+    match value {
+        HardwareAcceleration::None => "none",
+        HardwareAcceleration::Nvenc => "nvenc",
+        HardwareAcceleration::Vaapi => "vaapi",
+        HardwareAcceleration::VideoToolbox => "videotoolbox",
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn line(out: &mut String, value: &str) {
+    out.push_str(value);
+    out.push('\n');
+}

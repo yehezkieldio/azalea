@@ -10,6 +10,10 @@ name = "generate-schema"
 path = "src/bin/generate_schema.rs"
 required-features = ["schemars"]
 
+[[bin]]
+name = "generate-config"
+path = "src/bin/generate_config.rs"
+
 [lints]
 workspace = true
 
