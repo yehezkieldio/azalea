@@ -38,3 +38,11 @@ generate-schema:
 # Generate default configuration file
 generate-config:
     {{cargo}} run --bin generate-config
+
+# Update version numbers and generate changelog for a new release
+release version:
+    cargo set-version -p azalea -p azalea-core {{version}}
+    GITHUB_TOKEN=$(gh auth token) git-cliff --tag {{version}} --output CHANGELOG.md
+    git add .
+    git commit -m "chore(release): {{version}}"
+    git tag -s v{{version}} -m ""
