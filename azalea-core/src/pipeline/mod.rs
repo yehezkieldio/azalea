@@ -32,6 +32,23 @@ use crate::storage::Stage;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+const RESOLVE_WARN_MS: u64 = 8_000;
+const DOWNLOAD_WARN_MS: u64 = 20_000;
+const OPTIMIZE_WARN_MS: u64 = 30_000;
+
+fn warn_if_slow(stage: Stage, duration_ms: u64, threshold_ms: u64) {
+    if duration_ms > threshold_ms {
+        tracing::warn!(
+            ?stage,
+            duration_ms,
+            threshold_ms,
+            "Pipeline stage exceeded warning threshold"
+        );
+    } else {
+        tracing::debug!(?stage, duration_ms, "Pipeline stage completed within threshold");
+    }
+}
+
 /// Execute the pipeline up to the optimized media output, emitting progress updates.
 ///
 /// ## Preconditions
@@ -75,11 +92,13 @@ pub async fn run(
                 engine.metrics.record_error("resolve_failed");
                 engine.metrics.record_failure();
             })?;
+        let resolve_duration_ms = resolve_start.elapsed().as_millis() as u64;
         engine
             .metrics
-            .record_stage_duration(Stage::Resolve, resolve_start.elapsed().as_millis() as u64);
+            .record_stage_duration(Stage::Resolve, resolve_duration_ms);
+        warn_if_slow(Stage::Resolve, resolve_duration_ms, RESOLVE_WARN_MS);
         tracing::info!(
-            duration_ms = resolve_start.elapsed().as_millis(),
+            duration_ms = resolve_duration_ms,
             media_type = ?resolved.media_type,
             extension = %resolved.extension,
             resolution = ?resolved.resolution,
@@ -113,11 +132,13 @@ pub async fn run(
             }
             engine.metrics.record_failure();
         })?;
+        let download_duration_ms = download_start.elapsed().as_millis() as u64;
         engine
             .metrics
-            .record_stage_duration(Stage::Download, download_start.elapsed().as_millis() as u64);
+            .record_stage_duration(Stage::Download, download_duration_ms);
+        warn_if_slow(Stage::Download, download_duration_ms, DOWNLOAD_WARN_MS);
         tracing::info!(
-            duration_ms = download_start.elapsed().as_millis(),
+            duration_ms = download_duration_ms,
             size_bytes = downloaded.size,
             resolution = ?downloaded.resolution,
             media_duration_secs = downloaded.duration,
@@ -143,15 +164,17 @@ pub async fn run(
             engine.metrics.record_error("optimize_failed");
             engine.metrics.record_failure();
         })?;
+        let optimize_duration_ms = optimize_start.elapsed().as_millis() as u64;
         engine
             .metrics
-            .record_stage_duration(Stage::Optimize, optimize_start.elapsed().as_millis() as u64);
+            .record_stage_duration(Stage::Optimize, optimize_duration_ms);
+        warn_if_slow(Stage::Optimize, optimize_duration_ms, OPTIMIZE_WARN_MS);
         let (prepared_kind, prepared_parts) = match &prepared {
             types::PreparedUpload::Single { .. } => ("single", 1),
             types::PreparedUpload::Split { paths, .. } => ("split", paths.len()),
         };
         tracing::info!(
-            duration_ms = optimize_start.elapsed().as_millis(),
+            duration_ms = optimize_duration_ms,
             kind = prepared_kind,
             parts = prepared_parts,
             "Optimize completed"

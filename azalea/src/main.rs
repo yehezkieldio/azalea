@@ -30,8 +30,13 @@ use azalea_core::storage::Stage;
 use config::AppConfig;
 use mimalloc::MiMalloc;
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{process::Command, signal, sync::mpsc, task::JoinSet};
@@ -55,6 +60,9 @@ const DEPENDENCY_CHECK_TIMEOUT_SECS: u64 = 10;
 const SHUTDOWN_STEP_TIMEOUT_SECS: u64 = 5;
 const TEMP_PRUNE_INTERVAL_SECS: u64 = 30 * 60;
 const TEMP_PRUNE_MAX_AGE_SECS: u64 = 60 * 60;
+const JOB_DURATION_WARN_MS: u64 = 45_000;
+const UPLOAD_DURATION_WARN_MS: u64 = 20_000;
+const QUEUE_DEPTH_WARN_THRESHOLD: usize = 80;
 
 /// RAII guard that decrements the queue depth when a job task completes.
 ///
@@ -77,6 +85,14 @@ impl Drop for QueueDepthGuard {
                 Some(value.saturating_sub(1))
             });
     }
+}
+
+#[derive(Default)]
+struct WorkerDiagnostics {
+    completed_jobs: AtomicU64,
+    failed_jobs: AtomicU64,
+    timeout_jobs: AtomicU64,
+    hwacc_failures: AtomicU64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -105,6 +121,7 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
     raise_fd_limit();
     let mut config = config;
     resolve_dependencies(&mut config.engine.binaries)?;
+    log_startup_snapshot(&config);
     verify_dependencies(&config.engine.binaries, &config.engine.transcode).await?;
 
     // Ensure temp storage is available before starting the worker.
@@ -357,9 +374,14 @@ fn raise_fd_limit() {
 /// This loop owns the receiver; each job is processed in a task under the
 /// pipeline semaphore.
 async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Job>) {
-    tracing::info!("Pipeline worker started");
+    tracing::info!(
+        max_concurrency = app.engine.config.concurrency.pipeline.max(1),
+        queue_warn_threshold = QUEUE_DEPTH_WARN_THRESHOLD,
+        "Pipeline worker started"
+    );
 
     let max_concurrency = app.engine.config.concurrency.pipeline.max(1) as usize;
+    let diagnostics = Arc::new(WorkerDiagnostics::default());
     let mut join_set = tokio::task::JoinSet::new();
     let log_join_error = |error: tokio::task::JoinError| {
         if error.is_panic() {
@@ -371,7 +393,16 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
 
     while let Some(job) = receiver.recv().await {
         let app = app.clone();
+        let diagnostics = Arc::clone(&diagnostics);
         let queue_guard = QueueDepthGuard::new(Arc::clone(&app.queue_depth));
+        let queue_depth_at_start = app.queue_depth.load(Ordering::Relaxed);
+        if queue_depth_at_start >= QUEUE_DEPTH_WARN_THRESHOLD {
+            tracing::warn!(
+                queue_depth = queue_depth_at_start,
+                queue_capacity = JOB_QUEUE_CAPACITY,
+                "Queue depth is approaching capacity"
+            );
+        }
         let permit = match Arc::clone(&app.engine.permits.pipeline)
             .acquire_owned()
             .await
@@ -390,13 +421,17 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
             let span = tracing::info_span!(
                 "pipeline_run",
                 request_id = job.request_id.0,
+                trigger_id = job.trigger_id,
                 tweet_id = job.tweet_url.tweet_id.0,
                 channel_id = job.channel_id.get(),
                 author_id = job.author_id.get(),
+                source_kind = if job.source_message_id.is_some() { "message" } else { "command" },
+                queue_depth = queue_depth_at_start,
                 tweet_url = %job.tweet_url.original_url()
             );
 
             async {
+                let job_started_at = Instant::now();
                 let reply_message_id =
                     discord::send_processing(&app.discord, job.channel_id, job.source_message_id)
                         .await;
@@ -436,11 +471,21 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                         .await
                         {
                             Ok(outcome) => {
+                                let upload_elapsed_ms = upload_start.elapsed().as_millis() as u64;
                                 // Record metrics and mark dedup only on success.
                                 app.engine.metrics.record_stage_duration(
                                     Stage::Upload,
-                                    upload_start.elapsed().as_millis() as u64,
+                                    upload_elapsed_ms,
                                 );
+                                if upload_elapsed_ms > UPLOAD_DURATION_WARN_MS {
+                                    tracing::warn!(
+                                        upload_elapsed_ms,
+                                        threshold_ms = UPLOAD_DURATION_WARN_MS,
+                                        "Upload duration exceeded warning threshold"
+                                    );
+                                } else {
+                                    tracing::debug!(upload_elapsed_ms, "Upload completed within threshold");
+                                }
                                 app.engine.metrics.record_success();
                                 app.engine
                                     .dedup
@@ -469,6 +514,8 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
 
                 match outcome {
                     Ok(outcome) => {
+                        let elapsed_ms = job_started_at.elapsed().as_millis() as u64;
+                        diagnostics.completed_jobs.fetch_add(1, Ordering::Relaxed);
                         if let Some(source_message_id) = job.source_message_id
                             && let Err(e) = discord::delete_original(
                                 &app.discord,
@@ -490,13 +537,29 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                         }
 
                         tracing::info!(
+                            duration_ms = elapsed_ms,
                             first_message_id = outcome.first_message_id.get(),
                             messages_sent = outcome.messages_sent,
                             "Job completed"
                         );
+                        if elapsed_ms > JOB_DURATION_WARN_MS {
+                            tracing::warn!(
+                                duration_ms = elapsed_ms,
+                                threshold_ms = JOB_DURATION_WARN_MS,
+                                "Job duration exceeded warning threshold"
+                            );
+                        }
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "Job failed");
+                        diagnostics.completed_jobs.fetch_add(1, Ordering::Relaxed);
+                        diagnostics.failed_jobs.fetch_add(1, Ordering::Relaxed);
+                        if is_timeout_error(&error) {
+                            diagnostics.timeout_jobs.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if is_hwacc_error(&error) {
+                            diagnostics.hwacc_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                        log_job_failure_diagnostics(&error, job_started_at.elapsed());
                         discord::send_error(&app.discord, job.channel_id, reply_message_id, &error)
                             .await;
                     }
@@ -522,7 +585,13 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
         }
     }
 
-    tracing::info!("Pipeline worker shutting down");
+    tracing::info!(
+        completed_jobs = diagnostics.completed_jobs.load(Ordering::Relaxed),
+        failed_jobs = diagnostics.failed_jobs.load(Ordering::Relaxed),
+        timeout_jobs = diagnostics.timeout_jobs.load(Ordering::Relaxed),
+        hwacc_failures = diagnostics.hwacc_failures.load(Ordering::Relaxed),
+        "Pipeline worker shutting down"
+    );
 }
 
 /// Install a panic hook that best-effort flushes persistence to disk.
@@ -611,6 +680,13 @@ async fn verify_dependencies(
                     let err = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("Dependency '{}' check failed: {}", label, err);
                 }
+                let version = command_version_summary(&output);
+                tracing::info!(
+                    dependency = label,
+                    path = %cmd.display(),
+                    version = %version,
+                    "Dependency ready"
+                );
             }
             Ok(Err(e)) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -744,6 +820,172 @@ async fn ffmpeg_supports_hwaccel(ffmpeg_path: &Path, backend: &str) -> anyhow::R
     let found = stdout.lines().any(|line| line.trim() == backend);
     tracing::trace!(backend, found, "ffmpeg hwaccel backend probe result");
     Ok(found)
+}
+
+fn command_version_summary(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| "unknown-version".to_string())
+}
+
+fn log_startup_snapshot(config: &AppConfig) {
+    let runtime = &config.runtime;
+    let engine = &config.engine;
+    let transcode = &engine.transcode;
+    tracing::info!(
+        worker_threads = runtime.worker_threads,
+        max_blocking_threads = runtime.max_blocking_threads,
+        pipeline_concurrency = engine.concurrency.pipeline,
+        transcode_concurrency = engine.concurrency.transcode,
+        upload_limit_bytes = transcode.max_upload_bytes,
+        hwacc = ?transcode.hardware_acceleration,
+        encoder = transcode.hardware_acceleration.encoder(),
+        temp_dir = %engine.storage.temp_dir.display(),
+        "Effective runtime snapshot"
+    );
+    tracing::debug!(
+        ffmpeg = %engine.binaries.ffmpeg.display(),
+        ffprobe = %engine.binaries.ffprobe.display(),
+        ytdlp = %engine.binaries.ytdlp.display(),
+        vaapi_device = %transcode.vaapi_device,
+        max_download_bytes = engine.pipeline.max_download_bytes,
+        download_timeout_secs = engine.pipeline.download_timeout_secs,
+        upload_timeout_secs = engine.pipeline.upload_timeout_secs,
+        queue_capacity = JOB_QUEUE_CAPACITY,
+        "Startup diagnostics details"
+    );
+}
+
+fn is_timeout_error(error: &pipeline::Error) -> bool {
+    matches!(
+        error,
+        pipeline::Error::Core(core_pipeline::Error::Timeout { .. })
+    )
+}
+
+fn is_hwacc_error(error: &pipeline::Error) -> bool {
+    match error {
+        pipeline::Error::Core(core_pipeline::Error::TranscodeFailed { stderr_tail, .. }) => {
+            let stderr = stderr_tail.to_ascii_lowercase();
+            stderr.contains("vaapi")
+                || stderr.contains("nvenc")
+                || stderr.contains("videotoolbox")
+                || stderr.contains("cuda")
+                || stderr.contains("hwaccel")
+        }
+        _ => false,
+    }
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn log_job_failure_diagnostics(error: &pipeline::Error, elapsed: Duration) {
+    match error {
+        pipeline::Error::Core(core_pipeline::Error::TranscodeFailed {
+            stage,
+            exit_code,
+            stderr_tail,
+        }) => {
+            tracing::warn!(
+                error_kind = "transcode_failed",
+                stage = ?stage,
+                exit_code,
+                duration_ms = elapsed.as_millis() as u64,
+                stderr_tail_hash = stable_hash(stderr_tail),
+                is_hwacc_path = is_hwacc_error(error),
+                "Job failed"
+            );
+            tracing::debug!(stderr_tail = %stderr_tail, "Transcode stderr tail");
+        }
+        pipeline::Error::Core(core_pipeline::Error::Timeout {
+            operation,
+            duration,
+        }) => {
+            tracing::warn!(
+                error_kind = "timeout",
+                operation,
+                timeout_ms = duration.as_millis() as u64,
+                duration_ms = elapsed.as_millis() as u64,
+                "Job failed"
+            );
+        }
+        pipeline::Error::Core(core_pipeline::Error::ResolveFailed { resolver, source }) => {
+            tracing::warn!(
+                error_kind = "resolve_failed",
+                resolver,
+                source = %source,
+                duration_ms = elapsed.as_millis() as u64,
+                "Job failed"
+            );
+        }
+        pipeline::Error::Core(core_pipeline::Error::DownloadFailed { source }) => {
+            tracing::warn!(
+                error_kind = "download_failed",
+                source = %source,
+                duration_ms = elapsed.as_millis() as u64,
+                "Job failed"
+            );
+        }
+        pipeline::Error::Core(core_pipeline::Error::DiskSpace {
+            available_mb,
+            required_mb,
+        }) => {
+            tracing::warn!(
+                error_kind = "disk_space",
+                available_mb,
+                required_mb,
+                duration_ms = elapsed.as_millis() as u64,
+                "Job failed"
+            );
+        }
+        pipeline::Error::Core(core_pipeline::Error::Duplicate) => {
+            tracing::debug!(
+                error_kind = "duplicate",
+                duration_ms = elapsed.as_millis() as u64,
+                "Duplicate request skipped"
+            );
+        }
+        pipeline::Error::Core(core_pipeline::Error::Io(source)) => {
+            tracing::warn!(
+                error_kind = "io",
+                source = %source,
+                duration_ms = elapsed.as_millis() as u64,
+                "Job failed"
+            );
+        }
+        pipeline::Error::UploadFailed {
+            part,
+            total,
+            source,
+        } => {
+            tracing::warn!(
+                error_kind = "upload_failed",
+                part,
+                total,
+                source = %source,
+                duration_ms = elapsed.as_millis() as u64,
+                "Job failed"
+            );
+        }
+        pipeline::Error::DiscordApi { operation, source } => {
+            tracing::warn!(
+                error_kind = "discord_api",
+                operation,
+                source = %source,
+                duration_ms = elapsed.as_millis() as u64,
+                "Job failed"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
