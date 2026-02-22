@@ -256,3 +256,87 @@ fn remove_path_sync(path: &Path) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("azalea-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn cleanup_temp_dir_sync_removes_files_and_dirs() {
+        let dir = unique_temp_dir("sync-cleanup");
+        std::fs::create_dir_all(dir.join("nested")).expect("create nested dir");
+        std::fs::write(dir.join("a.tmp"), b"x").expect("write file");
+        std::fs::write(dir.join("nested/b.tmp"), b"y").expect("write nested file");
+
+        cleanup_temp_dir_sync(&dir);
+
+        let remaining = std::fs::read_dir(&dir).expect("read cleanup dir").count();
+        assert_eq!(remaining, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_temp_dir_older_than_only_removes_stale_entries() {
+        let dir = unique_temp_dir("stale-cleanup");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let old_file = dir.join("old.tmp");
+        let new_file = dir.join("new.tmp");
+
+        std::fs::write(&old_file, b"old").expect("write old file");
+        std::thread::sleep(Duration::from_millis(40));
+        std::fs::write(&new_file, b"new").expect("write new file");
+
+        let removed = cleanup_temp_dir_older_than(&dir, Duration::from_millis(20));
+        assert_eq!(removed, 1);
+        assert!(!old_file.exists());
+        assert!(new_file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn guard_drop_removes_file() {
+        let dir = unique_temp_dir("guard-file");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let file = dir.join("temp.bin");
+        std::fs::write(&file, b"payload").expect("write file");
+
+        let cleanup = TempFileCleanup::new();
+        let guard = cleanup.guard(file.clone());
+        drop(guard);
+        cleanup.shutdown().await;
+
+        assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_guard_drops_cleanup_all_files() {
+        let dir = unique_temp_dir("concurrent-guards");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let cleanup = TempFileCleanup::new();
+
+        let guards: Vec<_> = (0..32u32)
+            .map(|idx| {
+                let file = dir.join(format!("{idx}.tmp"));
+                std::fs::write(&file, b"x").expect("write file");
+                cleanup.guard(file)
+            })
+            .collect();
+
+        drop(guards);
+        cleanup.shutdown().await;
+
+        let remaining = std::fs::read_dir(&dir).expect("read dir").count();
+        assert_eq!(remaining, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

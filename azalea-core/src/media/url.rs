@@ -128,7 +128,9 @@ pub fn parse_tweet_urls(content: &str) -> SmallVec<[TweetLink; 4]> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_parse_x_com_url() {
@@ -199,5 +201,39 @@ mod tests {
                 .into_boxed_str(),
         );
         assert_eq!(url.original_url(), "https://twitter.com/user/status/12345");
+    }
+
+    #[test]
+    fn differential_hosts_produce_same_canonical_url() {
+        let x = parse_tweet_urls("https://x.com/user/status/424242");
+        let twitter = parse_tweet_urls("https://twitter.com/user/status/424242");
+        let vx = parse_tweet_urls("https://vxtwitter.com/user/status/424242");
+
+        let x = x.first().expect("x url should parse");
+        let twitter = twitter.first().expect("twitter url should parse");
+        let vx = vx.first().expect("vxtwitter url should parse");
+
+        assert_eq!(x.canonical_url(), twitter.canonical_url());
+        assert_eq!(x.canonical_url(), vx.canonical_url());
+    }
+
+    fn valid_user() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[A-Za-z0-9_]{1,15}").expect("valid regex strategy")
+    }
+
+    proptest! {
+        #[test]
+        fn parse_roundtrips_valid_x_urls(user in valid_user(), tweet_id in 1u64..u64::MAX) {
+            let content = format!("look https://x.com/{user}/status/{tweet_id}");
+            let urls = parse_tweet_urls(&content);
+            prop_assert_eq!(urls.len(), 1);
+            let parsed = urls.first().expect("exactly one parsed url");
+            prop_assert_eq!(parsed.user.as_ref(), user.as_str());
+            prop_assert_eq!(parsed.tweet_id.0, tweet_id);
+            prop_assert_eq!(
+                parsed.canonical_url(),
+                format!("https://x.com/{user}/status/{tweet_id}")
+            );
+        }
     }
 }
