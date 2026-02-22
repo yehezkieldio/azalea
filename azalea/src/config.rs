@@ -224,6 +224,287 @@ struct ConfigSources {
     process_env: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EnvBinding {
+    key: &'static str,
+    aliases: &'static [&'static str],
+    path: &'static [&'static str],
+}
+
+impl EnvBinding {
+    fn matches(self, key: &str) -> bool {
+        self.key == key || self.aliases.contains(&key)
+    }
+}
+
+const ENV_BINDINGS: &[EnvBinding] = &[
+    EnvBinding {
+        key: "APPLICATION_ID",
+        aliases: &[],
+        path: &["application_id"],
+    },
+    EnvBinding {
+        key: "WORKER_THREADS",
+        aliases: &[],
+        path: &["runtime", "worker_threads"],
+    },
+    EnvBinding {
+        key: "MAX_BLOCKING_THREADS",
+        aliases: &[],
+        path: &["runtime", "max_blocking_threads"],
+    },
+    EnvBinding {
+        key: "THREAD_STACK_SIZE",
+        aliases: &[],
+        path: &["runtime", "thread_stack_size"],
+    },
+    EnvBinding {
+        key: "DOWNLOAD",
+        aliases: &[],
+        path: &["concurrency", "download"],
+    },
+    EnvBinding {
+        key: "UPLOAD",
+        aliases: &[],
+        path: &["concurrency", "upload"],
+    },
+    EnvBinding {
+        key: "TRANSCODE",
+        aliases: &[],
+        path: &["concurrency", "transcode"],
+    },
+    EnvBinding {
+        key: "YTDLP",
+        aliases: &[],
+        path: &["concurrency", "ytdlp"],
+    },
+    EnvBinding {
+        key: "PIPELINE",
+        aliases: &[],
+        path: &["concurrency", "pipeline"],
+    },
+    EnvBinding {
+        key: "POOL_MAX_IDLE_PER_HOST",
+        aliases: &[],
+        path: &["http", "pool_max_idle_per_host"],
+    },
+    EnvBinding {
+        key: "POOL_IDLE_TIMEOUT_SECS",
+        aliases: &[],
+        path: &["http", "pool_idle_timeout_secs"],
+    },
+    EnvBinding {
+        key: "CONNECT_TIMEOUT_SECS",
+        aliases: &[],
+        path: &["http", "connect_timeout_secs"],
+    },
+    EnvBinding {
+        key: "TIMEOUT_SECS",
+        aliases: &[],
+        path: &["http", "timeout_secs"],
+    },
+    EnvBinding {
+        key: "TEMP_DIR",
+        aliases: &[],
+        path: &["storage", "temp_dir"],
+    },
+    EnvBinding {
+        key: "DEDUP_TTL_HOURS",
+        aliases: &[],
+        path: &["storage", "dedup_ttl_hours"],
+    },
+    EnvBinding {
+        key: "DEDUP_CACHE_SIZE",
+        aliases: &[],
+        path: &["storage", "dedup_cache_size"],
+    },
+    EnvBinding {
+        key: "DEDUP_PERSISTENT",
+        aliases: &[],
+        path: &["storage", "dedup_persistent"],
+    },
+    EnvBinding {
+        key: "DEDUP_DB_PATH",
+        aliases: &[],
+        path: &["storage", "dedup_db_path"],
+    },
+    EnvBinding {
+        key: "DEDUP_FLUSH_INTERVAL_SECS",
+        aliases: &[],
+        path: &["storage", "dedup_flush_interval_secs"],
+    },
+    EnvBinding {
+        key: "METRICS_DB_PATH",
+        aliases: &[],
+        path: &["storage", "metrics_db_path"],
+    },
+    EnvBinding {
+        key: "METRICS_ENABLED",
+        aliases: &[],
+        path: &["storage", "metrics_enabled"],
+    },
+    EnvBinding {
+        key: "RESOLVER_CACHE_TTL_SECS",
+        aliases: &[],
+        path: &["storage", "resolver_cache_ttl_secs"],
+    },
+    EnvBinding {
+        key: "RESOLVER_CACHE_SIZE",
+        aliases: &[],
+        path: &["storage", "resolver_cache_size"],
+    },
+    EnvBinding {
+        key: "RESOLVER_NEGATIVE_TTL_SECS",
+        aliases: &[],
+        path: &["storage", "resolver_negative_ttl_secs"],
+    },
+    EnvBinding {
+        key: "QUALITY_PRESET",
+        aliases: &[],
+        path: &["transcode", "quality_preset"],
+    },
+    EnvBinding {
+        key: "HARDWARE_ACCELERATION",
+        aliases: &[],
+        path: &["transcode", "hardware_acceleration"],
+    },
+    EnvBinding {
+        key: "FFMPEG_THREADS",
+        aliases: &[],
+        path: &["transcode", "ffmpeg_threads"],
+    },
+    EnvBinding {
+        key: "VAAPI_DEVICE",
+        aliases: &[],
+        path: &["transcode", "vaapi_device"],
+    },
+    EnvBinding {
+        key: "MAX_UPLOAD_BYTES",
+        aliases: &[],
+        path: &["transcode", "max_upload_bytes"],
+    },
+    EnvBinding {
+        key: "CONTAINER_OVERHEAD_RATIO",
+        aliases: &[],
+        path: &["transcode", "container_overhead_ratio"],
+    },
+    EnvBinding {
+        key: "VBR_SAFETY_MARGIN",
+        aliases: &[],
+        path: &["transcode", "vbr_safety_margin"],
+    },
+    EnvBinding {
+        key: "TRANSCODE_TARGET_RATIO",
+        aliases: &[],
+        path: &["transcode", "transcode_target_ratio"],
+    },
+    EnvBinding {
+        key: "SPLIT_TARGET_RATIO",
+        aliases: &[],
+        path: &["transcode", "split_target_ratio"],
+    },
+    EnvBinding {
+        key: "AUDIO_VBR_PADDING",
+        aliases: &[],
+        path: &["transcode", "audio_vbr_padding"],
+    },
+    EnvBinding {
+        key: "MIN_BITRATE_KBPS",
+        aliases: &[],
+        path: &["transcode", "min_bitrate_kbps"],
+    },
+    EnvBinding {
+        key: "MAX_SINGLE_VIDEO_DURATION_SECS",
+        aliases: &[],
+        path: &["transcode", "max_single_video_duration_secs"],
+    },
+    EnvBinding {
+        key: "FFPROBE_TIMEOUT_SECS",
+        aliases: &[],
+        path: &["transcode", "ffprobe_timeout_secs"],
+    },
+    EnvBinding {
+        key: "FFMPEG_TIMEOUT_SECS",
+        aliases: &[],
+        path: &["transcode", "ffmpeg_timeout_secs"],
+    },
+    EnvBinding {
+        key: "QUEUE_BACKPRESSURE_TIMEOUT_MS",
+        aliases: &[],
+        path: &["pipeline", "queue_backpressure_timeout_ms"],
+    },
+    EnvBinding {
+        key: "DOWNLOAD_TIMEOUT_SECS",
+        aliases: &[],
+        path: &["pipeline", "download_timeout_secs"],
+    },
+    EnvBinding {
+        key: "UPLOAD_TIMEOUT_SECS",
+        aliases: &[],
+        path: &["pipeline", "upload_timeout_secs"],
+    },
+    EnvBinding {
+        key: "MIN_DISK_SPACE_BYTES",
+        aliases: &[],
+        path: &["pipeline", "min_disk_space_bytes"],
+    },
+    EnvBinding {
+        key: "MAX_DOWNLOAD_BYTES",
+        aliases: &[],
+        path: &["pipeline", "max_download_bytes"],
+    },
+    EnvBinding {
+        key: "RESOLVER_TIMEOUT_SECS",
+        aliases: &[],
+        path: &["pipeline", "resolver_timeout_secs"],
+    },
+    EnvBinding {
+        key: "YTDLP_TIMEOUT_SECS",
+        aliases: &[],
+        path: &["pipeline", "ytdlp_timeout_secs"],
+    },
+    EnvBinding {
+        key: "USER_RATE_LIMIT_REQUESTS",
+        aliases: &[],
+        path: &["pipeline", "user_rate_limit_requests"],
+    },
+    EnvBinding {
+        key: "USER_RATE_LIMIT_WINDOW_SECS",
+        aliases: &[],
+        path: &["pipeline", "user_rate_limit_window_secs"],
+    },
+    EnvBinding {
+        key: "CHANNEL_RATE_LIMIT_REQUESTS",
+        aliases: &[],
+        path: &["pipeline", "channel_rate_limit_requests"],
+    },
+    EnvBinding {
+        key: "CHANNEL_RATE_LIMIT_WINDOW_SECS",
+        aliases: &[],
+        path: &["pipeline", "channel_rate_limit_window_secs"],
+    },
+    EnvBinding {
+        key: "PARALLEL_SEGMENT_THRESHOLD",
+        aliases: &[],
+        path: &["pipeline", "parallel_segment_threshold"],
+    },
+    EnvBinding {
+        key: "FFMPEG",
+        aliases: &["FFMPEG_PATH"],
+        path: &["binaries", "ffmpeg"],
+    },
+    EnvBinding {
+        key: "FFPROBE",
+        aliases: &["FFPROBE_PATH"],
+        path: &["binaries", "ffprobe"],
+    },
+    EnvBinding {
+        key: "YTDLP_PATH",
+        aliases: &[],
+        path: &["binaries", "ytdlp"],
+    },
+];
+
 fn load_from_sources(sources: ConfigSources) -> anyhow::Result<LoadedConfig> {
     let mut figment = Figment::new();
 
@@ -279,75 +560,16 @@ fn config_path_from_env_key(key: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    if normalized == "APPLICATION_ID" || normalized == "AZALEA_APPLICATION_ID" {
+    if normalized == "APPLICATION_ID" {
         return Some(vec!["application_id".to_string()]);
     }
 
-    if let Some(suffix) = normalized.strip_prefix("AZALEA_") {
-        let shortcut = match suffix {
-            "WORKER_THREADS" => Some(vec!["runtime".to_string(), "worker_threads".to_string()]),
-            "MAX_BLOCKING_THREADS" => Some(vec![
-                "runtime".to_string(),
-                "max_blocking_threads".to_string(),
-            ]),
-            "THREAD_STACK_SIZE" => {
-                Some(vec!["runtime".to_string(), "thread_stack_size".to_string()])
-            }
-            "HARDWARE_ACCELERATION" => Some(vec![
-                "transcode".to_string(),
-                "hardware_acceleration".to_string(),
-            ]),
-            _ => None,
-        };
-        if shortcut.is_some() {
-            return shortcut;
-        }
-
-        if let Some(path) = config_path_from_single_underscore_key(suffix) {
-            return Some(path);
-        }
-
-        let parts = suffix
-            .split("__")
-            .filter(|part| !part.is_empty())
-            .map(|part| part.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        if !parts.is_empty() {
-            return Some(parts);
-        }
-    }
-
-    None
-}
-
-fn config_path_from_single_underscore_key(suffix: &str) -> Option<Vec<String>> {
-    const SECTIONS: [&str; 7] = [
-        "RUNTIME",
-        "CONCURRENCY",
-        "HTTP",
-        "STORAGE",
-        "TRANSCODE",
-        "PIPELINE",
-        "BINARIES",
-    ];
-
-    for section in SECTIONS {
-        let Some(rest) = suffix.strip_prefix(section) else {
-            continue;
-        };
-        let Some(field) = rest.strip_prefix('_') else {
-            continue;
-        };
-        if field.is_empty() || field.starts_with('_') {
-            continue;
-        }
-        return Some(vec![
-            section.to_ascii_lowercase(),
-            field.to_ascii_lowercase(),
-        ]);
-    }
-
-    None
+    let suffix = normalized.strip_prefix("AZALEA_")?;
+    let path = ENV_BINDINGS
+        .iter()
+        .find(|binding| binding.matches(suffix))
+        .map(|binding| binding.path)?;
+    Some(path.iter().map(|part| (*part).to_string()).collect())
 }
 
 fn insert_nested(root: &mut Map<String, Value>, path: &[String], value: Value) {
@@ -468,6 +690,31 @@ mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
     use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    fn resolve_schema_ref<'a>(schema: &'a Value, mut node: &'a Value) -> Option<&'a Value> {
+        while let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+            node = schema.pointer(reference.strip_prefix('#')?)?;
+        }
+        Some(node)
+    }
+
+    fn schema_has_config_path(schema: &Value, path: &[&str]) -> bool {
+        let mut current = schema;
+        for segment in path {
+            let Some(resolved) = resolve_schema_ref(schema, current) else {
+                return false;
+            };
+            let Some(properties) = resolved.get("properties").and_then(Value::as_object) else {
+                return false;
+            };
+            let Some(next) = properties.get(*segment) else {
+                return false;
+            };
+            current = next;
+        }
+        true
+    }
 
     #[test]
     fn test_default_config_validates() {
@@ -491,18 +738,12 @@ mod tests {
             ),
             dotenv_entries: vec![
                 ("APPLICATION_ID".to_string(), "22".to_string()),
-                (
-                    "AZALEA_RUNTIME__WORKER_THREADS".to_string(),
-                    "4".to_string(),
-                ),
+                ("AZALEA_WORKER_THREADS".to_string(), "4".to_string()),
                 ("DISCORD_TOKEN".to_string(), "dotenv-token".to_string()),
             ],
             process_env: vec![
                 ("APPLICATION_ID".to_string(), "33".to_string()),
-                (
-                    "AZALEA_RUNTIME__WORKER_THREADS".to_string(),
-                    "6".to_string(),
-                ),
+                ("AZALEA_WORKER_THREADS".to_string(), "6".to_string()),
                 ("DISCORD_TOKEN".to_string(), "env-token".to_string()),
             ],
         })?;
@@ -547,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn load_supports_single_underscore_env_paths() -> anyhow::Result<()> {
+    fn load_supports_flat_env_paths() -> anyhow::Result<()> {
         let loaded = load_from_sources(ConfigSources {
             config_file_contents: Some(
                 r#"
@@ -560,10 +801,7 @@ mod tests {
             dotenv_entries: Vec::new(),
             process_env: vec![
                 ("APPLICATION_ID".to_string(), "123456789".to_string()),
-                (
-                    "AZALEA_PIPELINE_MAX_DOWNLOAD_BYTES".to_string(),
-                    "700".to_string(),
-                ),
+                ("AZALEA_MAX_DOWNLOAD_BYTES".to_string(), "700".to_string()),
                 ("DISCORD_TOKEN".to_string(), "secret".to_string()),
             ],
         })?;
@@ -599,16 +837,16 @@ mod tests {
     }
 
     #[test]
-    fn config_path_maps_nested_and_shortcut_keys() {
+    fn config_path_maps_flat_keys() {
         assert_eq!(
-            config_path_from_env_key("AZALEA_PIPELINE__MAX_DOWNLOAD_BYTES"),
+            config_path_from_env_key("AZALEA_MAX_DOWNLOAD_BYTES"),
             Some(vec![
                 "pipeline".to_string(),
                 "max_download_bytes".to_string()
             ])
         );
         assert_eq!(
-            config_path_from_env_key("AZALEA_RUNTIME_WORKER_THREADS"),
+            config_path_from_env_key("AZALEA_WORKER_THREADS"),
             Some(vec!["runtime".to_string(), "worker_threads".to_string()])
         );
         assert_eq!(
@@ -618,7 +856,60 @@ mod tests {
                 "hardware_acceleration".to_string()
             ])
         );
+        assert_eq!(
+            config_path_from_env_key("AZALEA_FFMPEG"),
+            Some(vec!["binaries".to_string(), "ffmpeg".to_string()])
+        );
+        assert_eq!(
+            config_path_from_env_key("AZALEA_YTDLP_PATH"),
+            Some(vec!["binaries".to_string(), "ytdlp".to_string()])
+        );
+        assert_eq!(
+            config_path_from_env_key("AZALEA_PIPELINE__MAX_DOWNLOAD_BYTES"),
+            None
+        );
         assert_eq!(config_path_from_env_key("DISCORD_TOKEN"), None);
+    }
+
+    #[test]
+    fn env_registry_keys_are_unique() {
+        let mut keys = HashSet::new();
+        for binding in ENV_BINDINGS {
+            assert!(
+                keys.insert(binding.key),
+                "duplicate env key {}",
+                binding.key
+            );
+            for alias in binding.aliases {
+                assert!(keys.insert(alias), "duplicate env alias {}", alias);
+            }
+        }
+    }
+
+    #[test]
+    fn env_registry_paths_exist_in_schema() -> anyhow::Result<()> {
+        let schema: Value = serde_json::from_str(include_str!("../../azalea.schema.json"))?;
+        for binding in ENV_BINDINGS {
+            assert!(
+                schema_has_config_path(&schema, binding.path),
+                "invalid config path for {}: {}",
+                binding.key,
+                binding.path.join(".")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn env_registry_aliases_resolve() {
+        assert_eq!(
+            config_path_from_env_key("AZALEA_FFMPEG_PATH"),
+            Some(vec!["binaries".to_string(), "ffmpeg".to_string()])
+        );
+        assert_eq!(
+            config_path_from_env_key("AZALEA_FFPROBE_PATH"),
+            Some(vec!["binaries".to_string(), "ffprobe".to_string()])
+        );
     }
 
     #[test]
