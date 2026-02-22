@@ -183,7 +183,7 @@ VideoToolbox is macOS-only. Run Azalea natively on macOS to leverage Apple hardw
 
 ## Configuration
 
-By default, Azalea only requirs `APPLICATION_ID` and `DISCORD_TOKEN` to run, with sensible defaults for all other settings.
+By default, Azalea only requires `APPLICATION_ID` and `DISCORD_TOKEN` to run, with sensible defaults for all other settings.
 
 Configuration is loaded from three sources in ascending priority order:
 
