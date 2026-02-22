@@ -22,12 +22,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
+  CARGO_INCREMENTAL: 0  # Disable incremental compilation; faster for CI due to clean cache behaviour.
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/${{ github.repository }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel in-progress runs on PRs and non-master branches; never cancel tag or master runs.
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.ref != 'refs/heads/master' }}
 
 jobs:
@@ -69,15 +70,16 @@ jobs:
   build-and-push:
     name: Build & Push (${{ matrix.flavor }})
     needs: [clippy, test, fmt]
+    # Only publish images on version tags; PRs and branch pushes run CI only.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
+      id-token: write      # Required for OIDC-based Sigstore signing
+      attestations: write  # Required for build provenance attestation
     strategy:
-      fail-fast: false
+      fail-fast: false  # Allow both flavors to complete even if one fails
       matrix:
         flavor: [cpu, vaapi]
 
@@ -113,6 +115,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: mode=max
+          # Registry-backed layer cache keyed per flavor to avoid cross-contamination.
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.flavor }}
           cache-to:   type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.flavor }},mode=max
 
@@ -126,6 +129,7 @@ jobs:
       - uses: sigstore/cosign-installer@v3
 
       - name: Sign image
+        # Keyless signing via Sigstore; the OIDC token from id-token: write is used automatically.
         run: cosign sign --yes ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
 
   create-release:
@@ -143,6 +147,8 @@ jobs:
         id: changelog
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
+          # Pull the section for this version from CHANGELOG.md; fall back to a
+          # minimal placeholder if the version entry is missing.
           awk -v ver="$CLEAN_VER" '
             $0 ~ "^## \\[" ver || $0 ~ "^## " ver { in_section=1; next }
             in_section && /^## / { exit }
