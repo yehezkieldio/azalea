@@ -625,3 +625,37 @@ async fn verify_dependencies(binaries: &BinarySettings) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+
+    fn unique_temp_file(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("azalea-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn resolve_binary_path_rejects_missing_explicit_paths() {
+        let missing = Path::new("./definitely-missing-binary");
+        let err = resolve_binary_path(missing, "test-binary")
+            .expect_err("missing explicit path should fail");
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn resolve_binary_path_accepts_existing_explicit_paths() {
+        let file = unique_temp_file("bin-path");
+        std::fs::write(&file, b"#!/bin/sh\nexit 0\n").expect("write temp file");
+
+        let resolved = resolve_binary_path(&file, "temp-binary")
+            .expect("existing explicit path should resolve");
+        assert!(resolved.exists());
+
+        let _ = std::fs::remove_file(file);
+    }
+}

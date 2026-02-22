@@ -286,9 +286,10 @@ fn config_path_from_env_key(key: &str) -> Option<Vec<String>> {
     if let Some(suffix) = normalized.strip_prefix("AZALEA_") {
         let shortcut = match suffix {
             "WORKER_THREADS" => Some(vec!["runtime".to_string(), "worker_threads".to_string()]),
-            "MAX_BLOCKING_THREADS" => {
-                Some(vec!["runtime".to_string(), "max_blocking_threads".to_string()])
-            }
+            "MAX_BLOCKING_THREADS" => Some(vec![
+                "runtime".to_string(),
+                "max_blocking_threads".to_string(),
+            ]),
             "THREAD_STACK_SIZE" => {
                 Some(vec!["runtime".to_string(), "thread_stack_size".to_string()])
             }
@@ -336,7 +337,10 @@ fn config_path_from_single_underscore_key(suffix: &str) -> Option<Vec<String>> {
         if field.is_empty() || field.starts_with('_') {
             continue;
         }
-        return Some(vec![section.to_ascii_lowercase(), field.to_ascii_lowercase()]);
+        return Some(vec![
+            section.to_ascii_lowercase(),
+            field.to_ascii_lowercase(),
+        ]);
     }
 
     None
@@ -457,7 +461,9 @@ fn resolve_discord_token(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_default_config_validates() {
@@ -481,12 +487,18 @@ mod tests {
             ),
             dotenv_entries: vec![
                 ("APPLICATION_ID".to_string(), "22".to_string()),
-                ("AZALEA_RUNTIME__WORKER_THREADS".to_string(), "4".to_string()),
+                (
+                    "AZALEA_RUNTIME__WORKER_THREADS".to_string(),
+                    "4".to_string(),
+                ),
                 ("DISCORD_TOKEN".to_string(), "dotenv-token".to_string()),
             ],
             process_env: vec![
                 ("APPLICATION_ID".to_string(), "33".to_string()),
-                ("AZALEA_RUNTIME__WORKER_THREADS".to_string(), "6".to_string()),
+                (
+                    "AZALEA_RUNTIME__WORKER_THREADS".to_string(),
+                    "6".to_string(),
+                ),
                 ("DISCORD_TOKEN".to_string(), "env-token".to_string()),
             ],
         })?;
@@ -566,5 +578,55 @@ mod tests {
         };
         assert!(err.to_string().contains("Invalid .env entry"));
         Ok(())
+    }
+
+    #[test]
+    fn parse_env_scalar_handles_common_types() {
+        assert_eq!(parse_env_scalar("true"), Value::Bool(true));
+        assert_eq!(parse_env_scalar("42"), Value::Number(42u64.into()));
+        assert_eq!(
+            parse_env_scalar("3.5"),
+            Value::Number(Number::from_f64(3.5).expect("finite"))
+        );
+        assert_eq!(
+            parse_env_scalar("hello"),
+            Value::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn config_path_maps_nested_and_shortcut_keys() {
+        assert_eq!(
+            config_path_from_env_key("AZALEA_PIPELINE__MAX_DOWNLOAD_BYTES"),
+            Some(vec![
+                "pipeline".to_string(),
+                "max_download_bytes".to_string()
+            ])
+        );
+        assert_eq!(
+            config_path_from_env_key("AZALEA_RUNTIME_WORKER_THREADS"),
+            Some(vec!["runtime".to_string(), "worker_threads".to_string()])
+        );
+        assert_eq!(config_path_from_env_key("DISCORD_TOKEN"), None);
+    }
+
+    #[test]
+    fn resolve_discord_token_rejects_empty_values() {
+        let err = resolve_discord_token(
+            &[("DISCORD_TOKEN".to_string(), "dotenv-token".to_string())],
+            &[("DISCORD_TOKEN".to_string(), "   ".to_string())],
+        )
+        .expect_err("empty process token must be rejected");
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    proptest! {
+        #[test]
+        fn app_id_aliases_always_map_to_application_id(key in prop_oneof![Just("APPLICATION_ID"), Just("AZALEA_APPLICATION_ID")]) {
+            prop_assert_eq!(
+                config_path_from_env_key(key),
+                Some(vec!["application_id".to_string()])
+            );
+        }
     }
 }
