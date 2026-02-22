@@ -481,3 +481,97 @@ impl Inner {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+
+    fn unique_metrics_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("azalea-{name}-{nanos}.redb"))
+    }
+
+    fn storage_config(
+        metrics_enabled: bool,
+        metrics_db_path: std::path::PathBuf,
+    ) -> crate::config::StorageSettings {
+        crate::config::StorageSettings {
+            metrics_enabled,
+            metrics_db_path,
+            ..crate::config::StorageSettings::default()
+        }
+    }
+
+    #[test]
+    fn disabled_metrics_are_noop() {
+        let path = unique_metrics_path("metrics-disabled");
+        let tracker = Tracker::new(&storage_config(false, path)).expect("tracker should construct");
+        tracker.record_success();
+        tracker.record_failure();
+        tracker.record_stage_duration(Stage::Resolve, 123);
+        tracker.record_error("resolve_failed");
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.total_runs, 0);
+        assert_eq!(snapshot.successes, 0);
+        assert_eq!(snapshot.failures, 0);
+        assert_eq!(snapshot.stage_avg_ms, [0; 4]);
+    }
+
+    #[test]
+    fn snapshot_aggregates_counters_and_stage_averages() {
+        let path = unique_metrics_path("metrics-snapshot");
+        let tracker =
+            Tracker::new(&storage_config(true, path.clone())).expect("tracker should construct");
+        tracker.record_success();
+        tracker.record_failure();
+        tracker.record_stage_duration(Stage::Resolve, 100);
+        tracker.record_stage_duration(Stage::Resolve, 300);
+        tracker.record_stage_duration(Stage::Upload, 80);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.total_runs, 2);
+        assert_eq!(snapshot.successes, 1);
+        assert_eq!(snapshot.failures, 1);
+        assert_eq!(
+            snapshot.stage_avg_ms.get(Stage::Resolve as usize).copied(),
+            Some(200)
+        );
+        assert_eq!(
+            snapshot.stage_avg_ms.get(Stage::Upload as usize).copied(),
+            Some(80)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn flush_then_load_restores_persisted_state() {
+        let path = unique_metrics_path("metrics-persist");
+        let tracker =
+            Tracker::new(&storage_config(true, path.clone())).expect("tracker should construct");
+        tracker.record_success();
+        tracker.record_stage_duration(Stage::Download, 250);
+        tracker.record_error("download_failed");
+        tracker.flush().await;
+        drop(tracker);
+
+        let restored =
+            Tracker::new(&storage_config(true, path.clone())).expect("tracker should reconstruct");
+        restored.load_from_db().await.expect("load should succeed");
+
+        let snapshot = restored.snapshot();
+        assert_eq!(snapshot.total_runs, 1);
+        assert_eq!(snapshot.successes, 1);
+        assert_eq!(snapshot.failures, 0);
+        assert_eq!(
+            snapshot.stage_avg_ms.get(Stage::Download as usize).copied(),
+            Some(250)
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+}

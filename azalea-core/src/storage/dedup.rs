@@ -682,3 +682,112 @@ fn inflight_ttl_secs(pipeline: &PipelineSettings, transcode: &TranscodeSettings)
     let margin = 60;
     pipeline_total.max(doubled_ffmpeg).saturating_add(margin)
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use crate::config::{PipelineSettings, StorageSettings, TranscodeSettings};
+    use tokio::sync::Barrier;
+
+    fn in_memory_storage_settings() -> StorageSettings {
+        StorageSettings {
+            dedup_persistent: false,
+            ..StorageSettings::default()
+        }
+    }
+
+    #[test]
+    fn key_binary_roundtrip_is_stable() {
+        let key = Key::new(42, TweetId(999));
+        let bytes = key.to_bytes();
+        let parsed = Key::from_bytes(&bytes).expect("16-byte key must parse");
+        assert_eq!(parsed, key);
+    }
+
+    #[test]
+    fn key_rejects_invalid_binary_length() {
+        assert!(Key::from_bytes(&[]).is_none());
+        assert!(Key::from_bytes(&[0u8; 15]).is_none());
+        assert!(Key::from_bytes(&[0u8; 17]).is_none());
+    }
+
+    #[test]
+    fn inflight_ttl_uses_larger_pipeline_or_double_ffmpeg_budget() {
+        let mut pipeline = PipelineSettings {
+            download_timeout_secs: 10,
+            upload_timeout_secs: 20,
+            ..PipelineSettings::default()
+        };
+        let transcode = TranscodeSettings {
+            ffmpeg_timeout_secs: 120,
+            ..TranscodeSettings::default()
+        };
+        assert_eq!(inflight_ttl_secs(&pipeline, &transcode), 300);
+
+        pipeline.download_timeout_secs = 300;
+        pipeline.upload_timeout_secs = 120;
+        assert_eq!(inflight_ttl_secs(&pipeline, &transcode), 600);
+    }
+
+    #[tokio::test]
+    async fn reserve_inflight_allows_single_concurrent_winner() {
+        let storage = in_memory_storage_settings();
+        let cache = Cache::new(
+            &storage,
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should construct");
+        let barrier = Arc::new(Barrier::new(8));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache.reserve_inflight(7, TweetId(77)).await
+            }));
+        }
+
+        let mut winners = 0usize;
+        for handle in handles {
+            if handle.await.expect("task must join") {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_processed_sets_duplicate_and_clears_inflight() {
+        let storage = in_memory_storage_settings();
+        let cache = Cache::new(
+            &storage,
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should construct");
+
+        assert!(cache.reserve_inflight(9, TweetId(12)).await);
+        cache.mark_processed(9, TweetId(12)).await;
+        assert!(cache.is_duplicate(9, TweetId(12)).await);
+        assert!(!cache.reserve_inflight(9, TweetId(12)).await);
+    }
+
+    #[tokio::test]
+    async fn clear_inflight_allows_retry_after_failure() {
+        let storage = in_memory_storage_settings();
+        let cache = Cache::new(
+            &storage,
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should construct");
+
+        assert!(cache.reserve_inflight(1, TweetId(1)).await);
+        cache.clear_inflight(1, TweetId(1)).await;
+        assert!(cache.reserve_inflight(1, TweetId(1)).await);
+    }
+}
