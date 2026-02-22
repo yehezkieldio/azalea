@@ -45,3 +45,42 @@ impl Permits {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_config_values_are_clamped_to_one() {
+        let permits = Permits::new(&ConcurrencySettings {
+            download: 0,
+            upload: 0,
+            transcode: 0,
+            ytdlp: 0,
+            pipeline: 0,
+        });
+
+        assert_eq!(permits.download.available_permits(), 1);
+        assert_eq!(permits.upload.available_permits(), 1);
+        assert_eq!(permits.transcode.available_permits(), 1);
+        assert_eq!(permits.ytdlp.available_permits(), 1);
+        assert_eq!(permits.pipeline.available_permits(), 1);
+    }
+
+    #[test]
+    fn configured_values_are_preserved() {
+        let permits = Permits::new(&ConcurrencySettings {
+            download: 3,
+            upload: 2,
+            transcode: 4,
+            ytdlp: 5,
+            pipeline: 6,
+        });
+
+        assert_eq!(permits.download.available_permits(), 3);
+        assert_eq!(permits.upload.available_permits(), 2);
+        assert_eq!(permits.transcode.available_permits(), 4);
+        assert_eq!(permits.ytdlp.available_permits(), 5);
+        assert_eq!(permits.pipeline.available_permits(), 6);
+    }
+}
