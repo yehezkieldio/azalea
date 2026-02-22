@@ -21,7 +21,7 @@ Azalea is a Discord bot that fetches X (formerly Twitter) media directly into yo
 
 ## Building from Source
 
-Currently there are no pre-built binaries available. The recommended installation method is building from source.
+Azalea currently does not have a public running instance or pre-built binaries. The recommended installation method is building from source or using the provided Docker images, this may change in the future. See below for instructions.
 
 ### Prerequisites
 
@@ -207,7 +207,7 @@ AZALEA_VAAPI_DEVICE=/dev/dri/renderD128
 
 ## Development
 
-Requires `just` and `cargo-nextest`.
+Requires [`just`](https://just.systems/) and [`cargo-nextest`](https://nexte.st/).
 
 ```sh
 just check
@@ -222,7 +222,7 @@ Log output is controlled by `RUST_LOG`.
 
 ```sh
 RUST_LOG=info ./azalea
-RUST_LOG=azalea=debug ./azalea
+RUST_LOG=debug ./azalea
 RUST_LOG=trace ./azalea
 ```
 
