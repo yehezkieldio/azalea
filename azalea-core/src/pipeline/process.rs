@@ -141,3 +141,42 @@ pub(crate) async fn kill_process_group(child: &mut Child) {
 
     let _ = child.kill().await;
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_bounded_keeps_data_when_under_limit() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            let _ = writer.write_all(b"hello world").await;
+        });
+
+        let result = read_bounded(reader, 32, None)
+            .await
+            .expect("bounded read should succeed");
+        assert_eq!(result.data, b"hello world");
+        assert!(!result.exceeded);
+    }
+
+    #[tokio::test]
+    async fn read_bounded_truncates_and_notifies_on_overflow() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        let (tx, mut rx) = mpsc::channel(1);
+
+        tokio::spawn(async move {
+            let payload = vec![b'x'; 96];
+            let _ = writer.write_all(&payload).await;
+        });
+
+        let result = read_bounded(reader, 16, Some(tx))
+            .await
+            .expect("bounded read should succeed");
+        assert_eq!(result.data.len(), 16);
+        assert!(result.exceeded);
+        assert!(rx.recv().await.is_some());
+    }
+}

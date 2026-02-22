@@ -126,3 +126,51 @@ fn validation_error(message: impl Into<String>) -> Error {
         source: DownloadError::SsrfBlocked(message.into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_non_https_urls() {
+        let err = validate_media_url("http://pbs.twimg.com/media/test.mp4")
+            .await
+            .expect_err("http url must be rejected");
+        assert!(matches!(
+            err,
+            Error::DownloadFailed {
+                source: DownloadError::SsrfBlocked(_)
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_disallowed_hosts_without_dns_lookup() {
+        let err = validate_media_url("https://example.com/media/test.mp4")
+            .await
+            .expect_err("host not on allowlist must be rejected");
+        assert!(err.to_string().contains("host not on allowlist"));
+    }
+
+    #[tokio::test]
+    async fn rejects_ip_literal_hosts() {
+        let err = validate_media_url("https://127.0.0.1/media/test.mp4")
+            .await
+            .expect_err("ip literal must be rejected");
+        assert!(matches!(
+            err,
+            Error::DownloadFailed {
+                source: DownloadError::SsrfBlocked(_)
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_unapproved_ports() {
+        let err = validate_media_url("https://pbs.twimg.com:444/media/test.mp4")
+            .await
+            .expect_err("port should be rejected");
+        assert!(err.to_string().contains("port not allowed"));
+    }
+}

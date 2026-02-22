@@ -147,3 +147,47 @@ impl fmt::Display for Progress {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn sanitize_extension_normalizes_known_values() {
+        assert_eq!(sanitize_extension(".MP4"), "mp4");
+        assert_eq!(sanitize_extension(" jpg "), "jpg");
+        assert_eq!(sanitize_extension("png?size=large"), "png");
+    }
+
+    #[test]
+    fn sanitize_extension_rejects_unknown_and_path_like_values() {
+        assert_eq!(sanitize_extension("../etc/passwd"), "mp4");
+        assert_eq!(sanitize_extension(""), "mp4");
+        assert_eq!(sanitize_extension("tar.gz"), "mp4");
+    }
+
+    #[test]
+    fn progress_display_messages_are_stable() {
+        assert_eq!(Progress::Resolving.to_string(), "Resolving metadata...");
+        assert_eq!(Progress::Downloading.to_string(), "Downloading media...");
+        assert_eq!(Progress::Optimizing.to_string(), "Processing media...");
+        assert_eq!(
+            Progress::Transcoding(2, 5).to_string(),
+            "Transcoding segments (2/5)"
+        );
+        assert_eq!(Progress::Uploading.to_string(), "Uploading...");
+    }
+
+    proptest! {
+        #[test]
+        fn sanitize_extension_always_returns_safe_suffix(ext in ".*") {
+            let sanitized = sanitize_extension(&ext);
+            prop_assert!(matches!(
+                sanitized.as_str(),
+                "mp4" | "webm" | "mov" | "mkv" | "avi" | "ts" | "gif" | "jpg" | "jpeg" | "png" | "webp"
+            ));
+            prop_assert!(sanitized.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()));
+        }
+    }
+}

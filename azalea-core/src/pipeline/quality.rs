@@ -205,3 +205,60 @@ impl Ladder {
             .unwrap_or(240)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::panic)]
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn bitrate_compute_rejects_invalid_duration() {
+        let err = BitrateParams::compute(&TranscodeSettings::default(), 0.0)
+            .expect_err("duration <= 0.1 must fail");
+
+        match err {
+            Error::TranscodeFailed {
+                stage: TranscodeStage::Transcode,
+                ..
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bitrate_compute_respects_lower_bounds() {
+        let params = BitrateParams::compute(&TranscodeSettings::default(), 60.0)
+            .expect("default config should produce bitrate params");
+
+        assert!(params.video_bitrate_kbps >= 50);
+        assert!(params.audio_bitrate_kbps > 0);
+    }
+
+    #[test]
+    fn split_bitrate_uses_expected_audio_floor() {
+        let params = BitrateParams::compute_for_split(&TranscodeSettings::default(), 30.0)
+            .expect("split params should be computed");
+        assert_eq!(params.audio_bitrate_kbps, 128);
+        assert!(params.video_bitrate_kbps >= 100);
+    }
+
+    #[test]
+    fn ladder_downshifts_for_size_preset() {
+        let balanced = Ladder::recommend(Some(1080), 1600, QualityPreset::Balanced);
+        let size = Ladder::recommend(Some(1080), 1600, QualityPreset::Size);
+
+        assert_eq!(balanced.target_height, Some(720));
+        assert_eq!(size.target_height, Some(360));
+    }
+
+    proptest! {
+        #[test]
+        fn recommendation_is_monotonic_for_unknown_source(low in 100u32..4000, high in 100u32..4000) {
+            let (a, b) = if low <= high { (low, high) } else { (high, low) };
+            let ra = Ladder::recommend(None, a, QualityPreset::Balanced).target_height.unwrap_or(u32::MAX);
+            let rb = Ladder::recommend(None, b, QualityPreset::Balanced).target_height.unwrap_or(u32::MAX);
+            prop_assert!(rb >= ra || rb == u32::MAX);
+        }
+    }
+}

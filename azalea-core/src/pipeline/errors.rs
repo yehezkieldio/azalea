@@ -192,3 +192,55 @@ impl Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn duplicate_is_not_user_notified() {
+        let error = Error::Duplicate;
+        assert!(!error.should_notify_user());
+        assert_eq!(
+            error.user_message(),
+            "This tweet was already archived recently."
+        );
+    }
+
+    #[test]
+    fn ssrf_errors_have_security_user_message() {
+        let error = Error::DownloadFailed {
+            source: DownloadError::SsrfBlocked("blocked".to_string()),
+        };
+
+        assert!(error.should_notify_user());
+        assert_eq!(
+            error.user_message(),
+            "❌ The media URL was blocked for security reasons."
+        );
+    }
+
+    #[test]
+    fn transcode_display_contains_stage_and_stderr_tail() {
+        let error = Error::TranscodeFailed {
+            stage: TranscodeStage::Split,
+            exit_code: Some(1),
+            stderr_tail: "encoder failed".to_string(),
+        };
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("Split"));
+        assert!(rendered.contains("encoder failed"));
+        assert!(rendered.contains("exit=Some(1)"));
+    }
+
+    #[test]
+    fn io_error_propagates_source() {
+        let inner = std::io::Error::other("boom");
+        let error = Error::Io(inner);
+        let source = error.source().expect("io error should expose source");
+        assert_eq!(source.to_string(), "boom");
+    }
+}

@@ -364,3 +364,51 @@ pub async fn execute(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn to_strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn remux_args_include_copy_faststart_and_output() {
+        let args = remux_args(Path::new("in.mp4"), Path::new("out.mp4"), 4);
+        let as_text = to_strings(&args);
+        assert!(as_text.windows(2).any(|w| w == ["-c", "copy"]));
+        assert!(as_text.windows(2).any(|w| w == ["-movflags", "+faststart"]));
+        assert!(as_text.contains(&"out.mp4".to_string()));
+    }
+
+    #[test]
+    fn transcode_args_add_scale_filter_when_height_is_set() {
+        let args = transcode_args(
+            Path::new("input.mp4"),
+            Path::new("output.mp4"),
+            900,
+            128,
+            Some(720),
+            &TranscodeSettings::default(),
+            2,
+        );
+        let as_text = to_strings(&args);
+        assert!(as_text.windows(2).any(|w| {
+            w.first() == Some(&"-vf".to_string())
+                && w.get(1).is_some_and(|value| value.contains("scale=-2:720"))
+        }));
+        assert!(as_text.windows(2).any(|w| w == ["-c:v", "libx264"]));
+    }
+
+    #[test]
+    fn split_copy_args_include_segment_settings() {
+        let args = split_copy_args(Path::new("input.mp4"), Path::new("seg%03d.mp4"), 11.5);
+        let as_text = to_strings(&args);
+        assert!(as_text.windows(2).any(|w| w == ["-f", "segment"]));
+        assert!(as_text.windows(2).any(|w| w == ["-segment_time", "11.5"]));
+    }
+}
