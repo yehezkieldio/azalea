@@ -19,10 +19,6 @@ clippy *args:
 test *args:
     {{cargo}} nextest run {{args}}
 
-# Run integration tests specifically
-test-integ:
-    {{cargo}} nextest run -E 'binary(integration_test)'
-
 # Format code and check for style issues
 fmt:
     {{cargo}} fmt --all
@@ -31,6 +27,14 @@ fmt:
 fmt-check:
     {{cargo}} fmt --all -- --check
 
-# Run the binary with optional arguments
-run *args:
-    {{cargo}} run -p azalea {{args}}
+# Run the main application
+run:
+    {{cargo}} run --bin azalea
+
+# Generate JSON Schema for configuration
+generate-schema:
+    {{cargo}} run --bin generate-schema --features schemars
+
+# Generate default configuration file
+generate-config:
+    {{cargo}} run --bin generate-config
