@@ -23,7 +23,7 @@ mod gateway;
 mod pipeline;
 
 use app::App;
-use azalea_core::config::BinarySettings;
+use azalea_core::config::{BinarySettings, HardwareAcceleration, TranscodeSettings};
 use azalea_core::media;
 use azalea_core::pipeline as core_pipeline;
 use azalea_core::storage::Stage;
@@ -105,7 +105,7 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
     raise_fd_limit();
     let mut config = config;
     resolve_dependencies(&mut config.engine.binaries)?;
-    verify_dependencies(&config.engine.binaries).await?;
+    verify_dependencies(&config.engine.binaries, &config.engine.transcode).await?;
 
     // Ensure temp storage is available before starting the worker.
     tokio::fs::create_dir_all(&config.engine.storage.temp_dir).await?;
@@ -586,7 +586,10 @@ fn resolve_binary_path(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
 ///
 /// ## Security-sensitive paths
 /// Only fixed command names are executed; no user input is interpolated.
-async fn verify_dependencies(binaries: &BinarySettings) -> anyhow::Result<()> {
+async fn verify_dependencies(
+    binaries: &BinarySettings,
+    transcode: &TranscodeSettings,
+) -> anyhow::Result<()> {
     tracing::info!("Verifying external dependencies...");
 
     let checks = [
@@ -623,7 +626,124 @@ async fn verify_dependencies(binaries: &BinarySettings) -> anyhow::Result<()> {
         }
     }
 
+    if let Err(error) = log_hardware_acceleration_diagnostics(binaries, transcode).await {
+        tracing::warn!(error = %error, "Failed to collect hardware acceleration diagnostics");
+    }
+
     Ok(())
+}
+
+async fn log_hardware_acceleration_diagnostics(
+    binaries: &BinarySettings,
+    transcode: &TranscodeSettings,
+) -> anyhow::Result<()> {
+    let configured_backend = transcode.hardware_acceleration;
+    let encoder = configured_backend.encoder();
+    tracing::debug!(?configured_backend, "Running hardware acceleration check");
+    tracing::info!(
+        ?configured_backend,
+        encoder,
+        ffmpeg_path = %binaries.ffmpeg.display(),
+        "Hardware acceleration configuration loaded"
+    );
+
+    if configured_backend == HardwareAcceleration::None {
+        tracing::info!("Hardware acceleration disabled by config; using software encoding");
+        return Ok(());
+    }
+
+    if configured_backend == HardwareAcceleration::Vaapi {
+        let vaapi_device = Path::new(transcode.vaapi_device.as_ref());
+        if vaapi_device.exists() {
+            tracing::info!(vaapi_device = %vaapi_device.display(), "Configured VAAPI device exists");
+        } else {
+            tracing::warn!(
+                vaapi_device = %vaapi_device.display(),
+                "Configured VAAPI device not found; ffmpeg may fail"
+            );
+        }
+    }
+
+    let encoder_available = ffmpeg_supports_encoder(&binaries.ffmpeg, encoder).await?;
+    if encoder_available {
+        tracing::info!(
+            ?configured_backend,
+            encoder,
+            "Configured hardware acceleration encoder is available"
+        );
+    } else {
+        tracing::warn!(
+            ?configured_backend,
+            encoder,
+            "Configured hardware acceleration encoder is not available in ffmpeg"
+        );
+    }
+
+    let hwaccel_backend = match configured_backend {
+        HardwareAcceleration::None => None,
+        HardwareAcceleration::Nvenc => Some("cuda"),
+        HardwareAcceleration::Vaapi => Some("vaapi"),
+        HardwareAcceleration::VideoToolbox => Some("videotoolbox"),
+    };
+    if let Some(hwaccel_backend) = hwaccel_backend {
+        let hwaccel_available = ffmpeg_supports_hwaccel(&binaries.ffmpeg, hwaccel_backend).await?;
+        tracing::debug!(
+            ?configured_backend,
+            hwaccel_backend,
+            hwaccel_available,
+            "Hardware acceleration backend diagnostics"
+        );
+    }
+
+    Ok(())
+}
+
+async fn ffmpeg_supports_encoder(ffmpeg_path: &Path, encoder: &str) -> anyhow::Result<bool> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(DEPENDENCY_CHECK_TIMEOUT_SECS),
+        Command::new(ffmpeg_path)
+            .args(["-hide_banner", "-encoders"])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ffmpeg encoder probe timed out"))??;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffmpeg encoder probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let found = stdout
+        .lines()
+        .any(|line| line.split_whitespace().any(|token| token.trim() == encoder));
+    tracing::trace!(encoder, found, "ffmpeg encoder probe result");
+    Ok(found)
+}
+
+async fn ffmpeg_supports_hwaccel(ffmpeg_path: &Path, backend: &str) -> anyhow::Result<bool> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(DEPENDENCY_CHECK_TIMEOUT_SECS),
+        Command::new(ffmpeg_path)
+            .args(["-hide_banner", "-hwaccels"])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ffmpeg hwaccel probe timed out"))??;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffmpeg hwaccel probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let found = stdout.lines().any(|line| line.trim() == backend);
+    tracing::trace!(backend, found, "ffmpeg hwaccel backend probe result");
+    Ok(found)
 }
 
 #[cfg(test)]

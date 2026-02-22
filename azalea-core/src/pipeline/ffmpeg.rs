@@ -13,12 +13,13 @@ use crate::config::{HardwareAcceleration, TranscodeSettings};
 use crate::pipeline::errors::{Error, TranscodeStage};
 use crate::pipeline::process::{SubprocessGuard, kill_process_group, read_bounded};
 use smallvec::SmallVec;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tracing::{debug, trace};
 
 /// Small-vector argument list to avoid heap allocations for common cases.
 ///
@@ -30,6 +31,19 @@ const MAX_FFMPEG_KBPS: u64 = 100_000;
 
 fn clamp_kbps(value: u64) -> u64 {
     value.min(MAX_FFMPEG_KBPS)
+}
+
+fn has_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter().any(|arg| arg.as_os_str() == OsStr::new(flag))
+}
+
+fn arg_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if arg.as_os_str() != OsStr::new(flag) {
+            return None;
+        }
+        args.get(index + 1).and_then(|value| value.to_str())
+    })
 }
 
 fn push_video_encoding_args(
@@ -131,10 +145,20 @@ pub fn transcode_args(
     config: &TranscodeSettings,
     transcode_concurrency: u32,
 ) -> Args {
+    debug!(
+        hardware_acceleration = ?config.hardware_acceleration,
+        encoder = config.hardware_acceleration.encoder(),
+        max_height,
+        "Building ffmpeg transcode args"
+    );
     let mut args = Args::new();
     args.push("-y".into());
 
     if config.hardware_acceleration == HardwareAcceleration::Vaapi {
+        debug!(
+            vaapi_device = %config.vaapi_device,
+            "Applying VAAPI hardware acceleration args for transcode"
+        );
         args.push("-init_hw_device".into());
         args.push(format!("vaapi=va:{}", config.vaapi_device).into());
         args.push("-filter_hw_device".into());
@@ -191,10 +215,19 @@ pub fn split_args(
     config: &TranscodeSettings,
     transcode_concurrency: u32,
 ) -> Args {
+    debug!(
+        hardware_acceleration = ?config.hardware_acceleration,
+        encoder = config.hardware_acceleration.encoder(),
+        "Building ffmpeg split args"
+    );
     let mut args = Args::new();
     args.push("-y".into());
 
     if config.hardware_acceleration == HardwareAcceleration::Vaapi {
+        debug!(
+            vaapi_device = %config.vaapi_device,
+            "Applying VAAPI hardware acceleration args for split"
+        );
         args.push("-init_hw_device".into());
         args.push(format!("vaapi=va:{}", config.vaapi_device).into());
         args.push("-filter_hw_device".into());
@@ -269,6 +302,15 @@ pub async fn execute(
 ) -> Result<(), Error> {
     const FFMPEG_STDERR_LIMIT: usize = 512 * 1024;
     const WAIT_TIMEOUT_SECS: u64 = 30;
+    debug!(
+        ?stage,
+        video_encoder = arg_value(args, "-c:v").unwrap_or("unknown"),
+        hwaccel = arg_value(args, "-hwaccel").unwrap_or("none"),
+        hwaccel_device = arg_value(args, "-hwaccel_device").unwrap_or("none"),
+        init_hw_device = has_flag(args, "-init_hw_device"),
+        "ffmpeg execution hardware acceleration plan"
+    );
+    trace!(?stage, args = ?args, "ffmpeg execution args");
 
     let mut command = Command::new(ffmpeg_path);
     command

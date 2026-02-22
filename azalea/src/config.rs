@@ -293,6 +293,10 @@ fn config_path_from_env_key(key: &str) -> Option<Vec<String>> {
             "THREAD_STACK_SIZE" => {
                 Some(vec!["runtime".to_string(), "thread_stack_size".to_string()])
             }
+            "HARDWARE_ACCELERATION" => Some(vec![
+                "transcode".to_string(),
+                "hardware_acceleration".to_string(),
+            ]),
             _ => None,
         };
         if shortcut.is_some() {
@@ -606,6 +610,13 @@ mod tests {
         assert_eq!(
             config_path_from_env_key("AZALEA_RUNTIME_WORKER_THREADS"),
             Some(vec!["runtime".to_string(), "worker_threads".to_string()])
+        );
+        assert_eq!(
+            config_path_from_env_key("AZALEA_HARDWARE_ACCELERATION"),
+            Some(vec![
+                "transcode".to_string(),
+                "hardware_acceleration".to_string()
+            ])
         );
         assert_eq!(config_path_from_env_key("DISCORD_TOKEN"), None);
     }
