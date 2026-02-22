@@ -45,7 +45,11 @@ fn warn_if_slow(stage: Stage, duration_ms: u64, threshold_ms: u64) {
             "Pipeline stage exceeded warning threshold"
         );
     } else {
-        tracing::debug!(?stage, duration_ms, "Pipeline stage completed within threshold");
+        tracing::debug!(
+            ?stage,
+            duration_ms,
+            "Pipeline stage completed within threshold"
+        );
     }
 }
 

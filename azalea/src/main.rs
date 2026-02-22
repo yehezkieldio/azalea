@@ -473,10 +473,9 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             Ok(outcome) => {
                                 let upload_elapsed_ms = upload_start.elapsed().as_millis() as u64;
                                 // Record metrics and mark dedup only on success.
-                                app.engine.metrics.record_stage_duration(
-                                    Stage::Upload,
-                                    upload_elapsed_ms,
-                                );
+                                app.engine
+                                    .metrics
+                                    .record_stage_duration(Stage::Upload, upload_elapsed_ms);
                                 if upload_elapsed_ms > UPLOAD_DURATION_WARN_MS {
                                     tracing::warn!(
                                         upload_elapsed_ms,
@@ -484,7 +483,10 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                                         "Upload duration exceeded warning threshold"
                                     );
                                 } else {
-                                    tracing::debug!(upload_elapsed_ms, "Upload completed within threshold");
+                                    tracing::debug!(
+                                        upload_elapsed_ms,
+                                        "Upload completed within threshold"
+                                    );
                                 }
                                 app.engine.metrics.record_success();
                                 app.engine

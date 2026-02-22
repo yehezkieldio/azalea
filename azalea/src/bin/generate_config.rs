@@ -38,7 +38,11 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
     ),
     ("METRICS_DB_PATH", &[], "storage.metrics_db_path"),
     ("METRICS_ENABLED", &[], "storage.metrics_enabled"),
-    ("RESOLVER_CACHE_TTL_SECS", &[], "storage.resolver_cache_ttl_secs"),
+    (
+        "RESOLVER_CACHE_TTL_SECS",
+        &[],
+        "storage.resolver_cache_ttl_secs",
+    ),
     ("RESOLVER_CACHE_SIZE", &[], "storage.resolver_cache_size"),
     (
         "RESOLVER_NEGATIVE_TTL_SECS",
@@ -60,7 +64,11 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
         "transcode.container_overhead_ratio",
     ),
     ("VBR_SAFETY_MARGIN", &[], "transcode.vbr_safety_margin"),
-    ("TRANSCODE_TARGET_RATIO", &[], "transcode.transcode_target_ratio"),
+    (
+        "TRANSCODE_TARGET_RATIO",
+        &[],
+        "transcode.transcode_target_ratio",
+    ),
     ("SPLIT_TARGET_RATIO", &[], "transcode.split_target_ratio"),
     ("AUDIO_VBR_PADDING", &[], "transcode.audio_vbr_padding"),
     ("MIN_BITRATE_KBPS", &[], "transcode.min_bitrate_kbps"),
@@ -69,18 +77,30 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
         &[],
         "transcode.max_single_video_duration_secs",
     ),
-    ("FFPROBE_TIMEOUT_SECS", &[], "transcode.ffprobe_timeout_secs"),
+    (
+        "FFPROBE_TIMEOUT_SECS",
+        &[],
+        "transcode.ffprobe_timeout_secs",
+    ),
     ("FFMPEG_TIMEOUT_SECS", &[], "transcode.ffmpeg_timeout_secs"),
     (
         "QUEUE_BACKPRESSURE_TIMEOUT_MS",
         &[],
         "pipeline.queue_backpressure_timeout_ms",
     ),
-    ("DOWNLOAD_TIMEOUT_SECS", &[], "pipeline.download_timeout_secs"),
+    (
+        "DOWNLOAD_TIMEOUT_SECS",
+        &[],
+        "pipeline.download_timeout_secs",
+    ),
     ("UPLOAD_TIMEOUT_SECS", &[], "pipeline.upload_timeout_secs"),
     ("MIN_DISK_SPACE_BYTES", &[], "pipeline.min_disk_space_bytes"),
     ("MAX_DOWNLOAD_BYTES", &[], "pipeline.max_download_bytes"),
-    ("RESOLVER_TIMEOUT_SECS", &[], "pipeline.resolver_timeout_secs"),
+    (
+        "RESOLVER_TIMEOUT_SECS",
+        &[],
+        "pipeline.resolver_timeout_secs",
+    ),
     ("YTDLP_TIMEOUT_SECS", &[], "pipeline.ytdlp_timeout_secs"),
     (
         "USER_RATE_LIMIT_REQUESTS",
@@ -205,9 +225,15 @@ fn render_template() -> String {
     );
     line(
         &mut out,
-        &format!("connect_timeout_secs = {}", engine.http.connect_timeout_secs),
+        &format!(
+            "connect_timeout_secs = {}",
+            engine.http.connect_timeout_secs
+        ),
     );
-    line(&mut out, &format!("timeout_secs = {}", engine.http.timeout_secs));
+    line(
+        &mut out,
+        &format!("timeout_secs = {}", engine.http.timeout_secs),
+    );
     line(&mut out, "");
 
     line(&mut out, "[storage]");
@@ -335,7 +361,10 @@ fn render_template() -> String {
     );
     line(
         &mut out,
-        &format!("split_target_ratio = {}", engine.transcode.split_target_ratio),
+        &format!(
+            "split_target_ratio = {}",
+            engine.transcode.split_target_ratio
+        ),
     );
     line(
         &mut out,
@@ -361,7 +390,10 @@ fn render_template() -> String {
     );
     line(
         &mut out,
-        &format!("ffmpeg_timeout_secs = {}", engine.transcode.ffmpeg_timeout_secs),
+        &format!(
+            "ffmpeg_timeout_secs = {}",
+            engine.transcode.ffmpeg_timeout_secs
+        ),
     );
     line(&mut out, "");
 
@@ -382,7 +414,10 @@ fn render_template() -> String {
     );
     line(
         &mut out,
-        &format!("upload_timeout_secs = {}", engine.pipeline.upload_timeout_secs),
+        &format!(
+            "upload_timeout_secs = {}",
+            engine.pipeline.upload_timeout_secs
+        ),
     );
     line(
         &mut out,
@@ -407,7 +442,10 @@ fn render_template() -> String {
     );
     line(
         &mut out,
-        &format!("ytdlp_timeout_secs = {}", engine.pipeline.ytdlp_timeout_secs),
+        &format!(
+            "ytdlp_timeout_secs = {}",
+            engine.pipeline.ytdlp_timeout_secs
+        ),
     );
     line(
         &mut out,
@@ -482,10 +520,7 @@ fn render_template() -> String {
     for (key, aliases, path) in ENV_REFERENCES {
         let mut names = vec![format!("AZALEA_{key}")];
         names.extend(aliases.iter().map(|alias| format!("AZALEA_{alias}")));
-        line(
-            &mut out,
-            &format!("# - {} -> {}", names.join(", "), path),
-        );
+        line(&mut out, &format!("# - {} -> {}", names.join(", "), path));
     }
 
     out
