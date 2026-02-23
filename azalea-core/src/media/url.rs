@@ -337,10 +337,31 @@ mod tests {
         proptest::string::string_regex("[A-Za-z0-9_]{1,15}").expect("valid regex strategy")
     }
 
+    fn valid_host() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("x.com"),
+            Just("twitter.com"),
+            Just("www.x.com"),
+            Just("www.twitter.com"),
+            Just("mobile.x.com"),
+            Just("mobile.twitter.com"),
+            Just("fxtwitter.com"),
+            Just("vxtwitter.com"),
+            Just("fixupx.com"),
+            Just("twittpr.com"),
+        ]
+    }
+
     proptest! {
         #[test]
-        fn parse_roundtrips_valid_x_urls(user in valid_user(), tweet_id in 1u64..u64::MAX) {
-            let content = format!("look https://x.com/{user}/status/{tweet_id}");
+        fn parse_extracts_correct_tweet_id_for_any_valid_url(
+            user in valid_user(),
+            host in valid_host(),
+            tweet_id in any::<u64>(),
+            is_https in any::<bool>(),
+        ) {
+            let scheme = if is_https { "https" } else { "http" };
+            let content = format!("look {scheme}://{host}/{user}/status/{tweet_id}");
             let urls = parse_tweet_urls(&content);
             prop_assert_eq!(urls.len(), 1);
             let parsed = urls.first().expect("exactly one parsed url");
