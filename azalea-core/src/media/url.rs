@@ -133,7 +133,7 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn test_parse_x_com_url() {
+    fn test_parse_bare_x_com_url() {
         let content = "Check this out https://x.com/elonmusk/status/1234567890";
         let urls = parse_tweet_urls(content);
         assert_eq!(urls.len(), 1);
@@ -142,12 +142,30 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_twitter_com_url() {
+    fn test_parse_bare_twitter_com_url() {
         let content = "Old link: https://twitter.com/jack/status/9876543210";
         let urls = parse_tweet_urls(content);
         assert_eq!(urls.len(), 1);
         assert_eq!(urls.first().map(|url| url.user.as_ref()), Some("jack"));
         assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(9876543210));
+    }
+
+    #[test]
+    fn test_parse_www_twitter_com_url() {
+        let content = "WWW link: https://www.twitter.com/jack/status/9876543210";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls.first().map(|url| url.user.as_ref()), Some("jack"));
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(9876543210));
+    }
+
+    #[test]
+    fn test_parse_www_x_com_url() {
+        let content = "WWW link: https://www.x.com/elonmusk/status/1234567890";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls.first().map(|url| url.user.as_ref()), Some("elonmusk"));
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(1234567890));
     }
 
     #[test]
