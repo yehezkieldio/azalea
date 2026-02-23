@@ -201,6 +201,80 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_embedded_url_in_parentheses() {
+        let content = "Embedded (https://x.com/user/status/1001) in text";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(1001));
+    }
+
+    #[test]
+    fn test_parse_embedded_url_in_angle_brackets() {
+        let content = "Embedded <https://twitter.com/user/status/1002> in text";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(1002));
+    }
+
+    #[test]
+    fn test_parse_multiple_mixed_aliases() {
+        let content = "Mix https://x.com/a/status/11 and https://vxtwitter.com/b/status/22 and https://twittpr.com/c/status/33";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 3);
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(11));
+        assert_eq!(urls.get(1).map(|url| url.tweet_id.0), Some(22));
+        assert_eq!(urls.get(2).map(|url| url.tweet_id.0), Some(33));
+    }
+
+    #[test]
+    fn test_parse_duplicate_identical_urls_are_kept() {
+        let content = "Dupes https://x.com/user/status/777 https://x.com/user/status/777";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(777));
+        assert_eq!(urls.get(1).map(|url| url.tweet_id.0), Some(777));
+    }
+
+    #[test]
+    fn test_parse_duplicate_cross_host_same_tweet_are_kept() {
+        let content = "Dupes https://x.com/user/status/888 https://twitter.com/user/status/888";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(
+            urls.first().map(|url| url.canonical_url()),
+            Some("https://x.com/user/status/888")
+        );
+        assert_eq!(
+            urls.get(1).map(|url| url.canonical_url()),
+            Some("https://x.com/user/status/888")
+        );
+    }
+
+    #[test]
+    fn test_parse_url_with_query_string() {
+        let content = "Query https://x.com/user/status/999?s=20&t=abc";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 1);
+        let url = urls.first().expect("url should parse");
+        assert_eq!(url.tweet_id.0, 999);
+        assert_eq!(url.original_url(), "https://x.com/user/status/999");
+    }
+
+    #[test]
+    fn test_reject_uppercase_host() {
+        let content = "Upper host https://X.COM/user/status/123";
+        let urls = parse_tweet_urls(content);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn test_reject_uppercase_status_segment() {
+        let content = "Upper status https://x.com/user/STATUS/123";
+        let urls = parse_tweet_urls(content);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
     fn test_parse_multiple_urls() {
         let content = "Two tweets: https://x.com/a/status/111 and https://twitter.com/b/status/222";
         let urls = parse_tweet_urls(content);
