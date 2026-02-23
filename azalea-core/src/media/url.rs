@@ -19,7 +19,7 @@ use std::sync::LazyLock;
 /// Compiled regex patterns for X (formerly Twitter) URLs.
 static TWITTER_URL_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
     match Regex::new(
-        r"https?://(?:(?:www\.|mobile\.)?(?:twitter\.com|x\.com)|(?:fxtwitter\.com|vxtwitter\.com|fixupx\.com))/([A-Za-z0-9_]{1,15})/status/(\d+)",
+        r"https?://(?:(?:www\.|mobile\.)?(?:twitter\.com|x\.com)|(?:fxtwitter\.com|vxtwitter\.com|fixupx\.com|twittpr\.com))/([A-Za-z0-9_]{1,15})/status/(\d+)",
     ) {
         Ok(regex) => Some(regex),
         Err(error) => {
@@ -174,6 +174,30 @@ mod tests {
         let urls = parse_tweet_urls(content);
         assert_eq!(urls.len(), 1);
         assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(1111111111));
+    }
+
+    #[test]
+    fn test_parse_fxtwitter_url() {
+        let content = "FX link: https://fxtwitter.com/user/status/2222222222";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(2222222222));
+    }
+
+    #[test]
+    fn test_parse_fixupx_url() {
+        let content = "Fixup link: https://fixupx.com/user/status/3333333333";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(3333333333));
+    }
+
+    #[test]
+    fn test_parse_twittpr_url() {
+        let content = "Twittpr link: https://twittpr.com/user/status/4444444444";
+        let urls = parse_tweet_urls(content);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls.first().map(|url| url.tweet_id.0), Some(4444444444));
     }
 
     #[test]
