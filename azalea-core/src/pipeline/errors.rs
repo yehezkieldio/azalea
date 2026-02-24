@@ -79,22 +79,20 @@ impl Error {
     /// User-facing message suitable for Discord responses.
     pub fn user_message(&self) -> &'static str {
         match self {
-            Self::Duplicate => "This tweet was already archived recently.",
+            Self::Duplicate => "this tweet was already archived recently.",
             Self::ResolveFailed { .. } => {
-                "❌ Could not extract media from tweet. The tweet may be protected, deleted, or contain no media."
+                "could not extract media from tweet. the tweet may be protected, deleted, or contain no media."
             }
             Self::DownloadFailed { source } => match source {
-                DownloadError::SsrfBlocked(_) => {
-                    "❌ The media URL was blocked for security reasons."
-                }
-                _ => "❌ Failed to download media. Please try again later.",
+                DownloadError::SsrfBlocked(_) => "the media URL was blocked for security reasons.",
+                _ => "failed to download media. please try again later.",
             },
-            Self::TranscodeFailed { .. } => "❌ Failed to process media for upload.",
+            Self::TranscodeFailed { .. } => "failed to process media for upload.",
             Self::Timeout { .. } => {
-                "❌ Operation timed out. The media may be too large or the service is slow."
+                "operation timed out. the media may be too large or the service is slow."
             }
-            Self::DiskSpace { .. } => "❌ Not enough disk space to process the media.",
-            Self::Io(_) => "❌ An internal error occurred.",
+            Self::DiskSpace { .. } => "not enough disk space to process the media.",
+            Self::Io(_) => "an internal error occurred.",
         }
     }
 
@@ -205,7 +203,7 @@ mod tests {
         assert!(!error.should_notify_user());
         assert_eq!(
             error.user_message(),
-            "This tweet was already archived recently."
+            "this tweet was already archived recently."
         );
     }
 
@@ -218,7 +216,7 @@ mod tests {
         assert!(error.should_notify_user());
         assert_eq!(
             error.user_message(),
-            "❌ The media URL was blocked for security reasons."
+            "the media URL was blocked for security reasons."
         );
     }
 

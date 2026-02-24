@@ -393,7 +393,7 @@ pub async fn execute(
             joined
         }
         Ok(Err(e)) => format!("stderr read failed: {e}"),
-        Err(_) => "Unknown stderr error".to_string(),
+        Err(_) => "unknown stderr error".to_string(),
     };
 
     if !status.success() {
