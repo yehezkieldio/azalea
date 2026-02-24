@@ -1,4 +1,4 @@
-name: CI / Release
+name: CI
 
 on:
   pull_request:
@@ -68,7 +68,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   build-and-push:
-    name: Build & Push
+    name: Release / Build & Push Docker Images
     needs: [clippy, test, fmt]
     # Only publish images on version tags; PRs and branch pushes run CI only.
     if: startsWith(github.ref, 'refs/tags/v')
@@ -133,7 +133,7 @@ jobs:
         run: cosign sign --yes ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
 
   create-release:
-    name: Publish GitHub Release
+    name: Release / Announce GitHub Release
     needs: [build-and-push]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
