@@ -22,7 +22,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "deflate",
     "gzip",
     "json",
-    "rustls-tls",
+    "rustls",
     "http2",
     "stream",
 ] }
