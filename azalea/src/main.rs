@@ -680,7 +680,7 @@ async fn verify_dependencies(
                 // Surface stderr for easier diagnosis when the tool exists but fails.
                 if !output.status.success() {
                     let err = String::from_utf8_lossy(&output.stderr);
-                    anyhow::bail!("Dependency '{}' check failed: {}", label, err);
+                    anyhow::bail!("dependency '{}' check failed: {}", label, err);
                 }
                 let version = command_version_summary(&output);
                 tracing::info!(
@@ -692,14 +692,14 @@ async fn verify_dependencies(
             }
             Ok(Err(e)) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    anyhow::bail!("Required dependency '{}' is missing", label);
+                    anyhow::bail!("required dependency '{}' is missing", label);
                 } else {
-                    anyhow::bail!("Failed to execute dependency '{}': {}", label, e);
+                    anyhow::bail!("failed to execute dependency '{}': {}", label, e);
                 }
             }
             Err(_) => {
                 // Timeout avoids hanging startup on broken dependencies.
-                anyhow::bail!("Dependency '{}' check timed out", label);
+                anyhow::bail!("dependency '{}' check timed out", label);
             }
         }
     }

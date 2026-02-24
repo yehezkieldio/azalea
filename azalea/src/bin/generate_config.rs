@@ -139,7 +139,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "azalea.config.toml".to_string());
 
     if args.next().is_some() {
-        anyhow::bail!("Usage: generate-config [output-path|-]");
+        anyhow::bail!("usage: generate-config [output-path|-]");
     }
 
     let template = render_template();

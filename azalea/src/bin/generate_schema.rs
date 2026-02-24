@@ -22,7 +22,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "azalea.schema.json".to_string());
 
     if args.next().is_some() {
-        anyhow::bail!("Usage: generate-schema [output-path|-]");
+        anyhow::bail!("usage: generate-schema [output-path|-]");
     }
 
     let schema = schemars::schema_for!(config::AppConfig);

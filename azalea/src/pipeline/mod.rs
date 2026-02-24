@@ -96,8 +96,8 @@ impl Error {
     pub fn user_message(&self) -> &'static str {
         match self {
             Self::Core(err) => err.user_message(),
-            Self::UploadFailed { .. } => "❌ Failed to upload media to Discord.",
-            Self::DiscordApi { .. } => "❌ An internal error occurred.",
+            Self::UploadFailed { .. } => "failed to upload media to Discord.",
+            Self::DiscordApi { .. } => "an internal error occurred.",
         }
     }
 
@@ -155,7 +155,7 @@ mod tests {
 
         assert_eq!(
             app_error.user_message(),
-            "This tweet was already archived recently."
+            "this tweet was already archived recently."
         );
         assert!(!app_error.should_notify_user());
     }
@@ -169,7 +169,7 @@ mod tests {
         };
 
         assert!(err.should_notify_user());
-        assert_eq!(err.user_message(), "❌ Failed to upload media to Discord.");
+        assert_eq!(err.user_message(), "failed to upload media to Discord.");
         assert!(err.to_string().contains("upload failed (1/2): network"));
     }
 

@@ -127,18 +127,17 @@ async fn handle_media_command(
     job_sender: &mpsc::Sender<Job>,
 ) -> String {
     let Some(channel_id) = channel_id else {
-        return "This command can only be used in a channel.".to_string();
+        return "this command can only be used in a channel.".to_string();
     };
     let Some(author_id) = author_id else {
-        return "Could not determine the command author.".to_string();
+        return "could not determine the command author.".to_string();
     };
 
     if !app.user_rate_limiter.check(author_id).await {
-        return "⏳ You're sending requests too quickly. Please slow down.".to_string();
+        return "you're sending requests too quickly. please slow down.".to_string();
     }
     if !app.channel_rate_limiter.check(channel_id).await {
-        return "⏳ This channel is receiving too many requests. Please try again later."
-            .to_string();
+        return "this channel is receiving too many requests. please try again later.".to_string();
     }
 
     let url = match options
@@ -149,15 +148,15 @@ async fn handle_media_command(
             _ => None,
         }) {
         Some(url) => url,
-        None => return "Missing required URL.".to_string(),
+        None => return "missing required URL.".to_string(),
     };
 
     let mut tweet_urls = media::parse_tweet_urls(url).into_iter();
     let Some(tweet_url) = tweet_urls.next() else {
-        return "Please provide a valid tweet URL.".to_string();
+        return "please provide a valid tweet URL.".to_string();
     };
     if tweet_urls.next().is_some() {
-        return "Please provide exactly one tweet URL per command.".to_string();
+        return "please provide exactly one tweet URL per command.".to_string();
     }
 
     if app
@@ -166,7 +165,7 @@ async fn handle_media_command(
         .is_duplicate(channel_id.get(), tweet_url.tweet_id)
         .await
     {
-        return "That tweet was already processed recently in this channel.".to_string();
+        return "that tweet was already processed recently in this channel.".to_string();
     }
 
     let job = Job::new(
@@ -189,8 +188,8 @@ async fn handle_media_command(
             app.queue_depth.fetch_add(1, Ordering::Relaxed);
             "Queued for processing.".to_string()
         }
-        Ok(Err(_)) => "Job queue is unavailable right now. Please try again later.".to_string(),
-        Err(_) => "Queue is busy right now. Please try again in a moment.".to_string(),
+        Ok(Err(_)) => "job queue is unavailable right now. please try again later.".to_string(),
+        Err(_) => "queue is busy right now. please try again in a moment.".to_string(),
     }
 }
 

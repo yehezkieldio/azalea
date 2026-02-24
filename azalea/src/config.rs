@@ -635,12 +635,12 @@ fn parse_dotenv_contents(contents: &str) -> anyhow::Result<Vec<(String, String)>
 
         let line = line.strip_prefix("export ").unwrap_or(line);
         let Some((raw_key, raw_value)) = line.split_once('=') else {
-            anyhow::bail!("Invalid .env entry at line {}", line_number + 1);
+            anyhow::bail!("invalid .env entry at line {}", line_number + 1);
         };
 
         let key = raw_key.trim();
         if key.is_empty() {
-            anyhow::bail!("Invalid .env key at line {}", line_number + 1);
+            anyhow::bail!("invalid .env key at line {}", line_number + 1);
         }
 
         let mut value = raw_value.trim().to_string();
@@ -668,7 +668,7 @@ fn resolve_discord_token(
         if !token.is_empty() {
             return Ok(token.to_string());
         }
-        anyhow::bail!("DISCORD_TOKEN cannot be empty");
+        anyhow::bail!("discord token (`DISCORD_TOKEN`) cannot be empty");
     }
 
     if let Some((_, value)) = dotenv_entries
@@ -679,10 +679,10 @@ fn resolve_discord_token(
         if !token.is_empty() {
             return Ok(token.to_string());
         }
-        anyhow::bail!("DISCORD_TOKEN cannot be empty");
+        anyhow::bail!("discord token (`DISCORD_TOKEN`) cannot be empty");
     }
 
-    anyhow::bail!("DISCORD_TOKEN must be set via environment or .env")
+    anyhow::bail!("discord token (`DISCORD_TOKEN`) must be set via environment or .env")
 }
 
 #[cfg(test)]
@@ -818,7 +818,7 @@ mod tests {
             Ok(_) => anyhow::bail!("expected dotenv parse error"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("Invalid .env entry"));
+        assert!(err.to_string().contains("invalid .env entry"));
         Ok(())
     }
 
