@@ -130,6 +130,7 @@ If performance matters and is unclear, **measure**.
 
 A task is incomplete unless all of the following pass (from `Justfile`):
 
+- `just fmt` with zero warnings
 - `just check` with zero warnings
 - `just clippy` with zero warnings
 
