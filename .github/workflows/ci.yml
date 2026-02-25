@@ -11,6 +11,8 @@ on:
       - "azalea.schema.json"
   push:
     branches: [master]
+    tags-ignore:
+      - "v*"
     paths-ignore:
       - "**.md"
       - "assets/**"
