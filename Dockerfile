@@ -2,7 +2,8 @@ ARG YTDLP_TAG=2026.02.21
 ARG FFMPEG_TAG=autobuild-2026-02-24-16-00
 ARG FFMPEG_TARBALL=ffmpeg-N-122985-g145f6e5878-linux64-gpl.tar.xz
 
-# --- Base stage: shared toolchain ---
+# --- 1. Toolchain (Chef) ---
+# We use cargo-chef to cache Rust dependencies separately from source code.
 FROM lukemathwalker/cargo-chef:latest-rust-1.93.1-bookworm AS chef
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -11,80 +12,80 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+# Note: 'mold' and 'clang' are used here as a faster linker alternative to the default 'ld'.
 
-# --- Planner: compute the dependency recipe from the workspace manifest ---
+# --- 2. Planner ---
+# Creates a 'recipe.json' which is a skeleton of your project (deps only).
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# --- Builder: cook (pre-build) deps from the recipe, then compile the binary ---
+# --- 3. Builder ---
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-# Dependencies are built separately so they are cached across source-only changes.
+# Cook dependencies: if recipe.json hasn't changed, this layer is cached.
 RUN cargo chef cook --release --recipe-path recipe.json
+
 COPY . .
+# --locked ensures we use the exact versions in Cargo.lock.
+# -p azalea targets the specific package in a workspace.
 RUN cargo build --release --locked -p azalea
 
-# --- Downloader: fetch third-party binaries (yt-dlp, ffmpeg) in a disposable layer ---
+# --- 4. Downloader ---
+# A lightweight stage dedicated to fetching external binaries.
 FROM debian:bookworm-slim AS downloader
 ARG YTDLP_TAG
 ARG FFMPEG_TAG
 ARG FFMPEG_TARBALL
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    xz-utils \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    curl xz-utils ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /downloads
 
-# Download yt-dlp
+# Download yt-dlp (standalone python-based binary)
 RUN curl -L "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_TAG}/yt-dlp_linux" -o yt-dlp && \
     chmod +x yt-dlp
 
-# Download FFmpeg using the specific tarball variable provided
+# Download and extract FFmpeg (Static build)
+# --strip-components=2 allows us to grab /bin/ffmpeg directly into the workdir.
 RUN curl -L "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_TAG}/${FFMPEG_TARBALL}" | \
     tar xJ --strip-components=2 --wildcards "*/bin/ffmpeg" "*/bin/ffprobe"
 
-# Pre-create /data and /tmp/azalea owned by distroless nonroot UID 65532.
-# These directories must exist before the COPY in the runtime-cpu stage.
-RUN mkdir -p /distroless_data /distroless_tmp && \
-    chown -R 65532:65532 /distroless_data /distroless_tmp
-
-# --- Runtime (CPU): minimal distroless image, no shell, no package manager ---
-FROM gcr.io/distroless/cc-debian12:latest AS runtime-cpu
-COPY --from=downloader --chown=65532:65532 /distroless_data /data
-COPY --from=downloader --chown=65532:65532 /distroless_tmp /tmp/azalea
-WORKDIR /data
-
-COPY --from=downloader /downloads/yt-dlp /usr/local/bin/yt-dlp
-COPY --from=downloader /downloads/ffmpeg /usr/local/bin/ffmpeg
-COPY --from=downloader /downloads/ffprobe /usr/local/bin/ffprobe
-COPY --from=builder /app/target/release/azalea /usr/local/bin/azalea
-
-ENV RUST_LOG=info
-ENV PATH="/usr/local/bin:${PATH}"
-USER nonroot
-ENTRYPOINT ["azalea"]
-
-# --- Runtime (VA-API): Debian slim with Intel/i965 VA-API drivers for hardware-accelerated transcoding ---
-FROM debian:bookworm-slim AS runtime-vaapi
+# --- 5. Runtime Base ---
+# Common foundation for both CPU and VA-API targets.
+FROM debian:bookworm-slim AS runtime-base
+# Create a dedicated system user for security (UID 10001 is a common convention).
 RUN groupadd -r azalea && useradd -r -g azalea -u 10001 azalea
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    intel-media-va-driver \
-    i965-va-driver \
-    vainfo \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 
+# Install CA certs so we can talk to Discord/Websites via HTTPS.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Pre-prepare persistent and temporary directories with correct ownership.
 RUN mkdir -p /data /tmp/azalea && chown -R azalea:azalea /data /tmp/azalea
 WORKDIR /data
 
+# Pull in the binaries from previous stages.
 COPY --from=downloader /downloads/yt-dlp /usr/local/bin/yt-dlp
 COPY --from=downloader /downloads/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=downloader /downloads/ffprobe /usr/local/bin/ffprobe
 COPY --from=builder /app/target/release/azalea /usr/local/bin/azalea
 
-USER azalea
+# Ensure the application knows where to look for logs and binaries.
 ENV RUST_LOG=info
 ENV PATH="/usr/local/bin:${PATH}"
+
+USER azalea
 ENTRYPOINT ["azalea"]
+
+# --- 6. Target: CPU ---
+# Pure software transcoding version. Inherits everything from base.
+FROM runtime-base AS runtime-cpu
+
+# --- 7. Target: VA-API ---
+# Hardware-accelerated version for Intel/AMD GPUs.
+FROM runtime-base AS runtime-vaapi
+USER root
+# Install Intel Media drivers and 'vainfo' for hardware diagnostics.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    intel-media-va-driver i965-va-driver vainfo && rm -rf /var/lib/apt/lists/*
+USER azalea
