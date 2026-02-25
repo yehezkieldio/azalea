@@ -7,7 +7,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/${{ github.repository }}
-  CACHE_IMAGE: ${{ env.IMAGE }}/buildcache
+  CACHE_IMAGE: ghcr.io/${{ github.repository }}/buildcache
 
 jobs:
   build-and-push:
