@@ -7,7 +7,15 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.2.3 (February 25, 2026)
+
+### <!-- 16 -->🤖 CI/CD
+- [`5f18557`](https://github.com/yehezkieldio/azalea-vb/commit/5f185572c10d6a5016eb00940d6bc316b75bea7f) Fix release workflow env and restore tag trigger
+
 ## 0.2.2 (February 25, 2026)
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`90fe401`](https://github.com/yehezkieldio/azalea-vb/commit/90fe401187b58be598f077c10da984b565d79959) **release**: 0.2.2
 
 ### <!-- 16 -->🤖 CI/CD
 - [`b938987`](https://github.com/yehezkieldio/azalea-vb/commit/b938987affbd1f2ae345860a7a6ac19817525146) **ci**: Remove tags-ignore v* from workflow
