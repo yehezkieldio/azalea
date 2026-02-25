@@ -7,10 +7,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/${{ github.repository }}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.ref != 'refs/heads/master' }}
+  CACHE_IMAGE: ${{ env.IMAGE }}/buildcache
 
 jobs:
   build-and-push:
@@ -58,10 +55,9 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
-          provenance: mode=max
-          # Registry-backed layer cache keyed per flavor to avoid cross-contamination.
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.flavor }}
-          cache-to:   type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.flavor }},mode=max
+          provenance: true
+          cache-from: type=registry,ref=${{ env.CACHE_IMAGE }}:${{ matrix.flavor }}
+          cache-to: type=registry,ref=${{ env.CACHE_IMAGE }}:${{ matrix.flavor }},mode=min
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v3
@@ -104,3 +100,24 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN }} # Announce as project maintainer instead of the GitHub Actions bot
           body_path: release_notes.txt
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+
+  cleanup:
+    name: Cleanup Old Cache
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Cleanup runtime untagged
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ github.event.repository.name }}
+          package-type: 'container'
+          min-versions-to-keep: 0
+          delete-only-untagged-versions: 'true'
+      - name: Cleanup old cache versions
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ github.event.repository.name }}/buildcache
+          package-type: 'container'
+          min-versions-to-keep: 5
