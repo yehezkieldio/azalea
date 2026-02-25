@@ -1,85 +1,29 @@
-name: CI
+name: Release
 
 on:
-  pull_request:
-    paths-ignore:
-      - "**.md"
-      - "assets/**"
-      - "LICENSE-*"
-      - ".gitignore"
-      - "cliff.toml"
-      - "azalea.schema.json"
   push:
-    branches: [master]
     tags: ["v*"]
-    paths-ignore:
-      - "**.md"
-      - "assets/**"
-      - "LICENSE-*"
-      - ".gitignore"
-      - "cliff.toml"
-      - "azalea.schema.json"
 
 env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0  # Disable incremental compilation; faster for CI due to clean cache behaviour.
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/${{ github.repository }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Cancel in-progress runs on PRs and non-master branches; never cancel tag or master runs.
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.ref != 'refs/heads/master' }}
 
 jobs:
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: rui314/setup-mold@v1
-      - uses: extractions/setup-just@v3
-      - run: just clippy
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: rui314/setup-mold@v1
-      - uses: taiki-e/install-action@nextest
-      - uses: extractions/setup-just@v3
-      - run: just test
-
-  fmt:
-    name: Rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
   build-and-push:
-    name: Release / Build & Push Docker Images
-    needs: [clippy, test, fmt]
-    # Only publish images on version tags; PRs and branch pushes run CI only.
+    name: Build & Push Docker Images
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      id-token: write      # Required for OIDC-based Sigstore signing
-      attestations: write  # Required for build provenance attestation
+      id-token: write
+      attestations: write
     strategy:
-      fail-fast: false  # Allow both flavors to complete even if one fails
+      fail-fast: false
       matrix:
         flavor: [cpu, vaapi]
 
@@ -127,13 +71,11 @@ jobs:
           push-to-registry: true
 
       - uses: sigstore/cosign-installer@v3
-
       - name: Sign image
-        # Keyless signing via Sigstore; the OIDC token from id-token: write is used automatically.
         run: cosign sign --yes ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
 
-  create-release:
-    name: Release / Announce GitHub Release
+  announce-release:
+    name: Announce GitHub Release
     needs: [build-and-push]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
