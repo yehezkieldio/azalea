@@ -76,7 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-    RUN mkdir -p /data /tmp/azalea && chown -R azalea:azalea /data /tmp/azalea
+RUN mkdir -p /data /tmp/azalea && chown -R azalea:azalea /data /tmp/azalea
 WORKDIR /data
 
 COPY --from=downloader /downloads/yt-dlp /usr/local/bin/yt-dlp
