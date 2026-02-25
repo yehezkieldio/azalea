@@ -71,7 +71,7 @@ postprocessors = []
 conventional_commits = true
 filter_unconventional = false
 commit_preprocessors = [
-  { pattern = "\\(#([0-9]+)\\)", replace = "([#${1}](https://github.com/yehezkieldio/azalea-vb/issues/${1}))" },
+  { pattern = "\\(#([0-9]+)\\)", replace = "([#${1}](https://github.com/yehezkieldio/azalea/issues/${1}))" },
 ]
 commit_parsers = [
   { message = "^chore\\(release\\): release", skip = true },
@@ -122,4 +122,4 @@ sort_commits = "newest"
 
 [remote.github]
 owner = "yehezkieldio"
-repo = "azalea-vb"
+repo = "azalea"
