@@ -2,6 +2,13 @@
 <img src="assets/avatar.png" align="center" width="120px" height="120px" />
 <h3>Azalea</h3>
 <p>Discord bot for X media: detects & reuploads links automatically</p>
+
+<!-- <a href="https://deepwiki.com/yehezkieldio/azalea"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a> -->
+
+<a href="https://github.com/yehezkieldio/azalea/releases"><img src="https://img.shields.io/github/v/release/yehezkieldio/azalea?style=flat&labelColor=1C2C2E&color=C96329&logo=GitHub&logoColor=white"></a>
+<a href="https://github.com/yehezkieldio/azalea/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/yehezkieldio/azalea/ci.yml?style=flat&labelColor=1C2C2E&color=C96329&logo=GitHub%20Actions&logoColor=white"></a>
+<a href="https://github.com/yehezkieldio/azalea/pkgs/container/azalea"><img src="https://img.shields.io/github/actions/workflow/status/yehezkieldio/azalea/release.yml?style=flat&labelColor=1C2C2E&color=C96329&label=docker&logo=Docker&logoColor=white"></a>
+
 </div>
 
 ---
