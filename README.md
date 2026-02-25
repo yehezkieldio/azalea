@@ -46,7 +46,7 @@ Azalea currently does not have a public running instance or pre-built binaries. 
 
 - [Rust](https://rustup.rs/) stable toolchain
 - [`mold`](https://github.com/rui314/mold) linker — Linux only, can be disabled in `.cargo/config.toml`
-- `ffmpeg` and `ffprobe` on your `PATH` — used for probing, remuxing, and transcoding
+- [`ffmpeg`](https://www.ffmpeg.org/) and [`ffprobe`](https://ffmpeg.org/ffprobe.html) on your `PATH` — used for probing, remuxing, and transcoding
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) on your `PATH` — used as the fallback resolver
 
 ### Build
