@@ -46,3 +46,4 @@ release version:
     git add .
     git commit -m "chore(release): {{version}}"
     git tag -s v{{version}} -m ""
+    echo "Now do `git push origin master --tags` to publish the release"
