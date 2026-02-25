@@ -7,7 +7,15 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.2.2 (February 25, 2026)
+
+### <!-- 16 -->🤖 CI/CD
+- [`b938987`](https://github.com/yehezkieldio/azalea-vb/commit/b938987affbd1f2ae345860a7a6ac19817525146) **ci**: Remove tags-ignore v* from workflow
+
 ## 0.2.1 (February 25, 2026)
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`7f2a070`](https://github.com/yehezkieldio/azalea-vb/commit/7f2a070834ef499e75d341a009a2443a0e679042) **release**: 0.2.1
 
 ### <!-- 16 -->🤖 CI/CD
 - [`add747c`](https://github.com/yehezkieldio/azalea-vb/commit/add747c7cbe06829c23fafc3216b5394310a78e2) **ci**: Add tags-ignore v* to ci workflow
