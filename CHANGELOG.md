@@ -7,6 +7,42 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.2.0 (February 25, 2026)
+
+### <!-- 10 -->🧪 Test
+- [`8fb649b`](https://github.com/yehezkieldio/azalea-vb/commit/8fb649b3f69e278c0a5521f99dce79a68c1e6070) **media**: Add valid_host strategy and expand tweet url test
+- [`22f0dfe`](https://github.com/yehezkieldio/azalea-vb/commit/22f0dfe2e1a2bdbcb41291c1895f954b89b384f6) **media**: Add tweet url parsing tests
+- [`8f7683c`](https://github.com/yehezkieldio/azalea-vb/commit/8f7683cdee631ee25b68d5e382e9194dc666d547) **media**: Add twittpr domain to tweet url parsing
+- [`e5fc854`](https://github.com/yehezkieldio/azalea-vb/commit/e5fc854d5a040a06aef794c60c527d8d3f692070) **media**: Add www url parsing tests and rename bare url tests
+
+### <!-- 16 -->🤖 CI/CD
+- [`6638d75`](https://github.com/yehezkieldio/azalea-vb/commit/6638d75cf66b0064955adeb1c38dc5930cc87900) **ci**: Decouple ci and release into seperate workflows
+- [`8960334`](https://github.com/yehezkieldio/azalea-vb/commit/896033469a5ddb6a6a769e36edc99660065ff673) **deps**: Bump actions/checkout to v6 and attest-build-provenance to v3
+- [`e2607ed`](https://github.com/yehezkieldio/azalea-vb/commit/e2607ed08d6c1ffcc82dadeb403693d03e4ebcf7) **ci**: Rename release job names in ci_release workflow
+
+### <!-- 2 -->🧩 Dependencies Updates
+- [`223ac57`](https://github.com/yehezkieldio/azalea-vb/commit/223ac57e3eb5b4c74983f8909bd93d7f4b44ec09) **deps**: Update rust crate anyhow to v1.0.102 ([#3](https://github.com/yehezkieldio/azalea-vb/issues/3))
+- [`06dbd40`](https://github.com/yehezkieldio/azalea-vb/commit/06dbd40e77c28bfbc3fb89634d3ac065638cd46f) **deps**: Replace rustls-tls with rustls and bump lockfile
+- [`0985485`](https://github.com/yehezkieldio/azalea-vb/commit/098548550242df202998dc4ac09c4d2559137ac7) **deps**: Update all non-major dependencies
+
+### <!-- 3 -->🚀 New Features
+- [`3a2a5bf`](https://github.com/yehezkieldio/azalea-vb/commit/3a2a5bf35cc1a6fd6e9606de1898eefe622f9547) **azalea**: Validate temp dir writable before starting worker
+- [`cfd54fd`](https://github.com/yehezkieldio/azalea-vb/commit/cfd54fdeb04cf42e57a6cb6264c72a1cbb96a426) **main**: Add minimum tested ffmpeg and ffprobe version checks
+
+### <!-- 4 -->🐛 Bug Fixes
+- [`83cef15`](https://github.com/yehezkieldio/azalea-vb/commit/83cef151c829206cc9d5dc67fc5959c190d95a19) **pipeline**: Add content-length header check to reject downloads
+
+### <!-- 5 -->📚 Documentation
+- [`3b0c5e9`](https://github.com/yehezkieldio/azalea-vb/commit/3b0c5e91254f6cd79694d36ea291dd42696833a4) **readme**: Add ffmpeg and ffprobe links
+- [`6a429c6`](https://github.com/yehezkieldio/azalea-vb/commit/6a429c6d1bd8b2b916614116f638063d4fb6e050) **readme**: Add release, CI, and docker badges
+- [`403d25b`](https://github.com/yehezkieldio/azalea-vb/commit/403d25b1a338f9a71ee21a5039637e277355174c) **agents**: Add just fmt check to task list
+- [`fbbb5e5`](https://github.com/yehezkieldio/azalea-vb/commit/fbbb5e505a5f1eb17a18f0e77822cce926882b70) **readme**: Correct requirs to requires
+
+### <!-- 7 -->🚜 Refactor
+- [`a3620c0`](https://github.com/yehezkieldio/azalea-vb/commit/a3620c085d116a22ecc63bfeee197e1c5ffad020) **media**: Extract cleanup to return removed paths
+- [`388ab39`](https://github.com/yehezkieldio/azalea-vb/commit/388ab3930dce36efeb1c05844a66601a5f35b698) **azalea**: Normalize user-facing messages to lowercase
+- [`cecb289`](https://github.com/yehezkieldio/azalea-vb/commit/cecb289dc9dc8300e08da16a478f4ce8762ac15d) **pipeline**: Normalize error messages to lowercase
+
 ## 0.1.0 (February 22, 2026)
 
 ### <!-- 10 -->🧪 Test
@@ -22,6 +58,7 @@ All notable changes to this project will be documented in this file.
 - [`a55493c`](https://github.com/yehezkieldio/azalea-vb/commit/a55493c692bf84de8f6a6d599817d309379bb6c9) **core**: Add smoke tests for settings, tweet parsing, dedup cache
 
 ### <!-- 11 -->🛠️ Miscellaneous
+- [`14817b6`](https://github.com/yehezkieldio/azalea-vb/commit/14817b6892470d5fe42b6a4759130a0cc54c24d5) **release**: 0.1.0
 - [`6ce75e4`](https://github.com/yehezkieldio/azalea-vb/commit/6ce75e497e9539ad76d6a8decc09f889a81517e8) Add comments to Dockerfile and CI / Release workflow
 - [`9b10d8e`](https://github.com/yehezkieldio/azalea-vb/commit/9b10d8e9dda2750db2f29ec667d1b3706817f105) **config**: Replace repo and sort order in cliff template
 - [`4313dd0`](https://github.com/yehezkieldio/azalea-vb/commit/4313dd062b6757da9a72aaa739c412e4a9005a7c) **config**: Remove target-cpu=native rustflag from cargo config

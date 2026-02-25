@@ -111,6 +111,7 @@ commit_parsers = [
   { message = "^translation", group = "<!-- 15 -->🌐 Internationalization" },
   { message = "^ci", group = "<!-- 16 -->🤖 CI/CD" },
   { message = ".*deprecated", body = ".*deprecated", group = "<!-- 30 -->⚠️ Deprecation" },
+  { message = "^Merge", skip = true },
   { message = ".*", group = "<!-- 99 -->🌀 Other" },
 ]
 filter_commits = false
