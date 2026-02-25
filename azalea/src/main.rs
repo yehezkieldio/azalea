@@ -57,12 +57,37 @@ const DEDUP_PRUNE_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const DEDUP_PRUNE_BATCH_SIZE: usize = 500;
 const PROGRESS_UPDATE_DEBOUNCE_SECS: u64 = 3;
 const DEPENDENCY_CHECK_TIMEOUT_SECS: u64 = 10;
+const MIN_TESTED_FFMPEG_VERSION: ParsedVersion = ParsedVersion::new(6, 0, 0);
+const MIN_TESTED_FFPROBE_VERSION: ParsedVersion = ParsedVersion::new(6, 0, 0);
 const SHUTDOWN_STEP_TIMEOUT_SECS: u64 = 5;
 const TEMP_PRUNE_INTERVAL_SECS: u64 = 30 * 60;
 const TEMP_PRUNE_MAX_AGE_SECS: u64 = 60 * 60;
 const JOB_DURATION_WARN_MS: u64 = 45_000;
 const UPLOAD_DURATION_WARN_MS: u64 = 20_000;
 const QUEUE_DEPTH_WARN_THRESHOLD: usize = 80;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ParsedVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl ParsedVersion {
+    const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl std::fmt::Display for ParsedVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
 
 /// RAII guard that decrements the queue depth when a job task completes.
 ///
@@ -664,12 +689,22 @@ async fn verify_dependencies(
     tracing::info!("Verifying external dependencies...");
 
     let checks = [
-        (&binaries.ffmpeg, "ffmpeg", "-version"),
-        (&binaries.ffprobe, "ffprobe", "-version"),
-        (&binaries.ytdlp, "yt-dlp", "--version"),
+        (
+            &binaries.ffmpeg,
+            "ffmpeg",
+            "-version",
+            Some(MIN_TESTED_FFMPEG_VERSION),
+        ),
+        (
+            &binaries.ffprobe,
+            "ffprobe",
+            "-version",
+            Some(MIN_TESTED_FFPROBE_VERSION),
+        ),
+        (&binaries.ytdlp, "yt-dlp", "--version", None),
     ];
 
-    for (cmd, label, flag) in checks {
+    for (cmd, label, flag, minimum_tested_version) in checks {
         match tokio::time::timeout(
             Duration::from_secs(DEPENDENCY_CHECK_TIMEOUT_SECS),
             Command::new(cmd).arg(flag).output(),
@@ -689,6 +724,27 @@ async fn verify_dependencies(
                     version = %version,
                     "Dependency ready"
                 );
+                if let Some(minimum_tested_version) = minimum_tested_version {
+                    if let Some(parsed_version) = parse_version_from_summary(&version) {
+                        if parsed_version < minimum_tested_version {
+                            tracing::warn!(
+                                dependency = label,
+                                path = %cmd.display(),
+                                version = %parsed_version,
+                                minimum_tested_version = %minimum_tested_version,
+                                "Dependency version is below minimum tested version"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            dependency = label,
+                            path = %cmd.display(),
+                            version = %version,
+                            minimum_tested_version = %minimum_tested_version,
+                            "Failed to parse dependency version for minimum tested version check"
+                        );
+                    }
+                }
             }
             Ok(Err(e)) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -833,6 +889,61 @@ fn command_version_summary(output: &std::process::Output) -> String {
         .find(|line| !line.trim().is_empty())
         .map(|line| line.trim().to_string())
         .unwrap_or_else(|| "unknown-version".to_string())
+}
+
+fn parse_version_from_summary(summary: &str) -> Option<ParsedVersion> {
+    let candidate = summary
+        .split_whitespace()
+        .skip_while(|token| *token != "version")
+        .nth(1)
+        .or_else(|| {
+            summary
+                .split_whitespace()
+                .find(|token| token.chars().any(|ch| ch.is_ascii_digit()))
+        })?;
+
+    let mut values = [0_u64; 3];
+    let mut found = 0_usize;
+    let mut current = 0_u64;
+    let mut in_digits = false;
+
+    for ch in candidate.chars() {
+        if ch.is_ascii_digit() {
+            in_digits = true;
+            current = current
+                .saturating_mul(10)
+                .saturating_add((ch as u8 - b'0') as u64);
+            continue;
+        }
+
+        if in_digits {
+            let slot = values.get_mut(found)?;
+            *slot = current;
+            found += 1;
+            if found == values.len() {
+                break;
+            }
+            current = 0;
+            in_digits = false;
+        }
+    }
+
+    if in_digits && found < values.len() {
+        let slot = values.get_mut(found)?;
+        *slot = current;
+        found += 1;
+    }
+
+    if found == 0 {
+        return None;
+    }
+
+    let mut values = values.into_iter();
+    Some(ParsedVersion::new(
+        values.next().unwrap_or(0),
+        values.next().unwrap_or(0),
+        values.next().unwrap_or(0),
+    ))
 }
 
 fn log_startup_snapshot(config: &AppConfig) {
@@ -1021,5 +1132,19 @@ mod tests {
         assert!(resolved.exists());
 
         let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn parse_version_from_summary_extracts_ffmpeg_semver() {
+        let parsed = parse_version_from_summary("ffmpeg version 6.1.2-1ubuntu1")
+            .expect("ffmpeg summary should parse");
+        assert_eq!(parsed, ParsedVersion::new(6, 1, 2));
+    }
+
+    #[test]
+    fn parse_version_from_summary_handles_prefixed_versions() {
+        let parsed = parse_version_from_summary("ffprobe version n7.0-static")
+            .expect("ffprobe summary should parse");
+        assert_eq!(parsed, ParsedVersion::new(7, 0, 0));
     }
 }
