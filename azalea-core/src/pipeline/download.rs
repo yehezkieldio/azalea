@@ -96,6 +96,7 @@ pub async fn download(
             });
         }
 
+        let header_content_length = content_length_header_bytes(response.headers());
         let total_size = response.content_length();
         let must_probe = total_size.is_none();
         if let Some(total) = total_size {
@@ -104,9 +105,9 @@ pub async fn download(
             tracing::trace!("Content length unavailable");
         }
         let max_download = config.pipeline.max_download_bytes;
-        // Early reject when the server reports a size already above the cap.
+        // Early reject using the raw Content-Length header before streaming any bytes.
         if max_download > 0
-            && let Some(total) = total_size
+            && let Some(total) = header_content_length
             && total > max_download
         {
             return Err(Error::DownloadFailed {
@@ -524,5 +525,36 @@ fn preallocate_file(path: &Path, size: u64) -> std::io::Result<()> {
     {
         file.set_len(size)?;
         Ok(())
+    }
+}
+
+fn content_length_header_bytes(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::content_length_header_bytes;
+    use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
+
+    #[test]
+    fn parses_content_length_header_bytes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5242881"));
+
+        assert_eq!(content_length_header_bytes(&headers), Some(5_242_881));
+    }
+
+    #[test]
+    fn ignores_invalid_content_length_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("abc"));
+
+        assert_eq!(content_length_header_bytes(&headers), None);
     }
 }
