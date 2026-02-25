@@ -7,6 +7,18 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.2.1 (February 25, 2026)
+
+### <!-- 16 -->🤖 CI/CD
+- [`add747c`](https://github.com/yehezkieldio/azalea-vb/commit/add747c7cbe06829c23fafc3216b5394310a78e2) **ci**: Add tags-ignore v* to ci workflow
+- [`3067335`](https://github.com/yehezkieldio/azalea-vb/commit/3067335a85bcf337561413224ff5ffe2a9324be7) **ci**: Remove tag filter from release workflow
+- [`25786b3`](https://github.com/yehezkieldio/azalea-vb/commit/25786b3a10f1a47ac4cfcb8bce1c22ffca02a246) **ci**: Add cleanup job to release workflow
+
+### <!-- 8 -->🏗️ Build System
+- [`5fd8352`](https://github.com/yehezkieldio/azalea-vb/commit/5fd8352f3bf01ed36e6b929fc57b2934131f3d76) **docker**: Introduce runtime-base and restructure stages
+- [`1004229`](https://github.com/yehezkieldio/azalea-vb/commit/100422920678b0eff7e5d323002802e7a2a6c40d) **docker**: Remove stray indentation from dockerfile run
+- [`8e3b8a3`](https://github.com/yehezkieldio/azalea-vb/commit/8e3b8a3e4fb6190869d350ce7df471b9501cb607) **docker**: Pin yt-dlp and ffmpeg via build args
+
 ## 0.2.0 (February 25, 2026)
 
 ### <!-- 10 -->🧪 Test
@@ -14,6 +26,9 @@ All notable changes to this project will be documented in this file.
 - [`22f0dfe`](https://github.com/yehezkieldio/azalea-vb/commit/22f0dfe2e1a2bdbcb41291c1895f954b89b384f6) **media**: Add tweet url parsing tests
 - [`8f7683c`](https://github.com/yehezkieldio/azalea-vb/commit/8f7683cdee631ee25b68d5e382e9194dc666d547) **media**: Add twittpr domain to tweet url parsing
 - [`e5fc854`](https://github.com/yehezkieldio/azalea-vb/commit/e5fc854d5a040a06aef794c60c527d8d3f692070) **media**: Add www url parsing tests and rename bare url tests
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`e77659c`](https://github.com/yehezkieldio/azalea-vb/commit/e77659c95f6870de27a95c7b8ddc8b8b2fcc84b9) **release**: 0.2.0
 
 ### <!-- 16 -->🤖 CI/CD
 - [`6638d75`](https://github.com/yehezkieldio/azalea-vb/commit/6638d75cf66b0064955adeb1c38dc5930cc87900) **ci**: Decouple ci and release into seperate workflows

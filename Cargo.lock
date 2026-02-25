@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "azalea"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "azalea-core",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "azalea-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "dashmap",
