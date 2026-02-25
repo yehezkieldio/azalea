@@ -149,10 +149,18 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
     log_startup_snapshot(&config);
     verify_dependencies(&config.engine.binaries, &config.engine.transcode).await?;
 
-    // Ensure temp storage is available before starting the worker.
-    tokio::fs::create_dir_all(&config.engine.storage.temp_dir).await?;
+    // Ensure temp storage is available and writable before starting the worker.
+    let temp_dir = config.engine.storage.temp_dir.clone();
+    tokio::fs::create_dir_all(&temp_dir).await.map_err(|e| {
+        anyhow::anyhow!("failed to create temp dir '{}': {}", temp_dir.display(), e)
+    })?;
+    tokio::task::spawn_blocking({
+        let temp_dir = temp_dir.clone();
+        move || validate_temp_dir_writable(&temp_dir)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("temp dir writability check task failed: {e}"))??;
     {
-        let temp_dir = config.engine.storage.temp_dir.clone();
         let max_age = Duration::from_secs(TEMP_PRUNE_MAX_AGE_SECS);
         match tokio::task::spawn_blocking(move || {
             media::cleanup_stale_temp_entries(&temp_dir, max_age)
@@ -359,6 +367,41 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
         // Resume info is advisory; log and continue on failure.
         tracing::warn!(error = %e, "Failed to save resume info");
     }
+
+    Ok(())
+}
+
+fn validate_temp_dir_writable(temp_dir: &Path) -> anyhow::Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe_path = temp_dir.join(format!(
+        ".azalea-writable-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "temp dir '{}' is not writable: failed to create probe file '{}': {}",
+                temp_dir.display(),
+                probe_path.display(),
+                e
+            )
+        })?;
+
+    std::fs::remove_file(&probe_path).map_err(|e| {
+        anyhow::anyhow!(
+            "temp dir '{}' failed writability probe cleanup for '{}': {}",
+            temp_dir.display(),
+            probe_path.display(),
+            e
+        )
+    })?;
 
     Ok(())
 }
@@ -1116,6 +1159,10 @@ mod tests {
         std::env::temp_dir().join(format!("azalea-{name}-{nanos}"))
     }
 
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        unique_temp_file(name)
+    }
+
     #[test]
     fn resolve_binary_path_rejects_missing_explicit_paths() {
         let missing = Path::new("./definitely-missing-binary");
@@ -1148,5 +1195,23 @@ mod tests {
         let parsed = parse_version_from_summary("ffprobe version n7.0-static")
             .expect("ffprobe summary should parse");
         assert_eq!(parsed, ParsedVersion::new(7, 0, 0));
+    }
+
+    #[test]
+    fn validate_temp_dir_writable_accepts_writable_directory() {
+        let dir = unique_temp_dir("writable-temp-dir");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        validate_temp_dir_writable(&dir).expect("writable temp dir should pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_temp_dir_writable_reports_clear_diagnostic() {
+        let missing_dir = unique_temp_dir("missing-writable-dir");
+        let err = validate_temp_dir_writable(&missing_dir).expect_err("missing dir should fail");
+        let message = err.to_string();
+        assert!(message.contains("is not writable"));
+        assert!(message.contains(&missing_dir.display().to_string()));
     }
 }
