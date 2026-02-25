@@ -176,16 +176,16 @@ pub fn cleanup_temp_dir_sync(temp_dir: &Path) {
     }
 }
 
-/// Remove temp entries older than the supplied age threshold.
+/// Remove stale temp entries older than the supplied age threshold.
 ///
 /// ## Trade-off acknowledgment
 /// Best-effort cleanup; failures are logged and ignored.
-pub fn cleanup_temp_dir_older_than(temp_dir: &Path, max_age: Duration) -> usize {
+pub fn cleanup_stale_temp_entries(temp_dir: &Path, max_age: Duration) -> Vec<PathBuf> {
     let now = std::time::SystemTime::now();
-    let mut removed = 0usize;
+    let mut removed = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(temp_dir) else {
-        return 0;
+        return removed;
     };
 
     for entry in entries.flatten() {
@@ -216,7 +216,7 @@ pub fn cleanup_temp_dir_older_than(temp_dir: &Path, max_age: Duration) -> usize 
 
         match result {
             Ok(()) => {
-                removed += 1;
+                removed.push(path);
             }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "Failed to remove stale temp entry");
@@ -225,6 +225,14 @@ pub fn cleanup_temp_dir_older_than(temp_dir: &Path, max_age: Duration) -> usize 
     }
 
     removed
+}
+
+/// Remove temp entries older than the supplied age threshold.
+///
+/// ## Trade-off acknowledgment
+/// Best-effort cleanup; failures are logged and ignored.
+pub fn cleanup_temp_dir_older_than(temp_dir: &Path, max_age: Duration) -> usize {
+    cleanup_stale_temp_entries(temp_dir, max_age).len()
 }
 
 async fn remove_path_async(path: &Path) {
@@ -297,6 +305,24 @@ mod tests {
 
         let removed = cleanup_temp_dir_older_than(&dir, Duration::from_millis(20));
         assert_eq!(removed, 1);
+        assert!(!old_file.exists());
+        assert!(new_file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_stale_temp_entries_returns_removed_paths() {
+        let dir = unique_temp_dir("stale-cleanup-paths");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let old_file = dir.join("old.tmp");
+        let new_file = dir.join("new.tmp");
+
+        std::fs::write(&old_file, b"old").expect("write old file");
+        std::thread::sleep(Duration::from_millis(40));
+        std::fs::write(&new_file, b"new").expect("write new file");
+
+        let removed = cleanup_stale_temp_entries(&dir, Duration::from_millis(20));
+        assert_eq!(removed, vec![old_file.clone()]);
         assert!(!old_file.exists());
         assert!(new_file.exists());
         let _ = std::fs::remove_dir_all(&dir);

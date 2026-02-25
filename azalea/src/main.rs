@@ -155,12 +155,14 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
         let temp_dir = config.engine.storage.temp_dir.clone();
         let max_age = Duration::from_secs(TEMP_PRUNE_MAX_AGE_SECS);
         match tokio::task::spawn_blocking(move || {
-            media::cleanup_temp_dir_older_than(&temp_dir, max_age)
+            media::cleanup_stale_temp_entries(&temp_dir, max_age)
         })
         .await
         {
-            Ok(removed) if removed > 0 => {
-                tracing::info!(removed, "Pruned stale temp entries on startup");
+            Ok(removed_paths) if !removed_paths.is_empty() => {
+                for path in removed_paths {
+                    tracing::warn!(path = %path.display(), "Removed stale temp entry on startup");
+                }
             }
             Ok(_) => {}
             Err(e) => {
