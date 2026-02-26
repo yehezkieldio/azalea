@@ -106,6 +106,7 @@ pub enum Progress {
     Optimizing,
     Transcoding(usize, usize),
     Uploading,
+    UploadingSegment(usize, usize),
 }
 
 /// Normalize and restrict extensions to a known-safe allowlist.
@@ -144,6 +145,9 @@ impl fmt::Display for Progress {
                 write!(f, "Transcoding segments ({}/{})", done, total)
             }
             Self::Uploading => write!(f, "Uploading..."),
+            Self::UploadingSegment(done, total) => {
+                write!(f, "Uploading segment {}/{}...", done, total)
+            }
         }
     }
 }
@@ -177,6 +181,10 @@ mod tests {
             "Transcoding segments (2/5)"
         );
         assert_eq!(Progress::Uploading.to_string(), "Uploading...");
+        assert_eq!(
+            Progress::UploadingSegment(1, 4).to_string(),
+            "Uploading segment 1/4..."
+        );
     }
 
     proptest! {

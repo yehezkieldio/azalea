@@ -8,7 +8,7 @@
 //! ## Trade-off acknowledgment
 //! We upload parts sequentially to simplify ordering and rate limit handling.
 
-use crate::pipeline::{Error, UploadOutcome};
+use crate::pipeline::{Error, Progress, UploadOutcome};
 use azalea_core::concurrency::Permits;
 use azalea_core::config::EngineSettings;
 use azalea_core::media::TweetId;
@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::fs;
+use tokio::sync::mpsc;
 use twilight_http::Client;
 use twilight_http::api_error::ApiError;
 use twilight_http::error::Error as TwilightError;
@@ -42,6 +43,7 @@ pub async fn upload(
     discord: &Client,
     permits: &Permits,
     config: &EngineSettings,
+    progress_tx: Option<&mpsc::Sender<Progress>>,
 ) -> Result<UploadOutcome, Error> {
     tracing::info!(
         channel_id = channel_id.get(),
@@ -77,6 +79,15 @@ pub async fn upload(
     }
 
     for (index, file_path) in paths.iter().enumerate() {
+        if let Some(tx) = progress_tx {
+            let stage = if total_files > 1 {
+                Progress::UploadingSegment(index + 1, total_files)
+            } else {
+                Progress::Uploading
+            };
+            let _ = tx.send(stage).await;
+        }
+
         // Read each part with size enforcement before hitting the API.
         let file_size = file_size_checked(file_path, config).await?;
         tracing::trace!(

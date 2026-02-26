@@ -529,7 +529,6 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                 let outcome = match result {
                     Ok(prepared) => {
                         let upload_start = Instant::now();
-                        let _ = progress_tx.send(pipeline::Progress::Uploading).await;
                         match pipeline::upload::upload(
                             &prepared,
                             job.channel_id,
@@ -537,6 +536,7 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             &app.discord,
                             &app.engine.permits,
                             &app.engine.config,
+                            Some(&progress_tx),
                         )
                         .await
                         {
