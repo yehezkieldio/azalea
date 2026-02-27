@@ -95,13 +95,14 @@ impl BitrateParams {
     }
 
     fn audio_bitrate_for_duration(duration: f64) -> u32 {
-        if duration > 600.0 {
-            64
-        } else if duration > 300.0 {
-            96
-        } else {
+        let target_kbps = if duration > 600.0 {
             128
-        }
+        } else if duration > 300.0 {
+            160
+        } else {
+            192
+        };
+        target_kbps.clamp(128, 192)
     }
 }
 
@@ -238,7 +239,7 @@ mod tests {
     #[test]
     fn video_bitrate_fits_budget_minus_audio_reserve_for_boundaries_and_presets() {
         const BOUNDARY_CASES: &[(f64, u32)] =
-            &[(300.0, 128), (300.001, 96), (600.0, 96), (600.001, 64)];
+            &[(300.0, 192), (300.001, 160), (600.0, 160), (600.001, 128)];
         const PRESETS: [QualityPreset; 4] = [
             QualityPreset::Fast,
             QualityPreset::Balanced,
@@ -295,6 +296,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn audio_bitrate_short_medium_long_is_clamped_monotonic_and_floor_bounded() {
+        let config = TranscodeSettings {
+            max_upload_bytes: 256 * 1024 * 1024,
+            ..TranscodeSettings::default()
+        };
+
+        let short = BitrateParams::compute(&config, 60.0)
+            .expect("short clip should produce bitrate params")
+            .audio_bitrate_kbps;
+        let medium = BitrateParams::compute(&config, 420.0)
+            .expect("medium clip should produce bitrate params")
+            .audio_bitrate_kbps;
+        let long = BitrateParams::compute(&config, 900.0)
+            .expect("long clip should produce bitrate params")
+            .audio_bitrate_kbps;
+
+        assert_eq!(short, 192);
+        assert_eq!(medium, 160);
+        assert_eq!(long, 128);
+        assert!((128..=192).contains(&short));
+        assert!((128..=192).contains(&medium));
+        assert!((128..=192).contains(&long));
+        assert!(short >= medium && medium >= long);
+        assert_eq!(long, 128);
     }
 
     #[test]
