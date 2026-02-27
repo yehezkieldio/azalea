@@ -30,6 +30,17 @@ const ALLOWED_MEDIA_HOSTS: [&str; 4] = [
 ];
 
 pub(crate) async fn validate_media_url(url: &str) -> Result<Url, Error> {
+    let (parsed, host, port) = validate_url_structure(url)?;
+    // Resolve DNS and validate each resolved address.
+    let addrs = lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| validation_error(e.to_string()))?;
+
+    validate_resolved_ips(addrs.map(|addr| addr.ip()))?;
+    Ok(parsed)
+}
+
+fn validate_url_structure(url: &str) -> Result<(Url, String, u16), Error> {
     // Security-sensitive: do not accept non-HTTPS or local network targets.
     let parsed = Url::parse(url).map_err(|e| validation_error(e.to_string()))?;
 
@@ -40,9 +51,10 @@ pub(crate) async fn validate_media_url(url: &str) -> Result<Url, Error> {
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| validation_error("missing url host"))?;
-    let host_trimmed = host.trim_end_matches('.');
-    let host_lower = host_trimmed.to_ascii_lowercase();
+        .ok_or_else(|| validation_error("missing url host"))?
+        .trim_end_matches('.')
+        .to_string();
+    let host_lower = host.to_ascii_lowercase();
 
     if host_lower == "localhost"
         || DANGEROUS_SUFFIXES
@@ -53,28 +65,28 @@ pub(crate) async fn validate_media_url(url: &str) -> Result<Url, Error> {
         return Err(validation_error("local hostname rejected"));
     }
 
-    if !is_allowed_media_host(&host_lower) {
-        return Err(validation_error("host not on allowlist"));
-    }
-
-    if host_trimmed.parse::<IpAddr>().is_ok() {
+    if host.parse::<IpAddr>().is_ok() {
         // Reject IP literals; only allow DNS names with vetted resolution.
         return Err(validation_error("ip literal rejected"));
+    }
+
+    if !is_allowed_media_host(&host_lower) {
+        return Err(validation_error("host not on allowlist"));
     }
 
     let port = parsed.port_or_known_default().unwrap_or(443);
     if !ALLOWED_PORTS.contains(&port) {
         return Err(validation_error("port not allowed"));
     }
-    // Resolve DNS and validate each resolved address.
-    let addrs = lookup_host((host_trimmed, port))
-        .await
-        .map_err(|e| validation_error(e.to_string()))?;
 
+    Ok((parsed, host, port))
+}
+
+fn validate_resolved_ips(ips: impl IntoIterator<Item = IpAddr>) -> Result<(), Error> {
     let mut resolved_any = false;
-    for addr in addrs {
+    for ip in ips {
         resolved_any = true;
-        if is_blocked_ip(addr.ip()) {
+        if is_blocked_ip(ip) {
             // Block link-local, private, loopback, and multicast ranges.
             return Err(validation_error("resolved to blocked ip"));
         }
@@ -85,7 +97,7 @@ pub(crate) async fn validate_media_url(url: &str) -> Result<Url, Error> {
         return Err(validation_error("dns lookup returned no addresses"));
     }
 
-    Ok(parsed)
+    Ok(())
 }
 
 fn is_blocked_ip(ip: IpAddr) -> bool {
@@ -131,18 +143,41 @@ fn validation_error(message: impl Into<String>) -> Error {
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
+    use std::net::Ipv4Addr;
+
+    fn validate_media_url_with_resolved_ips(
+        url: &str,
+        ips: impl IntoIterator<Item = IpAddr>,
+    ) -> Result<Url, Error> {
+        let (parsed, _, _) = validate_url_structure(url)?;
+        validate_resolved_ips(ips)?;
+        Ok(parsed)
+    }
 
     #[tokio::test]
-    async fn rejects_non_https_urls() {
-        let err = validate_media_url("http://pbs.twimg.com/media/test.mp4")
-            .await
-            .expect_err("http url must be rejected");
-        assert!(matches!(
-            err,
-            Error::DownloadFailed {
-                source: DownloadError::SsrfBlocked(_)
-            }
-        ));
+    async fn rejects_denylist_urls_with_expected_reasons() {
+        let cases = [
+            ("http://pbs.twimg.com/media/test.mp4", "non-https url"),
+            (
+                "https://localhost/media/test.mp4",
+                "local hostname rejected",
+            ),
+            (
+                "https://printer.local/media/test.mp4",
+                "local hostname rejected",
+            ),
+            ("https://127.0.0.1/media/test.mp4", "ip literal rejected"),
+        ];
+
+        for (url, reason) in cases {
+            let err = validate_media_url(url)
+                .await
+                .expect_err("denylisted url must be rejected");
+            assert!(
+                err.to_string().contains(reason),
+                "expected reason `{reason}` for `{url}`, got `{err}`"
+            );
+        }
     }
 
     #[tokio::test]
@@ -154,23 +189,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_ip_literal_hosts() {
-        let err = validate_media_url("https://127.0.0.1/media/test.mp4")
-            .await
-            .expect_err("ip literal must be rejected");
-        assert!(matches!(
-            err,
-            Error::DownloadFailed {
-                source: DownloadError::SsrfBlocked(_)
-            }
-        ));
-    }
-
-    #[tokio::test]
     async fn rejects_unapproved_ports() {
         let err = validate_media_url("https://pbs.twimg.com:444/media/test.mp4")
             .await
             .expect_err("port should be rejected");
         assert!(err.to_string().contains("port not allowed"));
+    }
+
+    #[test]
+    fn accepts_allowed_urls_with_public_dns_results() {
+        let cases = [
+            "https://pbs.twimg.com/media/test.mp4",
+            "https://video.twimg.com:8443/media/test.mp4",
+            "https://foo.twimg.com/media/test.mp4",
+        ];
+
+        for url in cases {
+            validate_media_url_with_resolved_ips(url, [IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))])
+                .expect("allowed host with public IP should pass");
+        }
+    }
+
+    #[test]
+    fn rejects_rfc1918_dns_results_with_reason() {
+        let err = validate_media_url_with_resolved_ips(
+            "https://pbs.twimg.com/media/test.mp4",
+            [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))],
+        )
+        .expect_err("rfc1918 dns result must be rejected");
+        assert!(err.to_string().contains("resolved to blocked ip"));
     }
 }
