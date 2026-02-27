@@ -236,6 +236,68 @@ mod tests {
     }
 
     #[test]
+    fn video_bitrate_fits_budget_minus_audio_reserve_for_boundaries_and_presets() {
+        const BOUNDARY_CASES: &[(f64, u32)] =
+            &[(300.0, 128), (300.001, 96), (600.0, 96), (600.001, 64)];
+        const PRESETS: [QualityPreset; 4] = [
+            QualityPreset::Fast,
+            QualityPreset::Balanced,
+            QualityPreset::Quality,
+            QualityPreset::Size,
+        ];
+
+        for preset in PRESETS {
+            for &(duration, expected_audio_kbps) in BOUNDARY_CASES {
+                let mut at_cap = TranscodeSettings {
+                    quality_preset: preset,
+                    transcode_target_ratio: 1.0,
+                    container_overhead_ratio: 0.0,
+                    audio_vbr_padding: 1.0,
+                    vbr_safety_margin: 0.05,
+                    ..TranscodeSettings::default()
+                };
+
+                let audio_reserve_bits = expected_audio_kbps as f64 * 1000.0 * duration;
+                let desired_video_bits = 1000.0 * 1000.0 * duration;
+                let budget_before_margin = desired_video_bits / (1.0 - at_cap.vbr_safety_margin);
+                at_cap.max_upload_bytes =
+                    ((audio_reserve_bits + budget_before_margin) / 8.0).ceil() as u64;
+
+                let params = BitrateParams::compute(&at_cap, duration)
+                    .expect("at-cap budget should still leave positive video bitrate");
+                assert_eq!(params.audio_bitrate_kbps, expected_audio_kbps);
+
+                let usable_bits = (at_cap.max_upload_bytes as f64 * at_cap.transcode_target_ratio)
+                    * 8.0
+                    * (1.0 - at_cap.container_overhead_ratio);
+                let allowed_video_bits = usable_bits
+                    - params.audio_bitrate_kbps as f64
+                        * 1000.0
+                        * duration
+                        * at_cap.audio_vbr_padding;
+                let returned_video_bits = params.video_bitrate_kbps as f64 * 1000.0 * duration;
+                assert!(
+                    returned_video_bits <= allowed_video_bits + 1_000.0,
+                    "preset={preset:?}, duration={duration}, returned={returned_video_bits}, allowed={allowed_video_bits}"
+                );
+
+                let mut over_cap = at_cap.clone();
+                over_cap.max_upload_bytes = (audio_reserve_bits / 8.0).floor() as u64;
+                let err = BitrateParams::compute(&over_cap, duration)
+                    .expect_err("over-cap budget must fail once no video bits remain");
+                match err {
+                    Error::TranscodeFailed {
+                        stage: TranscodeStage::Transcode,
+                        stderr_tail,
+                        ..
+                    } => assert_eq!(stderr_tail, "video too long to fit"),
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn split_bitrate_uses_expected_audio_floor() {
         let params = BitrateParams::compute_for_split(&TranscodeSettings::default(), 30.0)
             .expect("split params should be computed");
