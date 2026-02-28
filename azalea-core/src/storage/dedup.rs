@@ -781,6 +781,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserve_inflight_collision_two_callers_only_one_proceeds() {
+        let storage = in_memory_storage_settings();
+        let cache = Cache::new(
+            &storage,
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should construct");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let a_cache = cache.clone();
+        let a_barrier = Arc::clone(&barrier);
+        let a = tokio::spawn(async move {
+            a_barrier.wait().await;
+            a_cache.reserve_inflight(11, TweetId(22)).await
+        });
+
+        let b_cache = cache.clone();
+        let b_barrier = Arc::clone(&barrier);
+        let b = tokio::spawn(async move {
+            b_barrier.wait().await;
+            b_cache.reserve_inflight(11, TweetId(22)).await
+        });
+
+        let winners = usize::from(a.await.expect("task A must join"))
+            + usize::from(b.await.expect("task B must join"));
+        assert_eq!(winners, 1);
+    }
+
+    #[tokio::test]
     async fn mark_processed_sets_duplicate_and_clears_inflight() {
         let storage = in_memory_storage_settings();
         let cache = Cache::new(
