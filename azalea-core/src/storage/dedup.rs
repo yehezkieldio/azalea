@@ -697,6 +697,26 @@ mod tests {
         }
     }
 
+    fn persistent_storage_settings(dedup_db_path: std::path::PathBuf) -> StorageSettings {
+        StorageSettings {
+            dedup_persistent: true,
+            dedup_ttl_hours: 1,
+            dedup_db_path,
+            ..StorageSettings::default()
+        }
+    }
+
+    fn unique_test_db_path(test_name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "azalea-{test_name}-{}-{nanos}.redb",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn key_binary_roundtrip_is_stable() {
         let key = Key::new(42, TweetId(999));
@@ -789,5 +809,50 @@ mod tests {
         assert!(cache.reserve_inflight(1, TweetId(1)).await);
         cache.clear_inflight(1, TweetId(1)).await;
         assert!(cache.reserve_inflight(1, TweetId(1)).await);
+    }
+
+    #[tokio::test]
+    async fn expired_persistent_entries_are_pruned_on_lookup() {
+        let db_path = unique_test_db_path("dedup-expiry");
+        let storage = persistent_storage_settings(db_path.clone());
+        let cache = Cache::new(
+            &storage,
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should construct");
+
+        let scope_id = 42;
+        let tweet_id = TweetId(4242);
+        let key = Key::new(scope_id, tweet_id);
+        let key_bytes = key.to_bytes();
+        let expired_timestamp = now_secs().saturating_sub(cache.ttl_secs.saturating_add(1));
+        let db = cache.db.as_ref().expect("persistent cache should have db");
+
+        let write_txn = db.begin_write().expect("write transaction should open");
+        {
+            let mut table = write_txn
+                .open_table(DEDUP_TABLE)
+                .expect("dedup table should open");
+            let _ = table
+                .insert(key_bytes.as_slice(), expired_timestamp)
+                .expect("insert should succeed");
+        }
+        write_txn.commit().expect("write transaction should commit");
+
+        assert!(!cache.is_duplicate(scope_id, tweet_id).await);
+
+        let read_txn = db.begin_read().expect("read transaction should open");
+        let table = read_txn
+            .open_table(DEDUP_TABLE)
+            .expect("dedup table should open");
+        assert!(
+            table
+                .get(key_bytes.as_slice())
+                .expect("lookup should succeed")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(db_path);
     }
 }
