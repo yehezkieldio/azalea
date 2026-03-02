@@ -275,3 +275,139 @@ fn format_config(app: &App) -> String {
         config.transcode.hardware_acceleration,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::config::{AppConfig, ApplicationId};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use twilight_model::id::marker::{ChannelMarker, UserMarker};
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("azalea-{name}-{nanos}"))
+    }
+
+    fn test_app() -> App {
+        let mut config = AppConfig {
+            application_id: ApplicationId::new(1),
+            ..Default::default()
+        };
+        config.engine.storage.temp_dir = unique_temp_path("discord-commands-temp");
+        config.engine.storage.dedup_persistent = false;
+        config.engine.storage.metrics_enabled = false;
+        std::fs::create_dir_all(&config.engine.storage.temp_dir).expect("create temp dir");
+
+        let discord = Client::builder().token("test-token".to_owned()).build();
+        App::new(config, discord).expect("build test app")
+    }
+
+    fn url_option(value: &str) -> CommandDataOption {
+        CommandDataOption {
+            name: "url".to_string(),
+            value: CommandOptionValue::String(value.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_media_command_rejects_missing_channel() {
+        let app = test_app();
+        let (job_sender, _job_receiver) = mpsc::channel(1);
+        let author_id = Some(Id::<UserMarker>::new(42));
+
+        let response = handle_media_command(
+            &app,
+            None,
+            author_id,
+            Id::new(10),
+            &[url_option("https://x.com/rustlang/status/123")],
+            &job_sender,
+        )
+        .await;
+
+        assert_eq!(response, "this command can only be used in a channel.");
+    }
+
+    #[tokio::test]
+    async fn handle_media_command_rejects_missing_author() {
+        let app = test_app();
+        let (job_sender, _job_receiver) = mpsc::channel(1);
+        let channel_id = Some(Id::<ChannelMarker>::new(24));
+
+        let response = handle_media_command(
+            &app,
+            channel_id,
+            None,
+            Id::new(11),
+            &[url_option("https://x.com/rustlang/status/123")],
+            &job_sender,
+        )
+        .await;
+
+        assert_eq!(response, "could not determine the command author.");
+    }
+
+    #[tokio::test]
+    async fn handle_media_command_rejects_missing_url() {
+        let app = test_app();
+        let (job_sender, _job_receiver) = mpsc::channel(1);
+        let channel_id = Some(Id::<ChannelMarker>::new(25));
+        let author_id = Some(Id::<UserMarker>::new(43));
+
+        let response =
+            handle_media_command(&app, channel_id, author_id, Id::new(12), &[], &job_sender).await;
+
+        assert_eq!(response, "missing required URL.");
+    }
+
+    #[tokio::test]
+    async fn handle_media_command_rejects_invalid_url() {
+        let app = test_app();
+        let (job_sender, _job_receiver) = mpsc::channel(1);
+        let channel_id = Some(Id::<ChannelMarker>::new(26));
+        let author_id = Some(Id::<UserMarker>::new(44));
+
+        let response = handle_media_command(
+            &app,
+            channel_id,
+            author_id,
+            Id::new(13),
+            &[url_option("not-a-url")],
+            &job_sender,
+        )
+        .await;
+
+        assert_eq!(response, "please provide a valid tweet URL.");
+    }
+
+    #[tokio::test]
+    async fn handle_media_command_rejects_multiple_urls() {
+        let app = test_app();
+        let (job_sender, _job_receiver) = mpsc::channel(1);
+        let channel_id = Some(Id::<ChannelMarker>::new(27));
+        let author_id = Some(Id::<UserMarker>::new(45));
+
+        let response = handle_media_command(
+            &app,
+            channel_id,
+            author_id,
+            Id::new(14),
+            &[url_option(
+                "https://x.com/rustlang/status/123 https://x.com/rustlang/status/456",
+            )],
+            &job_sender,
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            "please provide exactly one tweet URL per command."
+        );
+    }
+}
