@@ -19,6 +19,20 @@ use twilight_model::id::{
     marker::{ChannelMarker, MessageMarker},
 };
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ErrorNotificationPolicy {
+    SilentDelete,
+    VisibleError,
+}
+
+fn error_notification_policy(error: &Error) -> ErrorNotificationPolicy {
+    if error.should_notify_user() {
+        ErrorNotificationPolicy::VisibleError
+    } else {
+        ErrorNotificationPolicy::SilentDelete
+    }
+}
+
 /// Send the initial "processing" reply; returns the created message id if any.
 ///
 /// ## Postconditions
@@ -113,27 +127,25 @@ pub async fn send_error(
     reply_to: Option<Id<MessageMarker>>,
     error: &Error,
 ) {
-    if !error.should_notify_user() {
-        // If we shouldn't notify, remove the placeholder message when possible.
+    if error_notification_policy(error) == ErrorNotificationPolicy::SilentDelete {
         if let Some(msg_id) = reply_to {
             let _ = client.delete_message(channel_id, msg_id).await;
         }
+
         return;
     }
 
     if let Some(msg_id) = reply_to {
-        // Prefer editing the existing reply to keep the channel tidy.
         let _ = client
             .update_message(channel_id, msg_id)
             .content(Some(error.user_message()))
             .await;
-        return;
+    } else {
+        let _ = client
+            .create_message(channel_id)
+            .content(error.user_message())
+            .await;
     }
-
-    let _ = client
-        .create_message(channel_id)
-        .content(error.user_message())
-        .await;
 }
 
 /// Remove the temporary "processing" message after completion.
@@ -164,4 +176,32 @@ pub async fn delete_original(
             source: Box::new(e),
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azalea_core::pipeline::Error as CoreError;
+
+    #[test]
+    fn duplicate_errors_use_silent_delete_policy() {
+        let error = Error::Core(CoreError::Duplicate);
+        assert_eq!(
+            error_notification_policy(&error),
+            ErrorNotificationPolicy::SilentDelete
+        );
+    }
+
+    #[test]
+    fn non_duplicate_errors_use_visible_error_policy() {
+        let error = Error::UploadFailed {
+            part: 1,
+            total: 1,
+            source: Box::new(std::io::Error::other("upload failed")),
+        };
+        assert_eq!(
+            error_notification_policy(&error),
+            ErrorNotificationPolicy::VisibleError
+        );
+    }
 }
