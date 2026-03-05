@@ -401,6 +401,29 @@ mod tests {
     }
 
     #[test]
+    fn exponential_backoff_max_delay_is_bounded_for_all_attempts() {
+        const BASE_MS: u64 = 500;
+        const MAX_MS: u64 = 2_000;
+        const JITTER_MAX_MS: u64 = 250;
+
+        for attempt in 0..=64 {
+            let capped = BASE_MS
+                .saturating_mul(1u64 << (attempt.min(8) as u32))
+                .min(MAX_MS);
+            let expected_max = Duration::from_millis(capped + (JITTER_MAX_MS - 1));
+            for _ in 0..32 {
+                let delay = exponential_backoff(attempt, BASE_MS, MAX_MS);
+                assert!(
+                    delay <= expected_max,
+                    "attempt {attempt} exceeded max: delay={}ms expected_max={}ms",
+                    delay.as_millis(),
+                    expected_max.as_millis()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn jitter_stays_within_requested_bound() {
         for _ in 0..32 {
             let jitter = jitter_millis(250);
