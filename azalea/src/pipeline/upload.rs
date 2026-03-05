@@ -213,17 +213,28 @@ async fn read_file_with_limit(path: &Path, config: &EngineSettings) -> Result<Ve
 fn read_file_preallocated(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let size = file.metadata()?.len();
-    if size > usize::MAX as u64 {
+    let capacity = checked_preallocation_len(size)?;
+    // Preallocate to reduce reallocations for large uploads.
+    let mut buf = Vec::with_capacity(capacity);
+    use std::io::Read;
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn checked_preallocation_len(size: u64) -> std::io::Result<usize> {
+    if size > isize::MAX as u64 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "file size exceeds addressable memory",
         ));
     }
-    // Preallocate to reduce reallocations for large uploads.
-    let mut buf = Vec::with_capacity(size as usize);
-    use std::io::Read;
-    file.read_to_end(&mut buf)?;
-    Ok(buf)
+
+    usize::try_from(size).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file size exceeds addressable memory",
+        )
+    })
 }
 
 struct UploadRetryContext<'a> {
@@ -355,6 +366,29 @@ fn jitter_millis(max_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use azalea_core::config::EngineSettings;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_file_path(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("azalea-upload-{label}-{nanos}-{sequence}"))
+    }
+
+    fn write_temp_file(label: &str, bytes: &[u8]) -> PathBuf {
+        let path = unique_temp_file_path(label);
+        assert!(std::fs::write(&path, bytes).is_ok());
+        path
+    }
+
+    fn cleanup_file(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn exponential_backoff_grows_and_caps() {
@@ -373,5 +407,90 @@ mod tests {
             assert!(jitter < 250);
         }
         assert_eq!(jitter_millis(0), 0);
+    }
+
+    #[tokio::test]
+    async fn file_size_checked_missing_file_returns_not_found() {
+        let config = EngineSettings::default();
+        let path = unique_temp_file_path("missing-size-check");
+        cleanup_file(&path);
+
+        let result = file_size_checked(&path, &config).await;
+        assert!(matches!(
+            result,
+            Err(Error::Core(azalea_core::pipeline::Error::Io(ref err)))
+                if err.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_size_checked_oversized_file_is_rejected() {
+        let path = write_temp_file("oversized-size-check", b"12345678");
+        let mut config = EngineSettings::default();
+        config.transcode.max_upload_bytes = 4;
+
+        let result = file_size_checked(&path, &config).await;
+        cleanup_file(&path);
+
+        let rendered = result.as_ref().err().map(ToString::to_string);
+        assert!(matches!(
+            result,
+            Err(Error::UploadFailed {
+                part: 1,
+                total: 1,
+                ..
+            })
+        ));
+        assert!(
+            rendered
+                .as_deref()
+                .is_some_and(|message| message.contains("file too large"))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_size_checked_normal_file_returns_size() {
+        let payload = b"normal-file";
+        let path = write_temp_file("normal-size-check", payload);
+        let mut config = EngineSettings::default();
+        config.transcode.max_upload_bytes = payload.len() as u64 + 1;
+
+        let result = file_size_checked(&path, &config).await;
+        cleanup_file(&path);
+
+        assert_eq!(result.ok(), Some(payload.len() as u64));
+    }
+
+    #[test]
+    fn read_file_preallocated_missing_file_returns_not_found() {
+        let path = unique_temp_file_path("missing-read-preallocated");
+        cleanup_file(&path);
+
+        let result = read_file_preallocated(&path);
+        assert!(matches!(
+            result,
+            Err(ref err) if err.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn read_file_preallocated_oversized_size_is_rejected() {
+        let result = checked_preallocation_len((isize::MAX as u64).saturating_add(1));
+        assert!(matches!(
+            result,
+            Err(ref err)
+                if err.kind() == std::io::ErrorKind::InvalidInput
+                    && err.to_string() == "file size exceeds addressable memory"
+        ));
+    }
+
+    #[test]
+    fn read_file_preallocated_normal_file_returns_contents() {
+        let payload = b"normal-read";
+        let path = write_temp_file("normal-read-preallocated", payload);
+        let result = read_file_preallocated(&path);
+        cleanup_file(&path);
+
+        assert_eq!(result.ok().as_deref(), Some(payload.as_slice()));
     }
 }
