@@ -6,6 +6,46 @@ All notable changes to this project will be documented in this file.
 
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
+
+## 0.3.0 (March 7, 2026)
+
+### <!-- 10 -->🧪 Test
+- [`8329f81`](https://github.com/yehezkieldio/azalea/commit/8329f81cf9008fda3c60bdafce54f0bef3ef813a) **pipeline**: Add exponential backoff max-delay test
+- [`d593ad4`](https://github.com/yehezkieldio/azalea/commit/d593ad4721269c9a48e42c25f70db18384e24556) **discord**: Add media command tests
+- [`ffb54bb`](https://github.com/yehezkieldio/azalea/commit/ffb54bb98061f7ed8fcc34b0f2aed7d7147c480e) **smoke**: Add pass-through local fixture smoke test
+- [`d2b8185`](https://github.com/yehezkieldio/azalea/commit/d2b81850e39d448ab5a5c3e96bf04c4c7351066b) **dedup**: Add reserve_inflight collision test for two callers
+- [`090decc`](https://github.com/yehezkieldio/azalea/commit/090decc2dc03ecbbc2f6493f3758ec686e11c3db) **dedup**: Add prune test for expired persistent entries on lookup
+- [`df021d8`](https://github.com/yehezkieldio/azalea/commit/df021d81503995aabb82e4c8e548d0977731f86a) **pipeline**: Add video bitrate boundaries and presets test
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`828a1f3`](https://github.com/yehezkieldio/azalea/commit/828a1f30410c8a3d7c9d60706c860f5ce383073b) **changelog**: Regenerate changelog
+- [`4441b56`](https://github.com/yehezkieldio/azalea/commit/4441b56e3d2b6bffe4795e6583b1fd3e7c6cc1b8) **config**: Replace repo and issue URL in cliff.toml
+
+### <!-- 12 -->🔒 Security
+- [`44f6f45`](https://github.com/yehezkieldio/azalea/commit/44f6f45f02c7f3fdb40fc582b153b9272f5db52d) **ssrf**: Enforce dns resolution and reject blocked ips
+
+### <!-- 16 -->🤖 CI/CD
+- [`f77ae94`](https://github.com/yehezkieldio/azalea/commit/f77ae9407fc357fefcfb710a5b2ced46f87a30e6) **ci**: Add tags-ignore to push workflow
+
+### <!-- 2 -->🧩 Dependencies Updates
+- [`f66b718`](https://github.com/yehezkieldio/azalea/commit/f66b7187d90db566d9c9fa1e5c50dacf1c65828d) **deps**: Update rust crate tokio to v1.50.0 by renovate[bot] ([#5](https://github.com/yehezkieldio/azalea/issues/5))
+- [`9485cf3`](https://github.com/yehezkieldio/azalea/commit/9485cf392bd1e695dabdc8dd16c05aef45952b3d) **deps**: Update rust crate moka to v0.12.14 by renovate[bot] ([#4](https://github.com/yehezkieldio/azalea/issues/4))
+
+### <!-- 3 -->🚀 New Features
+- [`011a441`](https://github.com/yehezkieldio/azalea/commit/011a441340bad6fd4308fa8f661eac2e3e97e736) **pipeline**: Add jitter_millis_for_seed deterministic jitter calculation
+- [`cd8aa20`](https://github.com/yehezkieldio/azalea/commit/cd8aa2055ac300506fddad67c97c8130b42583de) **pipeline**: Add uploading segment progress updates
+
+### <!-- 4 -->🐛 Bug Fixes
+- [`62682af`](https://github.com/yehezkieldio/azalea/commit/62682af801cd6480cd12d0c221654fb3c0a1b70e) **pipeline**: Guard preallocation and preallocate upload buffer
+- [`8adc0ba`](https://github.com/yehezkieldio/azalea/commit/8adc0ba5427a99f000669ef2b7372e32b2901f53) **pipeline**: Replace audio bitrate mapping and clamp to 128-192
+
+### <!-- 7 -->🚜 Refactor
+- [`d742820`](https://github.com/yehezkieldio/azalea/commit/d742820e61a47bf363bee994415ccd7ccfd1133d) **gateway**: Extract shutdown_dispatch_tasks and add tests
+- [`868ce0c`](https://github.com/yehezkieldio/azalea/commit/868ce0cb28214158ec13dd14e4a964d8de1cd023) **discord**: Extract error notification policy and add tests
+
+### <!-- 8 -->🏗️ Build System
+- [`776ee11`](https://github.com/yehezkieldio/azalea/commit/776ee1153d31ccf61b977fe7a2b5f729590c4d23) **justfile**: Add post-release git push instruction
+
 ## 0.2.3 (February 25, 2026)
 
 ### <!-- 11 -->🛠️ Miscellaneous
