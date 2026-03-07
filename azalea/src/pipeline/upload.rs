@@ -13,7 +13,7 @@ use azalea_core::concurrency::Permits;
 use azalea_core::config::EngineSettings;
 use azalea_core::media::TweetId;
 use azalea_core::pipeline::PreparedUpload;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -342,6 +342,19 @@ fn exponential_backoff(attempt: usize, base_ms: u64, max_ms: u64) -> Duration {
     Duration::from_millis(delay.saturating_add(jitter))
 }
 
+fn jitter_millis_for_seed(max_ms: u64, seed: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+
+    let mixed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let mixed = mixed ^ (mixed >> 31);
+
+    mixed % max_ms
+}
+
 fn jitter_millis(max_ms: u64) -> u64 {
     static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -353,14 +366,12 @@ fn jitter_millis(max_ms: u64) -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let counter = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    // Deterministic jitter without pulling in an RNG dependency.
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     nanos.hash(&mut hasher);
     std::thread::current().id().hash(&mut hasher);
     counter.hash(&mut hasher);
 
-    hasher.finish() % max_ms
+    jitter_millis_for_seed(max_ms, hasher.finish())
 }
 
 #[cfg(test)]
@@ -424,7 +435,26 @@ mod tests {
     }
 
     #[test]
-    fn jitter_stays_within_requested_bound() {
+    fn jitter_seed_stays_within_requested_bound() {
+        const SEED_LIMIT: u64 = u16::MAX as u64;
+
+        for max_ms in [1, 2, 3, 7, 250, 1_024, u16::MAX as u64 + 1] {
+            for seed in 0..=SEED_LIMIT {
+                let jitter = jitter_millis_for_seed(max_ms, seed);
+                assert!(
+                    jitter < max_ms,
+                    "seed {seed} exceeded bound: jitter={jitter} max_ms={max_ms}"
+                );
+            }
+        }
+
+        for seed in 0..=SEED_LIMIT {
+            assert_eq!(jitter_millis_for_seed(0, seed), 0);
+        }
+    }
+
+    #[test]
+    fn jitter_runtime_path_stays_within_requested_bound() {
         for _ in 0..32 {
             let jitter = jitter_millis(250);
             assert!(jitter < 250);
