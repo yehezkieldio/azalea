@@ -36,6 +36,14 @@ impl<'a> Dispatcher<'a> {
     }
 }
 
+async fn shutdown_dispatch_tasks(tracker: TaskTracker) {
+    tracker.close();
+    if !tracker.is_empty() {
+        tracing::info!(pending = tracker.len(), "waiting for in-flight tasks");
+        tracker.wait().await;
+    }
+}
+
 /// Drive a shard event loop, dispatching handlers and collecting resume info.
 ///
 /// ## Postconditions
@@ -75,11 +83,48 @@ pub async fn run(
     // Snapshot resume state before we close outstanding tasks.
     let resume_info = SessionInfo::from(&shard);
 
-    tracker.close();
-    if !tracker.is_empty() {
-        tracing::info!(pending = tracker.len(), "waiting for in-flight tasks");
-        tracker.wait().await;
-    }
+    shutdown_dispatch_tasks(tracker).await;
 
     resume_info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn shutdown_awaits_all_dispatched_tasks() {
+        let tracker = TaskTracker::new();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+
+        Dispatcher::new(&tracker).dispatch(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            let _ = finished_tx.send(());
+        });
+
+        assert!(started_rx.await.is_ok(), "dispatched task should start");
+
+        let mut shutdown = tokio::spawn(shutdown_dispatch_tasks(tracker));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown should wait for tracked tasks"
+        );
+
+        assert!(release_tx.send(()).is_ok(), "task should still be waiting");
+        assert!(
+            shutdown.await.is_ok(),
+            "shutdown task should complete cleanly"
+        );
+        assert!(
+            finished_rx.await.is_ok(),
+            "tracked task should finish before shutdown returns"
+        );
+    }
 }
