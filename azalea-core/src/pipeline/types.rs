@@ -156,6 +156,14 @@ impl fmt::Display for Progress {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::path::{Component, Path};
+
+    fn is_allowed_extension(ext: &str) -> bool {
+        matches!(
+            ext,
+            "mp4" | "webm" | "mov" | "mkv" | "avi" | "ts" | "gif" | "jpg" | "jpeg" | "png" | "webp"
+        )
+    }
 
     #[test]
     fn sanitize_extension_normalizes_known_values() {
@@ -189,13 +197,17 @@ mod tests {
 
     proptest! {
         #[test]
-        fn sanitize_extension_always_returns_safe_suffix(ext in ".*") {
+        fn sanitize_extension_always_returns_safe_suffix(ext in any::<String>()) {
             let sanitized = sanitize_extension(&ext);
-            prop_assert!(matches!(
-                sanitized.as_str(),
-                "mp4" | "webm" | "mov" | "mkv" | "avi" | "ts" | "gif" | "jpg" | "jpeg" | "png" | "webp"
-            ));
+
+            prop_assert!(is_allowed_extension(&sanitized));
             prop_assert!(sanitized.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()));
+            prop_assert!(!sanitized.contains(['/', '\\']));
+            prop_assert_ne!(sanitized.as_str(), ".");
+            prop_assert_ne!(sanitized.as_str(), "..");
+            prop_assert!(Path::new(&sanitized)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))));
         }
     }
 }
