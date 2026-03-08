@@ -435,6 +435,15 @@ mod tests {
     }
 
     #[test]
+    fn exponential_backoff_saturates_without_overflow_for_large_attempts() {
+        let expected = Duration::from_millis(u64::MAX);
+
+        for attempt in [1_024, 1 << 20, usize::MAX - 1, usize::MAX] {
+            assert_eq!(exponential_backoff(attempt, u64::MAX, u64::MAX), expected);
+        }
+    }
+
+    #[test]
     fn jitter_seed_stays_within_requested_bound() {
         const SEED_LIMIT: u64 = u16::MAX as u64;
 
