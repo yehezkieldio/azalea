@@ -643,13 +643,22 @@ fn should_negative_cache(error: &ResolveError) -> bool {
     // Cache durable errors but skip transient failures (timeouts, rate limits).
     match error {
         ResolveError::HttpStatus(code) => *code == 404,
-        ResolveError::ParseFailed(_) => true,
+        ResolveError::ParseFailed(message) => {
+            let lower = message.to_lowercase();
+            !(lower.contains("eof")
+                || lower.contains("unexpected end")
+                || lower.contains("unterminated")
+                || lower.contains("truncated")
+                || lower.contains("partial"))
+        }
         ResolveError::ProcessFailed { stderr, .. } => {
             let lower = stderr.to_lowercase();
             if lower.contains("timed out")
                 || lower.contains("timeout")
                 || lower.contains("rate limit")
                 || lower.contains("429")
+                || lower.contains("network")
+                || lower.contains("connection")
                 || lower.contains("temporar")
                 || lower.contains("server")
             {
@@ -698,4 +707,45 @@ async fn read_stderr_tail(
     }
 
     Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_negative_cache;
+    use crate::pipeline::errors::ResolveError;
+
+    #[test]
+    fn negative_cache_keeps_protected_tweet_failures() {
+        let error = ResolveError::ProcessFailed {
+            exit_code: Some(1),
+            stderr: "tweet is protected".to_string(),
+        };
+
+        assert!(should_negative_cache(&error));
+    }
+
+    #[test]
+    fn negative_cache_keeps_durable_parse_failures() {
+        let error =
+            ResolveError::ParseFailed("invalid type: null, expected media array".to_string());
+
+        assert!(should_negative_cache(&error));
+    }
+
+    #[test]
+    fn negative_cache_skips_network_failures() {
+        let error = ResolveError::ProcessFailed {
+            exit_code: Some(1),
+            stderr: "connection reset by peer while fetching media".to_string(),
+        };
+
+        assert!(!should_negative_cache(&error));
+    }
+
+    #[test]
+    fn negative_cache_skips_partial_parse_failures() {
+        let error = ResolveError::ParseFailed("EOF while parsing a value".to_string());
+
+        assert!(!should_negative_cache(&error));
+    }
 }
