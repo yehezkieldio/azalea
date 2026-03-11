@@ -352,6 +352,8 @@ mod tests {
         ]
     }
 
+    const FUZZ_MAX_INPUT_BYTES: usize = 4 * 1024;
+
     proptest! {
         #[test]
         fn parse_extracts_correct_tweet_id_for_any_valid_url(
@@ -371,6 +373,22 @@ mod tests {
                 parsed.canonical_url(),
                 format!("https://x.com/{user}/status/{tweet_id}")
             );
+        }
+
+        #[test]
+        fn parse_handles_arbitrary_byte_strings_without_panicking(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=FUZZ_MAX_INPUT_BYTES),
+        ) {
+            // Keep the fuzz input bounded so both the lossy UTF-8 conversion and any
+            // parser allocations stay linear in a small, fixed-size input.
+            let content = String::from_utf8_lossy(&bytes);
+            let urls = parse_tweet_urls(&content);
+
+            for url in &urls {
+                prop_assert!(url.user.len() <= 15);
+                prop_assert!(content.contains(url.original_url()));
+                prop_assert!(url.canonical_url().starts_with("https://x.com/"));
+            }
         }
     }
 }
