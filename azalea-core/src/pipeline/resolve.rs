@@ -27,8 +27,10 @@ use crate::pipeline::ssrf::validate_media_url;
 use crate::pipeline::types::{MediaType, ResolvedMedia, sanitize_extension};
 use moka::future::Cache;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -43,7 +45,7 @@ use tokio::sync::mpsc;
 pub struct ResolverChain {
     vx: VxTwitter,
     ytdlp: YtDlp,
-    positive_cache: Cache<TweetId, ResolvedMedia>,
+    positive_cache: Cache<TweetId, Arc<ResolvedMedia>>,
     negative_cache: Cache<TweetId, ResolveError>,
 }
 
@@ -91,7 +93,7 @@ impl ResolverChain {
         tweet_url: &TweetLink,
         http: &reqwest::Client,
         permits: &Permits,
-    ) -> Result<ResolvedMedia, Error> {
+    ) -> Result<Arc<ResolvedMedia>, Error> {
         tracing::trace!(tweet_id = tweet_url.tweet_id.0, "Resolving media");
         if let Some(err) = self.negative_cache.get(&tweet_url.tweet_id).await {
             // Fail fast on known-bad URLs to avoid repeated slow lookups.
@@ -119,7 +121,7 @@ impl ResolverChain {
                     "Resolved media"
                 );
                 self.positive_cache
-                    .insert(tweet_url.tweet_id, media.clone())
+                    .insert(tweet_url.tweet_id, Arc::clone(&media))
                     .await;
                 return Ok(media);
             }
@@ -155,7 +157,7 @@ impl ResolverChain {
                     "Resolved media"
                 );
                 self.positive_cache
-                    .insert(tweet_url.tweet_id, media.clone())
+                    .insert(tweet_url.tweet_id, Arc::clone(&media))
                     .await;
                 Ok(media)
             }
@@ -226,7 +228,7 @@ impl VxTwitter {
         &self,
         tweet_url: &TweetLink,
         http: &reqwest::Client,
-    ) -> Result<ResolvedMedia, ResolveError> {
+    ) -> Result<Arc<ResolvedMedia>, ResolveError> {
         let api_url = format!(
             "https://api.vxtwitter.com/{}/status/{}",
             tweet_url.user, tweet_url.tweet_id.0
@@ -255,8 +257,8 @@ impl VxTwitter {
             );
             let is_image = matches!(media.media_type.as_ref(), "image" | "photo");
 
-            Ok(ResolvedMedia {
-                url: media.url.clone(),
+            Ok(Arc::new(ResolvedMedia {
+                url: Cow::Owned(media.url.clone().into()),
                 media_type: if is_image {
                     MediaType::Image
                 } else {
@@ -268,7 +270,7 @@ impl VxTwitter {
                     _ => None,
                 },
                 extension: extension.into_boxed_str(),
-            })
+            }))
         })
         .await;
 
@@ -344,7 +346,7 @@ impl YtDlp {
         }
     }
 
-    async fn resolve(&self, tweet_url: &TweetLink) -> Result<ResolvedMedia, ResolveError> {
+    async fn resolve(&self, tweet_url: &TweetLink) -> Result<Arc<ResolvedMedia>, ResolveError> {
         const YTDLP_STDOUT_LIMIT: usize = 4 * 1024 * 1024;
         const YTDLP_STDERR_LINES: usize = 10;
 
@@ -488,8 +490,8 @@ impl YtDlp {
         let (url, extension, is_image) = select_best_format(&ytdlp_output)?;
         let extension = sanitize_extension(&extension);
 
-        Ok(ResolvedMedia {
-            url,
+        Ok(Arc::new(ResolvedMedia {
+            url: Cow::Owned(url.into()),
             media_type: if is_image {
                 MediaType::Image
             } else {
@@ -501,7 +503,7 @@ impl YtDlp {
                 _ => None,
             },
             extension: extension.into_boxed_str(),
-        })
+        }))
     }
 }
 

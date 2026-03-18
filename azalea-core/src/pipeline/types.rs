@@ -5,7 +5,7 @@
 //! - Guards own temporary files until upload completes.
 //! - `RequestId` is stable across all log statements for a job.
 
-use std::{fmt, path::PathBuf};
+use std::{borrow::Cow, fmt, path::PathBuf};
 
 use crate::media::{TempFileGuard, TweetLink};
 
@@ -50,7 +50,7 @@ pub enum MediaType {
 /// URL is SSRF-validated before download (see `pipeline::ssrf`).
 #[derive(Debug, Clone)]
 pub struct ResolvedMedia {
-    pub url: Box<str>,
+    pub url: Cow<'static, str>,
     pub media_type: MediaType,
     pub duration: Option<f64>,
     pub resolution: Option<(u32, u32)>,

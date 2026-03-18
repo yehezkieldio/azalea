@@ -116,7 +116,7 @@ pub async fn run(
         }
 
         let downloaded = download::download(
-            &resolved,
+            resolved.as_ref(),
             &job,
             &engine.http,
             &engine.permits,
@@ -156,7 +156,7 @@ pub async fn run(
 
         let prepared = optimize::optimize(
             downloaded,
-            &resolved,
+            resolved.as_ref(),
             &engine.permits,
             &engine.temp_files,
             &engine.config,

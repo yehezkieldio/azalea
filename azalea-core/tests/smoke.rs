@@ -6,6 +6,7 @@ use azalea_core::media::{TempFileCleanup, TweetId, parse_tweet_urls};
 use azalea_core::pipeline::optimize;
 use azalea_core::pipeline::types::{DownloadedFile, MediaType, PreparedUpload, ResolvedMedia};
 use azalea_core::storage::DedupCache;
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -77,7 +78,7 @@ async fn pass_through_local_fixture_smoke_flow() {
         _dir_guard: Some(temp_files.guard(fixture_dir)),
     };
     let resolved = ResolvedMedia {
-        url: "https://pbs.twimg.com/media/local-pass-through.mp4".into(),
+        url: Cow::Borrowed("https://pbs.twimg.com/media/local-pass-through.mp4"),
         media_type: MediaType::Video,
         duration: Some(1.0),
         resolution: Some((640, 360)),
