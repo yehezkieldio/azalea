@@ -22,7 +22,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 
 /// Compact dedup key.
 ///
@@ -123,6 +123,8 @@ pub struct Cache {
     flush_failures: Arc<AtomicUsize>,
     flush_backoff_until: Arc<AtomicU64>,
     persistence_disabled: Arc<AtomicBool>,
+    flush_notify: Arc<Notify>,
+    flush_task_running: Arc<AtomicBool>,
     flush_cancel: watch::Sender<bool>,
     flush_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     maintenance_cancel: watch::Sender<bool>,
@@ -183,6 +185,8 @@ impl Cache {
             flush_failures: Arc::new(AtomicUsize::new(0)),
             flush_backoff_until: Arc::new(AtomicU64::new(0)),
             persistence_disabled: Arc::new(AtomicBool::new(false)),
+            flush_notify: Arc::new(Notify::new()),
+            flush_task_running: Arc::new(AtomicBool::new(false)),
             flush_cancel,
             flush_handle: Arc::new(Mutex::new(None)),
             maintenance_cancel,
@@ -349,8 +353,13 @@ impl Cache {
         };
 
         if should_flush {
-            // Best-effort flush when the batch size threshold is reached.
-            self.flush().await;
+            // Wake the background flusher so the batch can be committed in one
+            // Redb transaction instead of blocking this hot path.
+            if self.flush_task_running.load(Ordering::Relaxed) {
+                self.flush_notify.notify_one();
+            } else {
+                self.flush().await;
+            }
         }
     }
 
@@ -474,22 +483,35 @@ impl Cache {
             return;
         }
 
+        if self.flush_task_running.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
         let mut handle_guard = self.flush_handle.lock().await;
         if handle_guard.is_some() {
+            self.flush_task_running.store(false, Ordering::Relaxed);
             return;
         }
 
         let _ = self.flush_cancel.send(false);
         let dedup = self.clone();
+        let flush_notify = Arc::clone(&self.flush_notify);
         let mut cancel_rx = self.flush_cancel.subscribe();
         *handle_guard = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate first tick so startup does not flush partial
+            // batches before the queue has a chance to fill under load.
+            ticker.tick().await;
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_rx.changed() => {
                         if *cancel_rx.borrow() {
                             break;
                         }
+                    }
+                    _ = flush_notify.notified() => {
+                        dedup.flush().await;
                     }
                     _ = ticker.tick() => {
                         dedup.flush().await;
@@ -501,6 +523,7 @@ impl Cache {
 
     /// Stop the periodic flush task.
     pub async fn stop_flush_task(&self) {
+        self.flush_task_running.store(false, Ordering::Relaxed);
         let _ = self.flush_cancel.send(true);
         if let Some(handle) = self.flush_handle.lock().await.take() {
             let _ = handle.await;
@@ -882,6 +905,51 @@ mod tests {
                 .expect("lookup should succeed")
                 .is_none()
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn background_flush_batches_pending_writes() {
+        let db_path = unique_test_db_path("dedup-batched-flush");
+        let storage = persistent_storage_settings(db_path.clone());
+        let cache = Cache::new(
+            &storage,
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should construct");
+
+        cache
+            .start_flush_task(std::time::Duration::from_secs(3600))
+            .await;
+
+        let scope_id = 31;
+        for offset in 0..DEFAULT_BATCH_SIZE {
+            let tweet_id = TweetId(offset as u64 + 1);
+            assert!(cache.reserve_inflight(scope_id, tweet_id).await);
+            cache.mark_processed(scope_id, tweet_id).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            cache.pending_writes_len().await,
+            0,
+            "background flush should drain the batch"
+        );
+
+        cache.stop_flush_task().await;
+        drop(cache);
+
+        let restored = Cache::new(
+            &persistent_storage_settings(db_path.clone()),
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should reconstruct");
+        restored.load_from_db().await.expect("load should succeed");
+
+        assert!(restored.is_duplicate(scope_id, TweetId(1)).await);
 
         let _ = std::fs::remove_file(db_path);
     }
