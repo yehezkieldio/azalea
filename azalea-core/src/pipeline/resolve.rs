@@ -204,9 +204,9 @@ struct VxResponse {
 
 #[derive(Debug, Deserialize)]
 struct VxMedia {
-    url: String,
+    url: Box<str>,
     #[serde(rename = "type")]
-    media_type: String,
+    media_type: Box<str>,
     #[serde(default)]
     duration_millis: Option<u64>,
     #[serde(default)]
@@ -253,10 +253,10 @@ impl VxTwitter {
             let extension = sanitize_extension(
                 &infer_extension(&media.media_type, &media.url, Some(http)).await,
             );
-            let is_image = matches!(media.media_type.as_str(), "image" | "photo");
+            let is_image = matches!(media.media_type.as_ref(), "image" | "photo");
 
             Ok(ResolvedMedia {
-                url: media.url.clone().into_boxed_str(),
+                url: media.url.clone(),
                 media_type: if is_image {
                     MediaType::Image
                 } else {
@@ -287,7 +287,7 @@ impl VxTwitter {
         }
 
         // Prefer video over GIF over stills for richer embeds.
-        let priority = |m: &VxMedia| match m.media_type.as_str() {
+        let priority = |m: &VxMedia| match m.media_type.as_ref() {
             "video" => 0,
             "gif" => 1,
             "image" | "photo" => 2,
@@ -309,7 +309,7 @@ struct YtDlp {
 
 #[derive(Debug, Deserialize)]
 struct YtDlpOutput {
-    url: Option<String>,
+    url: Option<Box<str>>,
     #[serde(default)]
     formats: Vec<YtDlpFormat>,
     #[serde(default)]
@@ -319,19 +319,19 @@ struct YtDlpOutput {
     #[serde(default)]
     height: Option<u32>,
     #[serde(default)]
-    ext: Option<String>,
+    ext: Option<Box<str>>,
     #[serde(default)]
-    thumbnail: Option<String>,
+    thumbnail: Option<Box<str>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct YtDlpFormat {
-    url: Option<String>,
-    ext: Option<String>,
+    url: Option<Box<str>>,
+    ext: Option<Box<str>>,
     #[serde(default)]
-    vcodec: Option<String>,
+    vcodec: Option<Box<str>>,
     #[serde(default)]
-    acodec: Option<String>,
+    acodec: Option<Box<str>>,
     #[serde(default)]
     tbr: Option<f64>,
 }
@@ -438,7 +438,7 @@ impl YtDlp {
                     .await
                     .ok()
                     .and_then(|result| result.ok())
-                    .unwrap_or_else(|| "unknown error".to_string());
+                    .unwrap_or_else(|| "unknown error".into());
                 return Err(ResolveError::ProcessFailed {
                     exit_code: None,
                     stderr: format!("yt-dlp output exceeded limit: {stderr_tail}"),
@@ -461,7 +461,7 @@ impl YtDlp {
             .await
             .ok()
             .and_then(|result| result.ok())
-            .unwrap_or_else(|| "unknown error".to_string());
+            .unwrap_or_else(|| "unknown error".into());
 
         if stdout.exceeded {
             return Err(ResolveError::ProcessFailed {
@@ -489,7 +489,7 @@ impl YtDlp {
         let extension = sanitize_extension(&extension);
 
         Ok(ResolvedMedia {
-            url: url.into_boxed_str(),
+            url,
             media_type: if is_image {
                 MediaType::Image
             } else {
@@ -505,11 +505,11 @@ impl YtDlp {
     }
 }
 
-fn select_best_format(output: &YtDlpOutput) -> Result<(String, String, bool), ResolveError> {
+fn select_best_format(output: &YtDlpOutput) -> Result<(Box<str>, Box<str>, bool), ResolveError> {
     if let Some(url) = &output.url {
         // Some yt-dlp outputs provide a direct URL; prefer it when present.
-        let ext = output.ext.clone().unwrap_or_else(|| "mp4".to_string());
-        let is_image = is_image_extension(&ext);
+        let ext = output.ext.clone().unwrap_or_else(|| "mp4".into());
+        let is_image = is_image_extension(ext.as_ref());
         return Ok((url.clone(), ext, is_image));
     }
 
@@ -524,7 +524,7 @@ fn select_best_format(output: &YtDlpOutput) -> Result<(String, String, bool), Re
     if valid_formats.is_empty() {
         // Fall back to thumbnail for image-only tweets.
         if let Some(thumbnail_url) = &output.thumbnail {
-            let ext = extension_from_url(thumbnail_url).unwrap_or_else(|| "jpg".to_string());
+            let ext = extension_from_url(thumbnail_url).unwrap_or_else(|| "jpg".into());
             return Ok((thumbnail_url.clone(), ext, true));
         }
         return Err(ResolveError::ParseFailed("no formats".to_string()));
@@ -560,7 +560,7 @@ fn select_best_format(output: &YtDlpOutput) -> Result<(String, String, bool), Re
             .url
             .clone()
             .ok_or_else(|| ResolveError::ParseFailed("format missing url".to_string()))?;
-        let ext = best.ext.clone().unwrap_or_else(|| "mp4".to_string());
+        let ext = best.ext.clone().unwrap_or_else(|| "mp4".into());
         return Ok((url, ext, false));
     }
 
@@ -580,7 +580,7 @@ fn select_best_format(output: &YtDlpOutput) -> Result<(String, String, bool), Re
         .url
         .clone()
         .ok_or_else(|| ResolveError::ParseFailed("format missing url".to_string()))?;
-    let ext = best.ext.clone().unwrap_or_else(|| "mp4".to_string());
+    let ext = best.ext.clone().unwrap_or_else(|| "mp4".into());
     Ok((url, ext, false))
 }
 
@@ -588,19 +588,23 @@ fn is_image_extension(ext: &str) -> bool {
     matches!(ext, "jpg" | "jpeg" | "png" | "webp" | "gif")
 }
 
-fn extension_from_url(url: &str) -> Option<String> {
+fn extension_from_url(url: &str) -> Option<Box<str>> {
     url.split('?')
         .next()?
         .split('.')
         .next_back()
-        .map(|s| s.to_lowercase())
+        .map(|s| s.to_lowercase().into_boxed_str())
 }
 
-async fn infer_extension(media_type: &str, url: &str, client: Option<&reqwest::Client>) -> String {
+async fn infer_extension(
+    media_type: &str,
+    url: &str,
+    client: Option<&reqwest::Client>,
+) -> Box<str> {
     if let Some(ext) = url.split('.').next_back() {
         let ext = ext.split('?').next().unwrap_or(ext);
         if ["mp4", "webm", "gif", "jpg", "jpeg", "png", "webp"].contains(&ext) {
-            return ext.to_string();
+            return ext.into();
         }
     }
 
@@ -617,14 +621,14 @@ async fn infer_extension(media_type: &str, url: &str, client: Option<&reqwest::C
     }
 
     match media_type {
-        "video" => "mp4".to_string(),
-        "gif" => "gif".to_string(),
-        "image" | "photo" => "jpg".to_string(),
-        _ => "mp4".to_string(),
+        "video" => "mp4".into(),
+        "gif" => "gif".into(),
+        "image" | "photo" => "jpg".into(),
+        _ => "mp4".into(),
     }
 }
 
-fn extension_from_mime_type(mime_type: &str) -> String {
+fn extension_from_mime_type(mime_type: &str) -> Box<str> {
     let mime_base = mime_type.split(';').next().unwrap_or(mime_type).trim();
     match mime_base {
         "video/mp4" => "mp4",
@@ -636,7 +640,7 @@ fn extension_from_mime_type(mime_type: &str) -> String {
         "image/gif" => "gif",
         _ => mime_base.split('/').nth(1).unwrap_or("mp4"),
     }
-    .to_string()
+    .into()
 }
 
 fn should_negative_cache(error: &ResolveError) -> bool {
@@ -678,7 +682,7 @@ fn should_negative_cache(error: &ResolveError) -> bool {
 async fn read_stderr_tail(
     stderr: tokio::process::ChildStderr,
     max_lines: usize,
-) -> Result<String, std::io::Error> {
+) -> Result<Box<str>, std::io::Error> {
     const MAX_LINE_BYTES: usize = 4096;
     let mut reader = BufReader::new(stderr);
     let mut lines = VecDeque::with_capacity(max_lines);
@@ -706,7 +710,11 @@ async fn read_stderr_tail(
         lines.push_back(line);
     }
 
-    Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
+    Ok(lines
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_boxed_str())
 }
 
 #[cfg(test)]

@@ -48,7 +48,7 @@ struct LoadState {
     failures: u64,
     stage_sum: [u64; 4],
     stage_count: [u64; 4],
-    errors: Vec<(String, u64)>,
+    errors: Vec<(Box<str>, u64)>,
 }
 
 impl Stage {
@@ -79,7 +79,7 @@ struct Inner {
     failures: AtomicU64,
     stage_duration_sum_ms: [AtomicU64; 4],
     stage_count: [AtomicU64; 4],
-    error_counts: DashMap<String, AtomicU64>,
+    error_counts: DashMap<Box<str>, AtomicU64>,
     flush_cancel: watch::Sender<bool>,
     flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -162,7 +162,7 @@ impl Tracker {
 
         self.inner
             .error_counts
-            .entry(kind.to_string())
+            .entry(kind.into())
             .or_insert_with(|| AtomicU64::new(0))
             .value()
             .fetch_add(1, Ordering::Relaxed);
@@ -229,7 +229,7 @@ impl Tracker {
             if let Ok(table) = read_txn.open_table(ERRORS_TABLE) {
                 for entry in table.iter()? {
                     let (key, value): (AccessGuard<&str>, AccessGuard<u64>) = entry?;
-                    errors.push((key.value().to_string(), value.value()));
+                    errors.push((key.value().into(), value.value()));
                 }
             }
 
@@ -323,7 +323,7 @@ impl Tracker {
         let successes = self.inner.successes.load(Ordering::Relaxed);
         let failures = self.inner.failures.load(Ordering::Relaxed);
 
-        let stage_data: Vec<(String, u64, u64)> = [
+        let stage_data: Vec<(Box<str>, u64, u64)> = [
             Stage::Resolve,
             Stage::Download,
             Stage::Optimize,
@@ -333,7 +333,7 @@ impl Tracker {
         .map(|stage| {
             let idx = *stage as usize;
             (
-                stage.as_str().to_string(),
+                stage.as_str().into(),
                 self.inner
                     .stage_duration_sum_ms
                     .get(idx)
@@ -348,16 +348,11 @@ impl Tracker {
         })
         .collect();
 
-        let error_counts: Vec<(String, u64)> = self
+        let error_counts: Vec<(Box<str>, u64)> = self
             .inner
             .error_counts
             .iter()
-            .map(|entry| {
-                (
-                    entry.key().to_string(),
-                    entry.value().load(Ordering::Relaxed),
-                )
-            })
+            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
             .collect();
 
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
@@ -370,8 +365,8 @@ impl Tracker {
                 let _ = table.insert("failures", failures);
 
                 for (stage, sum, count) in stage_data {
-                    let sum_key = format!("stage.{}.duration_sum_ms", stage);
-                    let count_key = format!("stage.{}.count", stage);
+                    let sum_key = format!("stage.{}.duration_sum_ms", stage.as_ref());
+                    let count_key = format!("stage.{}.count", stage.as_ref());
                     let _ = table.insert(sum_key.as_str(), sum);
                     let _ = table.insert(count_key.as_str(), count);
                 }
@@ -380,7 +375,7 @@ impl Tracker {
             {
                 let mut table = write_txn.open_table(ERRORS_TABLE)?;
                 for (key, count) in error_counts {
-                    let _ = table.insert(key.as_str(), count);
+                    let _ = table.insert(key.as_ref(), count);
                 }
             }
 
