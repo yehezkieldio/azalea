@@ -202,6 +202,7 @@ mod tests {
 
             prop_assert!(is_allowed_extension(&sanitized));
             prop_assert!(sanitized.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()));
+            prop_assert!(!sanitized.contains(".."));
             prop_assert!(!sanitized.contains(['/', '\\']));
             prop_assert_ne!(sanitized.as_str(), ".");
             prop_assert_ne!(sanitized.as_str(), "..");
