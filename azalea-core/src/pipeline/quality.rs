@@ -325,6 +325,45 @@ mod tests {
         assert_eq!(long, 128);
     }
 
+    proptest! {
+        #[test]
+        fn bitrate_compute_is_monotonic_for_upload_budget(
+            duration in 0.2f64..1800.0,
+            extra_budget_bytes in 0u64..1_000_000,
+            larger_budget_bytes in 0u64..1_000_000,
+        ) {
+            let config = TranscodeSettings::default();
+            let audio_bitrate_kbps = BitrateParams::audio_bitrate_for_duration(duration);
+            let audio_total_bits =
+                audio_bitrate_kbps as f64 * 1000.0 * duration * config.audio_vbr_padding;
+            let usable_budget_scale =
+                config.transcode_target_ratio * (1.0 - config.container_overhead_ratio) * 8.0;
+            let minimum_upload_bytes = (audio_total_bits / usable_budget_scale).ceil() as u64 + 1;
+            let smaller_budget = minimum_upload_bytes + extra_budget_bytes;
+            let larger_budget = smaller_budget + larger_budget_bytes;
+
+            let smaller = BitrateParams::compute(
+                &TranscodeSettings {
+                    max_upload_bytes: smaller_budget,
+                    ..config.clone()
+                },
+                duration,
+            )
+            .expect("minimum valid budget should produce bitrate params");
+            let larger = BitrateParams::compute(
+                &TranscodeSettings {
+                    max_upload_bytes: larger_budget,
+                    ..config
+                },
+                duration,
+            )
+            .expect("larger budget should produce bitrate params");
+
+            prop_assert_eq!(smaller.audio_bitrate_kbps, larger.audio_bitrate_kbps);
+            prop_assert!(larger.video_bitrate_kbps >= smaller.video_bitrate_kbps);
+        }
+    }
+
     #[test]
     fn split_bitrate_uses_expected_audio_floor() {
         let params = BitrateParams::compute_for_split(&TranscodeSettings::default(), 30.0)
