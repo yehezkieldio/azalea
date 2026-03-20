@@ -834,6 +834,13 @@ mod tests {
     }
 
     #[test]
+    fn negative_cache_keeps_404_http_status() {
+        let error = ResolveError::HttpStatus(404);
+
+        assert!(should_negative_cache(&error));
+    }
+
+    #[test]
     fn negative_cache_keeps_durable_parse_failures() {
         let error =
             ResolveError::ParseFailed("invalid type: null, expected media array".to_string());
@@ -846,6 +853,26 @@ mod tests {
         let error = ResolveError::ProcessFailed {
             exit_code: Some(1),
             stderr: "connection reset by peer while fetching media".to_string(),
+        };
+
+        assert!(!should_negative_cache(&error));
+    }
+
+    #[test]
+    fn negative_cache_skips_timeout_failures() {
+        let error = ResolveError::ProcessFailed {
+            exit_code: Some(1),
+            stderr: "yt-dlp timed out after 30s".to_string(),
+        };
+
+        assert!(!should_negative_cache(&error));
+    }
+
+    #[test]
+    fn negative_cache_skips_429_rate_limit_failures() {
+        let error = ResolveError::ProcessFailed {
+            exit_code: Some(1),
+            stderr: "HTTP 429 too many requests".to_string(),
         };
 
         assert!(!should_negative_cache(&error));
