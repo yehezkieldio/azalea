@@ -721,8 +721,107 @@ async fn read_stderr_tail(
 
 #[cfg(test)]
 mod tests {
-    use super::should_negative_cache;
+    use super::{YtDlpFormat, YtDlpOutput, select_best_format, should_negative_cache};
     use crate::pipeline::errors::ResolveError;
+
+    fn format(
+        url: &str,
+        ext: &str,
+        vcodec: Option<&str>,
+        acodec: Option<&str>,
+        tbr: Option<f64>,
+    ) -> YtDlpFormat {
+        YtDlpFormat {
+            url: Some(url.into()),
+            ext: Some(ext.into()),
+            vcodec: vcodec.map(Into::into),
+            acodec: acodec.map(Into::into),
+            tbr,
+        }
+    }
+
+    #[test]
+    fn select_best_format_prefers_h264_aac_over_vp9() -> Result<(), ResolveError> {
+        let output = YtDlpOutput {
+            url: None,
+            formats: vec![
+                format(
+                    "https://example.invalid/vp9.webm",
+                    "webm",
+                    Some("vp9"),
+                    Some("opus"),
+                    Some(9.0),
+                ),
+                format(
+                    "https://example.invalid/h264.mp4",
+                    "mp4",
+                    Some("avc1.640028"),
+                    Some("mp4a.40.2"),
+                    Some(2.0),
+                ),
+            ],
+            duration: None,
+            width: None,
+            height: None,
+            ext: None,
+            thumbnail: Some("https://example.invalid/thumb.jpg".into()),
+        };
+
+        let (url, ext, is_image) = select_best_format(&output)?;
+
+        assert_eq!(url.as_ref(), "https://example.invalid/h264.mp4");
+        assert_eq!(ext.as_ref(), "mp4");
+        assert!(!is_image);
+        Ok(())
+    }
+
+    #[test]
+    fn select_best_format_prefers_vp9_over_thumbnail_when_no_h264_aac_exists()
+    -> Result<(), ResolveError> {
+        let output = YtDlpOutput {
+            url: None,
+            formats: vec![format(
+                "https://example.invalid/vp9.webm",
+                "webm",
+                Some("vp9"),
+                Some("opus"),
+                Some(9.0),
+            )],
+            duration: None,
+            width: None,
+            height: None,
+            ext: None,
+            thumbnail: Some("https://example.invalid/thumb.jpg".into()),
+        };
+
+        let (url, ext, is_image) = select_best_format(&output)?;
+
+        assert_eq!(url.as_ref(), "https://example.invalid/vp9.webm");
+        assert_eq!(ext.as_ref(), "webm");
+        assert!(!is_image);
+        Ok(())
+    }
+
+    #[test]
+    fn select_best_format_uses_thumbnail_when_no_downloadable_video_exists()
+    -> Result<(), ResolveError> {
+        let output = YtDlpOutput {
+            url: None,
+            formats: vec![],
+            duration: None,
+            width: None,
+            height: None,
+            ext: None,
+            thumbnail: Some("https://example.invalid/thumb.jpg".into()),
+        };
+
+        let (url, ext, is_image) = select_best_format(&output)?;
+
+        assert_eq!(url.as_ref(), "https://example.invalid/thumb.jpg");
+        assert_eq!(ext.as_ref(), "jpg");
+        assert!(is_image);
+        Ok(())
+    }
 
     #[test]
     fn negative_cache_keeps_protected_tweet_failures() {
