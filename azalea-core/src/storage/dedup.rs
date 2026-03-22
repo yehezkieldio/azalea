@@ -3,7 +3,7 @@
 //! ## Algorithm overview
 //! - In-flight cache prevents concurrent duplicate work.
 //! - LRU cache with TTL captures recently processed tweets.
-//! - Optional Redb store provides persistence across restarts.
+//! - Optional Redb store provides write-behind persistence across restarts.
 //!
 //! ## Concurrency assumptions
 //! This cache is shared across tasks; all state is guarded by async locks or
@@ -198,6 +198,7 @@ impl Cache {
     ///
     /// ## Postconditions
     /// - In-memory cache contains only non-expired entries.
+    /// - Subsequent duplicate checks are fully served from in-memory state.
     pub async fn load_from_db(&self) -> anyhow::Result<usize> {
         let Some(db) = &self.db else {
             return Ok(0);
@@ -256,9 +257,6 @@ impl Cache {
     }
 
     /// Check whether a tweet has already been processed or is in-flight.
-    ///
-    /// ## Edge-case handling
-    /// If persistence is enabled, expired keys are removed on lookup.
     pub async fn is_duplicate(&self, scope_id: u64, tweet_id: TweetId) -> bool {
         let key = Key::new(scope_id, tweet_id);
 
@@ -271,13 +269,6 @@ impl Cache {
             // Positive cache hit: already processed recently.
             return true;
         }
-
-        if self.db_duplicate_check(key).await {
-            // Warm the in-memory cache after a persistent hit.
-            self.cache.insert(key, ()).await;
-            return true;
-        }
-
         false
     }
 
@@ -288,7 +279,7 @@ impl Cache {
     pub async fn reserve_inflight(&self, scope_id: u64, tweet_id: TweetId) -> bool {
         let key = Key::new(scope_id, tweet_id);
 
-        // Ordering invariant: claim the in-flight marker first, then check cache/DB.
+        // Ordering invariant: claim the in-flight marker first, then check cache.
         // This prevents concurrent duplicate work while still clearing the marker
         // if we discover the key already exists. Do not reorder without reasoning.
         let marker = self
@@ -307,13 +298,6 @@ impl Cache {
             self.inflight.invalidate(&key).await;
             return false;
         }
-
-        if self.db_duplicate_check(key).await {
-            self.cache.insert(key, ()).await;
-            self.inflight.invalidate(&key).await;
-            return false;
-        }
-
         true
     }
 
@@ -641,58 +625,6 @@ impl Cache {
 
         tracing::error!(overflow, "Dropping dedup pending writes due to cap");
     }
-
-    async fn db_duplicate_check(&self, key: Key) -> bool {
-        let Some(db) = &self.db else {
-            return false;
-        };
-
-        let db = Arc::clone(db);
-        let ttl_secs = self.ttl_secs;
-        let key_bytes = key.to_bytes();
-
-        let result = tokio::task::spawn_blocking(move || -> Result<bool, redb::Error> {
-            let now = now_secs();
-
-            let read_txn = db.begin_read()?;
-            let table = read_txn.open_table(DEDUP_TABLE)?;
-            let mut expired = false;
-
-            if let Some(entry) = table.get(key_bytes.as_slice())? {
-                let timestamp = entry.value();
-                if now.saturating_sub(timestamp) <= ttl_secs {
-                    return Ok(true);
-                }
-                expired = true;
-            }
-            drop(read_txn);
-
-            if expired {
-                // Clean up expired entries on lookup to keep the db lean.
-                let write_txn = db.begin_write()?;
-                {
-                    let mut table = write_txn.open_table(DEDUP_TABLE)?;
-                    let _: Option<redb::AccessGuard<u64>> = table.remove(key_bytes.as_slice())?;
-                }
-                let _ = write_txn.commit();
-            }
-
-            Ok(false)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(hit)) => hit,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "Dedup db lookup failed");
-                false
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Dedup db lookup failed");
-                false
-            }
-        }
-    }
 }
 
 fn inflight_ttl_secs(pipeline: &PipelineSettings, transcode: &TranscodeSettings) -> u64 {
@@ -865,7 +797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_persistent_entries_are_pruned_on_lookup() {
+    async fn expired_persistent_entries_are_pruned_on_hydration() {
         let db_path = unique_test_db_path("dedup-expiry");
         let storage = persistent_storage_settings(db_path.clone());
         let cache = Cache::new(
@@ -893,6 +825,8 @@ mod tests {
         }
         write_txn.commit().expect("write transaction should commit");
 
+        let loaded = cache.load_from_db().await.expect("load should succeed");
+        assert_eq!(loaded, 0, "expired entries should not hydrate into cache");
         assert!(!cache.is_duplicate(scope_id, tweet_id).await);
 
         let read_txn = db.begin_read().expect("read transaction should open");
@@ -905,6 +839,44 @@ mod tests {
                 .expect("lookup should succeed")
                 .is_none()
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_requires_hydration_then_restores_duplicates() {
+        let db_path = unique_test_db_path("dedup-restart-hydration");
+        let storage = persistent_storage_settings(db_path.clone());
+        let scope_id = 17;
+        let tweet_id = TweetId(1701);
+
+        let initial = Cache::new(
+            &storage,
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should construct");
+        assert!(initial.reserve_inflight(scope_id, tweet_id).await);
+        initial.mark_processed(scope_id, tweet_id).await;
+        initial.flush().await;
+        drop(initial);
+
+        let restarted = Cache::new(
+            &storage,
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should reconstruct");
+
+        // Hot-path admission is intentionally in-memory only until hydration runs.
+        assert!(!restarted.is_duplicate(scope_id, tweet_id).await);
+        assert!(restarted.reserve_inflight(scope_id, tweet_id).await);
+        restarted.clear_inflight(scope_id, tweet_id).await;
+
+        let loaded = restarted.load_from_db().await.expect("load should succeed");
+        assert!(loaded >= 1, "hydration should restore persisted dedup keys");
+        assert!(restarted.is_duplicate(scope_id, tweet_id).await);
+        assert!(!restarted.reserve_inflight(scope_id, tweet_id).await);
 
         let _ = std::fs::remove_file(db_path);
     }

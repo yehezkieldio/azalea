@@ -159,6 +159,8 @@ async fn handle_media_command(
         return "please provide exactly one tweet URL per command.".to_string();
     }
 
+    // Admission checks are served from in-memory dedup state; persistence is
+    // hydrated at startup and written via background flush.
     if app
         .engine
         .dedup

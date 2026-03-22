@@ -70,7 +70,7 @@ pub async fn run(
     tracing::info!("Pipeline started");
     let pipeline_start = Instant::now();
 
-    tracing::trace!("Checking dedup cache");
+    tracing::trace!("Checking in-memory dedup admission cache");
     if !engine
         .dedup
         .reserve_inflight(job.scope_id, job.tweet_url.tweet_id)
