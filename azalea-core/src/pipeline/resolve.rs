@@ -35,6 +35,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 /// Resolves tweet media using a primary API and a yt-dlp fallback.
 ///
@@ -94,91 +95,117 @@ impl ResolverChain {
         http: &reqwest::Client,
         permits: &Permits,
     ) -> Result<Arc<ResolvedMedia>, Error> {
-        tracing::trace!(tweet_id = tweet_url.tweet_id.0, "Resolving media");
-        if let Some(err) = self.negative_cache.get(&tweet_url.tweet_id).await {
-            // Fail fast on known-bad URLs to avoid repeated slow lookups.
-            tracing::trace!("Negative cache hit");
-            return Err(Error::ResolveFailed {
-                resolver: "negative-cache",
-                source: err,
-            });
-        }
+        let resolve_span = tracing::info_span!(
+            "resolver_chain.resolve",
+            tweet_id = tweet_url.tweet_id.0,
+            tweet_user = %tweet_url.user
+        );
 
-        if let Some(media) = self.positive_cache.get(&tweet_url.tweet_id).await {
-            // Positive cache is authoritative for successful resolves.
-            tracing::trace!("Positive cache hit");
-            return Ok(media);
-        }
+        async {
+            tracing::trace!("Resolving media");
+            if let Some(err) = self.negative_cache.get(&tweet_url.tweet_id).await {
+                // Fail fast on known-bad URLs to avoid repeated slow lookups.
+                tracing::trace!("Negative cache hit");
+                return Err(Error::ResolveFailed {
+                    resolver: "negative-cache",
+                    source: err,
+                });
+            }
 
-        let mut vx_negative: Option<ResolveError> = None;
-        // Prefer the lightweight API; fall back to yt-dlp on failure.
-        match self.vx.resolve(tweet_url, http).await {
-            Ok(media) => {
-                tracing::info!(
-                    resolver = "vxtwitter",
-                    media_type = ?media.media_type,
-                    extension = %media.extension,
-                    "Resolved media"
-                );
-                self.positive_cache
-                    .insert(tweet_url.tweet_id, Arc::clone(&media))
-                    .await;
+            if let Some(media) = self.positive_cache.get(&tweet_url.tweet_id).await {
+                // Positive cache is authoritative for successful resolves.
+                tracing::trace!("Positive cache hit");
                 return Ok(media);
             }
-            Err(err) => {
-                if should_negative_cache(&err) {
-                    vx_negative = Some(err.clone());
-                }
-                // VxTwitter is best-effort; fall back to yt-dlp for robustness.
-                tracing::warn!(error = %err, "vxtwitter failed, trying yt-dlp");
-            }
-        }
+            tracing::trace!("Resolver cache miss");
 
-        tracing::trace!("Acquiring yt-dlp permit");
-        // ytdlp is heavier; throttle concurrency via permits.
-        let _permit = permits
-            .ytdlp
-            .acquire()
-            .await
-            .map_err(|_| Error::ResolveFailed {
-                resolver: "yt-dlp",
-                source: ResolveError::ProcessFailed {
-                    exit_code: None,
-                    stderr: "ytdlp semaphore closed".to_string(),
-                },
-            })?;
-
-        match self.ytdlp.resolve(tweet_url).await {
-            Ok(media) => {
-                tracing::info!(
-                    resolver = "yt-dlp",
-                    media_type = ?media.media_type,
-                    extension = %media.extension,
-                    "Resolved media"
-                );
-                self.positive_cache
-                    .insert(tweet_url.tweet_id, Arc::clone(&media))
-                    .await;
-                Ok(media)
-            }
-            Err(err) => {
-                tracing::trace!("yt-dlp resolve failed");
-                // Only cache durable failures to avoid poisoning on transient outages.
-                if should_negative_cache(&err) {
-                    self.negative_cache
-                        .insert(tweet_url.tweet_id, err.clone())
+            let mut vx_negative: Option<ResolveError> = None;
+            // Prefer the lightweight API; fall back to yt-dlp on failure.
+            match self
+                .vx
+                .resolve(tweet_url, http)
+                .instrument(tracing::info_span!("resolver.vxtwitter"))
+                .await
+            {
+                Ok(media) => {
+                    tracing::info!(
+                        resolver = "vxtwitter",
+                        media_type = ?media.media_type,
+                        extension = %media.extension,
+                        "Resolved media"
+                    );
+                    self.positive_cache
+                        .insert(tweet_url.tweet_id, Arc::clone(&media))
                         .await;
-                } else if let Some(vx_err) = vx_negative {
-                    self.negative_cache.insert(tweet_url.tweet_id, vx_err).await;
-                } else {
-                    tracing::trace!("Skipping negative cache for transient resolver error");
+                    return Ok(media);
                 }
-                Err(Error::ResolveFailed {
+                Err(err) => {
+                    if should_negative_cache(&err) {
+                        tracing::trace!("Storing VxTwitter error candidate for negative cache");
+                        vx_negative = Some(err.clone());
+                    }
+                    // VxTwitter is best-effort; fall back to yt-dlp for robustness.
+                    tracing::warn!(error = %err, "vxtwitter failed, trying yt-dlp");
+                }
+            }
+
+            tracing::trace!("Acquiring yt-dlp permit");
+            // ytdlp is heavier; throttle concurrency via permits.
+            let _permit = permits
+                .ytdlp
+                .acquire()
+                .await
+                .map_err(|_| Error::ResolveFailed {
                     resolver: "yt-dlp",
-                    source: err,
-                })
+                    source: ResolveError::ProcessFailed {
+                        exit_code: None,
+                        stderr: "ytdlp semaphore closed".to_string(),
+                    },
+                })?;
+
+            match self
+                .ytdlp
+                .resolve(tweet_url)
+                .instrument(tracing::info_span!("resolver.ytdlp"))
+                .await
+            {
+                Ok(media) => {
+                    tracing::info!(
+                        resolver = "yt-dlp",
+                        media_type = ?media.media_type,
+                        extension = %media.extension,
+                        "Resolved media"
+                    );
+                    self.positive_cache
+                        .insert(tweet_url.tweet_id, Arc::clone(&media))
+                        .await;
+                    Ok(media)
+                }
+                Err(err) => {
+                    tracing::trace!("yt-dlp resolve failed");
+                    // Only cache durable failures to avoid poisoning on transient outages.
+                    if should_negative_cache(&err) {
+                        tracing::trace!("Caching durable yt-dlp resolver failure");
+                        self.negative_cache
+                            .insert(tweet_url.tweet_id, err.clone())
+                            .await;
+                    } else if let Some(vx_err) = vx_negative {
+                        tracing::trace!(
+                            "Caching durable fallback failure from prior VxTwitter error"
+                        );
+                        self.negative_cache.insert(tweet_url.tweet_id, vx_err).await;
+                    } else {
+                        tracing::trace!("Skipping negative cache for transient resolver error");
+                    }
+                    Err(Error::ResolveFailed {
+                        resolver: "yt-dlp",
+                        source: err,
+                    })
+                }
             }
         }
+        .instrument(resolve_span)
+        .await
     }
 
     /// Current cache sizes used for stats reporting.
@@ -233,60 +260,73 @@ impl VxTwitter {
             "https://api.vxtwitter.com/{}/status/{}",
             tweet_url.user, tweet_url.tweet_id.0
         );
+        let request_span = tracing::info_span!(
+            "resolver.vxtwitter.request",
+            tweet_id = tweet_url.tweet_id.0,
+            api_url = %api_url
+        );
 
-        let result = tokio::time::timeout(self.timeout, async {
-            let response = http
-                .get(&api_url)
-                .send()
-                .await
-                .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
+        async {
+            tracing::trace!("Requesting VxTwitter media metadata");
+            let result = tokio::time::timeout(self.timeout, async {
+                let response = http
+                    .get(&api_url)
+                    .send()
+                    .await
+                    .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
 
-            let status = response.status();
-            if !status.is_success() {
-                return Err(ResolveError::HttpStatus(status.as_u16()));
-            }
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(ResolveError::HttpStatus(status.as_u16()));
+                }
 
-            let vx_response: VxResponse = response
-                .json()
-                .await
-                .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
+                let vx_response: VxResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
 
-            let media = self.select_best_media(&vx_response.media_extended)?;
-            let extension = if let Some(ext) =
-                extension_from_vxtwitter_metadata(&media.media_type, &media.url)
-            {
-                sanitize_extension(&ext)
-            } else {
-                sanitize_extension(
-                    &infer_extension(&media.media_type, &media.url, Some(http)).await,
-                )
-            };
-            let is_image = matches!(media.media_type.as_ref(), "image" | "photo");
-
-            Ok(Arc::new(ResolvedMedia {
-                url: Cow::Owned(media.url.clone().into()),
-                media_type: if is_image {
-                    MediaType::Image
+                let media = self.select_best_media(&vx_response.media_extended)?;
+                let extension = if let Some(ext) =
+                    extension_from_vxtwitter_metadata(&media.media_type, &media.url)
+                {
+                    sanitize_extension(&ext)
                 } else {
-                    MediaType::Video
-                },
-                duration: media.duration_millis.map(|d| d as f64 / 1000.0),
-                resolution: match (media.width, media.height) {
-                    (Some(w), Some(h)) => Some((w, h)),
-                    _ => None,
-                },
-                extension: extension.into_boxed_str(),
-            }))
-        })
-        .await;
+                    sanitize_extension(
+                        &infer_extension(&media.media_type, &media.url, Some(http)).await,
+                    )
+                };
+                let is_image = matches!(media.media_type.as_ref(), "image" | "photo");
 
-        match result {
-            Ok(resolved) => resolved,
-            Err(_) => Err(ResolveError::ProcessFailed {
-                exit_code: None,
-                stderr: "vxtwitter timed out".to_string(),
-            }),
+                Ok(Arc::new(ResolvedMedia {
+                    url: Cow::Owned(media.url.clone().into()),
+                    media_type: if is_image {
+                        MediaType::Image
+                    } else {
+                        MediaType::Video
+                    },
+                    duration: media.duration_millis.map(|d| d as f64 / 1000.0),
+                    resolution: match (media.width, media.height) {
+                        (Some(w), Some(h)) => Some((w, h)),
+                        _ => None,
+                    },
+                    extension: extension.into_boxed_str(),
+                }))
+            })
+            .await;
+
+            match result {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    tracing::warn!("VxTwitter resolver timed out");
+                    Err(ResolveError::ProcessFailed {
+                        exit_code: None,
+                        stderr: "vxtwitter timed out".to_string(),
+                    })
+                }
+            }
         }
+        .instrument(request_span)
+        .await
     }
 
     fn select_best_media<'a>(&self, media: &'a [VxMedia]) -> Result<&'a VxMedia, ResolveError> {
@@ -356,159 +396,183 @@ impl YtDlp {
         const YTDLP_STDOUT_LIMIT: usize = 4 * 1024 * 1024;
         const YTDLP_STDERR_LINES: usize = 10;
 
-        let mut command = Command::new(&self.path);
-        command
-            .args([
-                "--dump-json",
-                "--no-warnings",
-                "--no-playlist",
-                "--no-check-certificate",
-                "--user-agent",
-                USER_AGENT,
-                "--extractor-args",
-                "twitter:api=syndication",
-                tweet_url.canonical_url(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut guard =
-            SubprocessGuard::spawn(&mut command).map_err(|e| ResolveError::ProcessFailed {
-                exit_code: None,
-                stderr: e.to_string(),
-            })?;
+        let resolve_span = tracing::info_span!(
+            "resolver.ytdlp.process",
+            tweet_id = tweet_url.tweet_id.0,
+            binary = %self.path.display()
+        );
 
-        let stdout =
-            guard
-                .child_mut()
-                .stdout
-                .take()
-                .ok_or_else(|| ResolveError::ProcessFailed {
+        async {
+            let mut command = Command::new(&self.path);
+            command
+                .args([
+                    "--dump-json",
+                    "--no-warnings",
+                    "--no-playlist",
+                    "--no-check-certificate",
+                    "--user-agent",
+                    USER_AGENT,
+                    "--extractor-args",
+                    "twitter:api=syndication",
+                    tweet_url.canonical_url(),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut guard =
+                SubprocessGuard::spawn(&mut command).map_err(|e| ResolveError::ProcessFailed {
                     exit_code: None,
-                    stderr: "yt-dlp stdout missing".to_string(),
-                })?;
-        let stderr =
-            guard
-                .child_mut()
-                .stderr
-                .take()
-                .ok_or_else(|| ResolveError::ProcessFailed {
-                    exit_code: None,
-                    stderr: "yt-dlp stderr missing".to_string(),
+                    stderr: e.to_string(),
                 })?;
 
-        let (limit_tx, mut limit_rx) = mpsc::channel::<()>(1);
-        let limit_guard = limit_tx.clone();
+            let stdout =
+                guard
+                    .child_mut()
+                    .stdout
+                    .take()
+                    .ok_or_else(|| ResolveError::ProcessFailed {
+                        exit_code: None,
+                        stderr: "yt-dlp stdout missing".to_string(),
+                    })?;
+            let stderr =
+                guard
+                    .child_mut()
+                    .stderr
+                    .take()
+                    .ok_or_else(|| ResolveError::ProcessFailed {
+                        exit_code: None,
+                        stderr: "yt-dlp stderr missing".to_string(),
+                    })?;
 
-        // Bound stdout to prevent untrusted output from growing without limit.
-        let stdout_handle = tokio::spawn(read_bounded(stdout, YTDLP_STDOUT_LIMIT, Some(limit_tx)));
-        let stderr_handle = tokio::spawn(read_stderr_tail(stderr, YTDLP_STDERR_LINES));
+            let (limit_tx, mut limit_rx) = mpsc::channel::<()>(1);
+            let limit_guard = limit_tx.clone();
 
-        enum WaitOutcome {
-            Exit(std::io::Result<std::process::ExitStatus>),
-            Timeout,
-            OutputLimit,
-        }
+            // Bound stdout to prevent untrusted output from growing without limit.
+            let stdout_handle =
+                tokio::spawn(read_bounded(stdout, YTDLP_STDOUT_LIMIT, Some(limit_tx)));
+            let stderr_handle = tokio::spawn(read_stderr_tail(stderr, YTDLP_STDERR_LINES));
 
-        let wait_outcome = tokio::select! {
-            res = tokio::time::timeout(self.timeout, guard.wait()) => {
-                match res {
-                    Ok(status) => WaitOutcome::Exit(status),
-                    Err(_) => WaitOutcome::Timeout,
+            enum WaitOutcome {
+                Exit(std::io::Result<std::process::ExitStatus>),
+                Timeout,
+                OutputLimit,
+            }
+
+            let wait_outcome = tokio::select! {
+                res = tokio::time::timeout(self.timeout, guard.wait()) => {
+                    match res {
+                        Ok(status) => WaitOutcome::Exit(status),
+                        Err(_) => WaitOutcome::Timeout,
+                    }
                 }
-            }
-            _ = limit_rx.recv() => WaitOutcome::OutputLimit,
-        };
-        drop(limit_guard);
+                _ = limit_rx.recv() => WaitOutcome::OutputLimit,
+            };
+            drop(limit_guard);
 
-        let status = match wait_outcome {
-            WaitOutcome::Exit(status) => status.map_err(|e| ResolveError::ProcessFailed {
-                exit_code: None,
-                stderr: e.to_string(),
-            })?,
-            WaitOutcome::Timeout => {
-                // Ensure any child processes are terminated on timeout.
-                kill_process_group(guard.child_mut()).await;
-                let _ = guard.wait().await;
-                stdout_handle.abort();
-                stderr_handle.abort();
-                return Err(ResolveError::ProcessFailed {
+            let status = match wait_outcome {
+                WaitOutcome::Exit(status) => status.map_err(|e| ResolveError::ProcessFailed {
                     exit_code: None,
-                    stderr: "yt-dlp timed out".to_string(),
-                });
-            }
-            WaitOutcome::OutputLimit => {
-                // Output guard triggered; terminate to cap memory usage.
-                kill_process_group(guard.child_mut()).await;
-                let _ = guard.wait().await;
-                let _ = stdout_handle.await;
-                let stderr_tail = stderr_handle
-                    .await
-                    .ok()
-                    .and_then(|result| result.ok())
-                    .unwrap_or_else(|| "unknown error".into());
+                    stderr: e.to_string(),
+                })?,
+                WaitOutcome::Timeout => {
+                    // Ensure any child processes are terminated on timeout.
+                    tracing::warn!("yt-dlp timed out; killing process group");
+                    kill_process_group(guard.child_mut()).await;
+                    let _ = guard.wait().await;
+                    stdout_handle.abort();
+                    stderr_handle.abort();
+                    return Err(ResolveError::ProcessFailed {
+                        exit_code: None,
+                        stderr: "yt-dlp timed out".to_string(),
+                    });
+                }
+                WaitOutcome::OutputLimit => {
+                    // Output guard triggered; terminate to cap memory usage.
+                    tracing::warn!(
+                        limit_bytes = YTDLP_STDOUT_LIMIT,
+                        "yt-dlp output exceeded bounded read limit"
+                    );
+                    kill_process_group(guard.child_mut()).await;
+                    let _ = guard.wait().await;
+                    let _ = stdout_handle.await;
+                    let stderr_tail = stderr_handle
+                        .await
+                        .ok()
+                        .and_then(|result| result.ok())
+                        .unwrap_or_else(|| "unknown error".into());
+                    return Err(ResolveError::ProcessFailed {
+                        exit_code: None,
+                        stderr: format!("yt-dlp output exceeded limit: {stderr_tail}"),
+                    });
+                }
+            };
+
+            let stdout = stdout_handle
+                .await
+                .map_err(|e| ResolveError::ProcessFailed {
+                    exit_code: status.code(),
+                    stderr: e.to_string(),
+                })?
+                .map_err(|e| ResolveError::ProcessFailed {
+                    exit_code: status.code(),
+                    stderr: e.to_string(),
+                })?;
+
+            let stderr_tail = stderr_handle
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .unwrap_or_else(|| "unknown error".into());
+
+            if stdout.exceeded {
+                tracing::warn!(
+                    limit_bytes = YTDLP_STDOUT_LIMIT,
+                    "yt-dlp output exceeded bounded read limit"
+                );
                 return Err(ResolveError::ProcessFailed {
-                    exit_code: None,
+                    exit_code: status.code(),
                     stderr: format!("yt-dlp output exceeded limit: {stderr_tail}"),
                 });
             }
-        };
 
-        let stdout = stdout_handle
-            .await
-            .map_err(|e| ResolveError::ProcessFailed {
-                exit_code: status.code(),
-                stderr: e.to_string(),
-            })?
-            .map_err(|e| ResolveError::ProcessFailed {
-                exit_code: status.code(),
-                stderr: e.to_string(),
-            })?;
+            if !status.success() {
+                tracing::warn!(
+                    exit_code = status.code(),
+                    "yt-dlp process returned non-zero exit status"
+                );
+                return Err(ResolveError::ProcessFailed {
+                    exit_code: status.code(),
+                    stderr: stderr_tail
+                        .lines()
+                        .next()
+                        .unwrap_or("unknown error")
+                        .to_string(),
+                });
+            }
 
-        let stderr_tail = stderr_handle
-            .await
-            .ok()
-            .and_then(|result| result.ok())
-            .unwrap_or_else(|| "unknown error".into());
+            let ytdlp_output: YtDlpOutput = serde_json::from_slice(stdout.data.as_slice())
+                .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
 
-        if stdout.exceeded {
-            return Err(ResolveError::ProcessFailed {
-                exit_code: status.code(),
-                stderr: format!("yt-dlp output exceeded limit: {stderr_tail}"),
-            });
+            let (url, extension, is_image) = select_best_format(&ytdlp_output)?;
+            let extension = sanitize_extension(&extension);
+
+            Ok(Arc::new(ResolvedMedia {
+                url: Cow::Owned(url.into()),
+                media_type: if is_image {
+                    MediaType::Image
+                } else {
+                    MediaType::Video
+                },
+                duration: ytdlp_output.duration,
+                resolution: match (ytdlp_output.width, ytdlp_output.height) {
+                    (Some(w), Some(h)) => Some((w, h)),
+                    _ => None,
+                },
+                extension: extension.into_boxed_str(),
+            }))
         }
-
-        if !status.success() {
-            return Err(ResolveError::ProcessFailed {
-                exit_code: status.code(),
-                stderr: stderr_tail
-                    .lines()
-                    .next()
-                    .unwrap_or("unknown error")
-                    .to_string(),
-            });
-        }
-
-        let ytdlp_output: YtDlpOutput = serde_json::from_slice(stdout.data.as_slice())
-            .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
-
-        let (url, extension, is_image) = select_best_format(&ytdlp_output)?;
-        let extension = sanitize_extension(&extension);
-
-        Ok(Arc::new(ResolvedMedia {
-            url: Cow::Owned(url.into()),
-            media_type: if is_image {
-                MediaType::Image
-            } else {
-                MediaType::Video
-            },
-            duration: ytdlp_output.duration,
-            resolution: match (ytdlp_output.width, ytdlp_output.height) {
-                (Some(w), Some(h)) => Some((w, h)),
-                _ => None,
-            },
-            extension: extension.into_boxed_str(),
-        }))
+        .instrument(resolve_span)
+        .await
     }
 }
 

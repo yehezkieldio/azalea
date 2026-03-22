@@ -10,6 +10,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tracing::{debug, trace, warn};
 
 pub(crate) struct BoundedRead {
     pub(crate) data: Vec<u8>,
@@ -25,9 +26,20 @@ pub(crate) struct SubprocessGuard {
 
 impl SubprocessGuard {
     pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        let std_command = command.as_std();
+        let args = std_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        trace!(
+            program = %std_command.get_program().to_string_lossy(),
+            ?args,
+            "Spawning subprocess"
+        );
         configure_process_group(command);
         let child = command.spawn()?;
         let pid = child.id().map(|id| id as i32);
+        debug!(pid = pid.unwrap_or_default(), "Spawned subprocess");
         Ok(Self {
             child,
             pid,
@@ -44,6 +56,10 @@ impl SubprocessGuard {
         if status.is_ok() {
             self.armed = false;
         }
+        match &status {
+            Ok(exit) => trace!(code = exit.code(), "Subprocess exited"),
+            Err(error) => warn!(error = %error, "Failed waiting for subprocess"),
+        }
         status
     }
 }
@@ -53,6 +69,11 @@ impl Drop for SubprocessGuard {
         if !self.armed {
             return;
         }
+
+        debug!(
+            pid = self.pid.unwrap_or_default(),
+            "Cleaning up subprocess in Drop"
+        );
 
         // Best-effort cleanup to avoid leaving ffmpeg/yt-dlp processes behind.
         #[cfg(unix)]
@@ -82,6 +103,7 @@ pub(crate) async fn read_bounded<R: AsyncRead + Unpin>(
     mut notify: Option<mpsc::Sender<()>>,
 ) -> std::io::Result<BoundedRead> {
     // Invariant: `data.len()` never exceeds `limit` by construction.
+    trace!(limit, "Starting bounded read");
     let mut data = Vec::new();
     let mut exceeded = false;
     let mut buffer = [0u8; 8192];
@@ -105,6 +127,7 @@ pub(crate) async fn read_bounded<R: AsyncRead + Unpin>(
                     data.extend_from_slice(slice);
                 }
                 exceeded = true;
+                warn!(limit, read, "Bounded read exceeded limit");
                 if let Some(tx) = notify.take() {
                     // Best-effort signal to cancel the owning process.
                     let _ = tx.try_send(());
@@ -113,6 +136,7 @@ pub(crate) async fn read_bounded<R: AsyncRead + Unpin>(
         }
     }
 
+    trace!(bytes = data.len(), exceeded, "Completed bounded read");
     Ok(BoundedRead { data, exceeded })
 }
 
@@ -129,6 +153,10 @@ pub(crate) fn configure_process_group(command: &mut Command) {
 }
 
 pub(crate) async fn kill_process_group(child: &mut Child) {
+    trace!(
+        pid = child.id().unwrap_or_default(),
+        "Killing subprocess process group"
+    );
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {

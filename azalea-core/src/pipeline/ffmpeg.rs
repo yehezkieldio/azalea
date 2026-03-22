@@ -19,7 +19,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tracing::{debug, trace};
+use tracing::{Instrument as _, debug, trace, warn};
 
 /// Small-vector argument list to avoid heap allocations for common cases.
 ///
@@ -302,69 +302,95 @@ pub async fn execute(
 ) -> Result<(), Error> {
     const FFMPEG_STDERR_LIMIT: usize = 512 * 1024;
     const WAIT_TIMEOUT_SECS: u64 = 30;
-    debug!(
+
+    let ffmpeg_span = tracing::info_span!(
+        "ffmpeg.execute",
         ?stage,
+        ffmpeg = %ffmpeg_path.display(),
+        timeout_ms = timeout.as_millis() as u64,
         video_encoder = arg_value(args, "-c:v").unwrap_or("unknown"),
-        hwaccel = arg_value(args, "-hwaccel").unwrap_or("none"),
-        hwaccel_device = arg_value(args, "-hwaccel_device").unwrap_or("none"),
-        init_hw_device = has_flag(args, "-init_hw_device"),
-        "ffmpeg execution hardware acceleration plan"
+        hwaccel = arg_value(args, "-hwaccel").unwrap_or("none")
     );
-    trace!(?stage, args = ?args, "ffmpeg execution args");
 
-    let mut command = Command::new(ffmpeg_path);
-    command
-        .args(args)
-        .args(["-progress", "pipe:1", "-nostats"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    async {
+        let started = std::time::Instant::now();
+        debug!(
+            ?stage,
+            video_encoder = arg_value(args, "-c:v").unwrap_or("unknown"),
+            hwaccel = arg_value(args, "-hwaccel").unwrap_or("none"),
+            hwaccel_device = arg_value(args, "-hwaccel_device").unwrap_or("none"),
+            init_hw_device = has_flag(args, "-init_hw_device"),
+            "ffmpeg execution hardware acceleration plan"
+        );
+        trace!(?stage, args = ?args, "ffmpeg execution args");
 
-    let mut guard = SubprocessGuard::spawn(&mut command).map_err(Error::Io)?;
+        let mut command = Command::new(ffmpeg_path);
+        command
+            .args(args)
+            .args(["-progress", "pipe:1", "-nostats"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-    let stdout = guard
-        .child_mut()
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Io(std::io::Error::other("ffmpeg stdout missing")))?;
-    let stderr = guard
-        .child_mut()
-        .stderr
-        .take()
-        .ok_or_else(|| Error::Io(std::io::Error::other("ffmpeg stderr missing")))?;
+        let mut guard = SubprocessGuard::spawn(&mut command).map_err(Error::Io)?;
 
-    let stderr_handle =
-        tokio::spawn(async move { read_bounded(stderr, FFMPEG_STDERR_LIMIT, None).await });
+        let stdout = guard
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Io(std::io::Error::other("ffmpeg stdout missing")))?;
+        let stderr = guard
+            .child_mut()
+            .stderr
+            .take()
+            .ok_or_else(|| Error::Io(std::io::Error::other("ffmpeg stderr missing")))?;
 
-    let start_time = std::time::Instant::now();
-    let mut reader = BufReader::new(stdout).lines();
+        let stderr_handle =
+            tokio::spawn(async move { read_bounded(stderr, FFMPEG_STDERR_LIMIT, None).await });
 
-    // Drain ffmpeg progress output to avoid stdout pipe backpressure.
-    loop {
-        if start_time.elapsed() > timeout {
-            kill_process_group(guard.child_mut()).await;
-            let _ = guard.wait().await;
-            stderr_handle.abort();
-            return Err(Error::Timeout {
-                operation: "ffmpeg",
-                duration: timeout,
-            });
+        let start_time = std::time::Instant::now();
+        let mut reader = BufReader::new(stdout).lines();
+
+        // Drain ffmpeg progress output to avoid stdout pipe backpressure.
+        loop {
+            if start_time.elapsed() > timeout {
+                warn!(
+                    ?stage,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "ffmpeg execution timed out"
+                );
+                kill_process_group(guard.child_mut()).await;
+                let _ = guard.wait().await;
+                stderr_handle.abort();
+                return Err(Error::Timeout {
+                    operation: "ffmpeg",
+                    duration: timeout,
+                });
+            }
+
+            let read_result =
+                tokio::time::timeout(Duration::from_secs(5), reader.next_line()).await;
+
+            match read_result {
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
         }
 
-        let read_result = tokio::time::timeout(Duration::from_secs(5), reader.next_line()).await;
-
-        match read_result {
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) => break,
-            Ok(Err(_)) => break,
-            Err(_) => continue,
-        }
-    }
-
-    let status =
-        match tokio::time::timeout(Duration::from_secs(WAIT_TIMEOUT_SECS), guard.wait()).await {
+        let status = match tokio::time::timeout(
+            Duration::from_secs(WAIT_TIMEOUT_SECS),
+            guard.wait(),
+        )
+        .await
+        {
             Ok(status) => status.map_err(Error::Io)?,
             Err(_) => {
+                warn!(
+                    wait_timeout_secs = WAIT_TIMEOUT_SECS,
+                    "ffmpeg wait timed out"
+                );
                 kill_process_group(guard.child_mut()).await;
                 let _ = guard.wait().await;
                 stderr_handle.abort();
@@ -375,36 +401,50 @@ pub async fn execute(
             }
         };
 
-    // Capture only the tail of stderr to keep error payloads bounded.
-    let stderr_output = match stderr_handle.await {
-        Ok(Ok(output)) => {
-            let text = String::from_utf8_lossy(&output.data);
-            let mut lines: Vec<&str> = text.lines().collect();
-            if lines.len() > 10 {
-                lines = lines.split_off(lines.len() - 10);
-            }
-            let mut joined = lines.join("\n");
-            if output.exceeded {
-                if !joined.is_empty() {
-                    joined.push('\n');
+        // Capture only the tail of stderr to keep error payloads bounded.
+        let stderr_output = match stderr_handle.await {
+            Ok(Ok(output)) => {
+                let text = String::from_utf8_lossy(&output.data);
+                let mut lines: Vec<&str> = text.lines().collect();
+                if lines.len() > 10 {
+                    lines = lines.split_off(lines.len() - 10);
                 }
-                joined.push_str("[stderr truncated]");
+                let mut joined = lines.join("\n");
+                if output.exceeded {
+                    if !joined.is_empty() {
+                        joined.push('\n');
+                    }
+                    joined.push_str("[stderr truncated]");
+                }
+                joined
             }
-            joined
+            Ok(Err(e)) => format!("stderr read failed: {e}"),
+            Err(_) => "unknown stderr error".to_string(),
+        };
+
+        if !status.success() {
+            warn!(
+                ?stage,
+                exit_code = status.code(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "ffmpeg execution failed"
+            );
+            return Err(Error::TranscodeFailed {
+                stage,
+                exit_code: status.code(),
+                stderr_tail: stderr_output,
+            });
         }
-        Ok(Err(e)) => format!("stderr read failed: {e}"),
-        Err(_) => "unknown stderr error".to_string(),
-    };
 
-    if !status.success() {
-        return Err(Error::TranscodeFailed {
-            stage,
-            exit_code: status.code(),
-            stderr_tail: stderr_output,
-        });
+        trace!(
+            ?stage,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "ffmpeg execution succeeded"
+        );
+        Ok(())
     }
-
-    Ok(())
+    .instrument(ffmpeg_span)
+    .await
 }
 
 #[cfg(test)]

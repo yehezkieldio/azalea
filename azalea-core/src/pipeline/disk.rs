@@ -27,6 +27,14 @@ pub async fn ensure_disk_space(path: &Path, required_bytes: u64) -> Result<(), E
         return Ok(());
     }
 
+    let path_display = path.display().to_string();
+
+    tracing::trace!(
+        path = %path_display,
+        required_bytes,
+        "Checking disk space"
+    );
+
     let path = PathBuf::from(path);
     let available: Option<u64> = tokio::task::spawn_blocking(move || {
         #[cfg(unix)]
@@ -48,10 +56,22 @@ pub async fn ensure_disk_space(path: &Path, required_bytes: u64) -> Result<(), E
     if let Some(available_bytes) = available
         && available_bytes < required_bytes
     {
+        tracing::warn!(
+            path = %path_display,
+            available_bytes,
+            required_bytes,
+            "Insufficient disk space for pipeline stage"
+        );
         return Err(Error::DiskSpace {
             available_mb: available_bytes / 1024 / 1024,
             required_mb: required_bytes / 1024 / 1024,
         });
+    }
+
+    if let Some(available_bytes) = available {
+        tracing::trace!(available_bytes, required_bytes, "Disk space check passed");
+    } else {
+        tracing::trace!("Disk space availability could not be determined on this platform");
     }
 
     Ok(())

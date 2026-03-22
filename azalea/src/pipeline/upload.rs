@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 use twilight_http::Client;
 use twilight_http::api_error::ApiError;
 use twilight_http::error::Error as TwilightError;
@@ -45,6 +46,7 @@ pub async fn upload(
     config: &EngineSettings,
     progress_tx: Option<&mpsc::Sender<Progress>>,
 ) -> Result<UploadOutcome, Error> {
+    tracing::trace!("Entered upload stage");
     tracing::info!(
         channel_id = channel_id.get(),
         tweet_id = tweet_id.0,
@@ -116,7 +118,14 @@ pub async fn upload(
             total: total_files,
         };
 
-        let response = send_with_retry(&ctx, file_path, filename).await?;
+        let response = send_with_retry(&ctx, file_path, filename)
+            .instrument(tracing::info_span!(
+                "upload.part",
+                part = index + 1,
+                total = total_files,
+                path = %file_path.display()
+            ))
+            .await?;
 
         let message = response.model().await.map_err(|e| Error::UploadFailed {
             part: index + 1,
@@ -255,6 +264,13 @@ async fn send_with_retry(
 
     let mut attempt = 0usize;
     loop {
+        tracing::trace!(
+            part = ctx.part,
+            total = ctx.total,
+            attempt = attempt + 1,
+            path = %file_path.display(),
+            "Sending upload attempt"
+        );
         // Re-read each attempt to avoid holding large buffers across retries.
         let file_bytes = read_file_with_limit(file_path, ctx.config).await?;
         let attachment = Attachment {
@@ -270,7 +286,15 @@ async fn send_with_retry(
         }
 
         match request.attachments(&[attachment]).await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                tracing::info!(
+                    part = ctx.part,
+                    total = ctx.total,
+                    attempt = attempt + 1,
+                    "Upload request succeeded"
+                );
+                return Ok(response);
+            }
             Err(err) => {
                 // Retry only for transient errors with a bounded backoff.
                 if attempt < MAX_RETRIES

@@ -26,6 +26,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 /// Download media to a temp file while enforcing size and safety constraints.
 ///
@@ -44,6 +45,11 @@ pub async fn download(
     temp_files: &TempFileCleanup,
     config: &EngineSettings,
 ) -> Result<DownloadedFile, Error> {
+    tracing::trace!(
+        request_id = job.request_id.0,
+        tweet_id = job.tweet_url.tweet_id.0,
+        "Entered download stage"
+    );
     tracing::info!(
         url = %resolved.url,
         extension = %resolved.extension,
@@ -88,7 +94,9 @@ pub async fn download(
         // SSRF guardrails: validate and canonicalize before any network I/O.
         let validated_url = validate_media_url(resolved.url.as_ref()).await?;
 
-        let response = fetch_with_redirects(http, validated_url).await?;
+        let response = fetch_with_redirects(http, validated_url)
+            .instrument(tracing::info_span!("download.redirects"))
+            .await?;
 
         if !response.status().is_success() {
             return Err(Error::DownloadFailed {
@@ -223,7 +231,10 @@ pub async fn download(
             (resolved.duration, resolved.resolution)
         } else {
             tracing::trace!("Probing downloaded file for metadata");
-            match probe_file(&output_path, config).await {
+            match probe_file(&output_path, config)
+                .instrument(tracing::info_span!("download.ffprobe", path = %output_path.display()))
+                .await
+            {
                 Ok(result) => (result.duration, result.resolution),
                 Err(e) => {
                     tracing::trace!(error = %e, "Probe failed");
@@ -259,10 +270,16 @@ pub async fn download(
 
     match download_result {
         Ok(result) => result,
-        Err(_) => Err(Error::Timeout {
-            operation: "download",
-            duration: download_timeout,
-        }),
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = download_timeout.as_secs(),
+                "Download timed out"
+            );
+            Err(Error::Timeout {
+                operation: "download",
+                duration: download_timeout,
+            })
+        }
     }
 }
 
@@ -274,6 +291,7 @@ async fn fetch_with_redirects(
 
     let mut current = start_url;
     for hop in 0..=MAX_REDIRECTS {
+        tracing::trace!(hop, url = %current, "Fetching media URL");
         let response =
             http.get(current.clone())
                 .send()
@@ -284,6 +302,10 @@ async fn fetch_with_redirects(
 
         if response.status().is_redirection() {
             if hop == MAX_REDIRECTS {
+                tracing::warn!(
+                    max_redirects = MAX_REDIRECTS,
+                    "Too many redirects while downloading media"
+                );
                 return Err(Error::DownloadFailed {
                     source: DownloadError::WriteFailed(std::io::Error::other("too many redirects")),
                 });
@@ -309,6 +331,7 @@ async fn fetch_with_redirects(
                     source: DownloadError::WriteFailed(std::io::Error::other(e)),
                 })?;
 
+            tracing::trace!(hop, location, next = %next, "Following redirect");
             current = validate_media_url(next.as_str()).await?;
             continue;
         }
@@ -498,6 +521,7 @@ async fn probe_file(path: &Path, config: &EngineSettings) -> Result<ProbeResult,
 /// We use `set_len` rather than platform-specific fallocate to avoid unsafe
 /// syscalls and keep portability.
 fn preallocate_file(path: &Path, size: u64) -> std::io::Result<()> {
+    tracing::trace!(path = %path.display(), size_bytes = size, "Preallocating file");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)

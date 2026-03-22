@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 /// Prepare media for Discord upload, choosing the cheapest viable strategy.
 ///
@@ -46,6 +47,7 @@ pub async fn optimize(
     config: &EngineSettings,
     progress_tx: Option<mpsc::Sender<Progress>>,
 ) -> Result<PreparedUpload, Error> {
+    tracing::trace!(path = %downloaded.path.display(), "Entered optimize stage");
     tracing::info!(
         size_bytes = downloaded.size,
         media_type = ?resolved.media_type,
@@ -122,7 +124,14 @@ pub async fn optimize(
         match strategy {
             TranscodeStrategy::Remux => {
                 let remux_path = remux_path(&downloaded.path);
-                match remux(&downloaded.path, &remux_path, permits, config).await {
+                match remux(&downloaded.path, &remux_path, permits, config)
+                    .instrument(tracing::info_span!(
+                        "optimize.strategy.remux",
+                        input = %downloaded.path.display(),
+                        output = %remux_path.display()
+                    ))
+                    .await
+                {
                     Ok(size) if size <= max_upload_bytes => {
                         let dir_guard = downloaded._dir_guard.take().ok_or_else(|| {
                             Error::Io(std::io::Error::other("missing temp dir guard"))
@@ -134,6 +143,12 @@ pub async fn optimize(
                         });
                     }
                     Ok(_) => {
+                        tracing::trace!(
+                            strategy = %strategy,
+                            output = %remux_path.display(),
+                            limit_bytes = max_upload_bytes,
+                            "Remux output exceeded upload limit"
+                        );
                         let _ = fs::remove_file(&remux_path).await;
                     }
                     Err(e) => {
@@ -153,6 +168,12 @@ pub async fn optimize(
                     config,
                     &mut dir_guard,
                 )
+                .instrument(tracing::info_span!(
+                    "optimize.strategy.transcode",
+                    variant = "balanced",
+                    duration_secs = duration,
+                    max_height = ?balanced_height
+                ))
                 .await?;
                 if let Some(result) = result {
                     return Ok(result);
@@ -170,6 +191,12 @@ pub async fn optimize(
                     config,
                     &mut dir_guard,
                 )
+                .instrument(tracing::info_span!(
+                    "optimize.strategy.transcode",
+                    variant = "aggressive",
+                    duration_secs = duration,
+                    max_height = ?aggressive_height
+                ))
                 .await?;
                 if let Some(result) = result {
                     return Ok(result);
@@ -186,6 +213,10 @@ pub async fn optimize(
                     config,
                     &mut dir_guard,
                 )
+                .instrument(tracing::info_span!(
+                    "optimize.strategy.split_copy",
+                    duration_secs = duration
+                ))
                 .await?;
                 if let Some(result) = result {
                     return Ok(result);
@@ -201,6 +232,10 @@ pub async fn optimize(
                     config,
                     progress_tx,
                 )
+                .instrument(tracing::info_span!(
+                    "optimize.strategy.split_transcode",
+                    duration_secs = duration
+                ))
                 .await;
             }
             TranscodeStrategy::PassThrough | TranscodeStrategy::ImageCompress => {}

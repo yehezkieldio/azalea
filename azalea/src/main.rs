@@ -523,8 +523,9 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                 };
 
                 let core_job = job.core();
-                let result =
-                    core_pipeline::run(core_job, &app.engine, Some(progress_tx.clone())).await;
+                let result = core_pipeline::run(core_job, &app.engine, Some(progress_tx.clone()))
+                    .instrument(tracing::info_span!("pipeline.stage.core"))
+                    .await;
 
                 let outcome = match result {
                     Ok(prepared) => {
@@ -538,6 +539,7 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             &app.engine.config,
                             Some(&progress_tx),
                         )
+                        .instrument(tracing::info_span!("pipeline.stage.upload"))
                         .await
                         {
                             Ok(outcome) => {
