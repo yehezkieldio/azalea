@@ -44,7 +44,7 @@ impl ConfigBuilderExt for ConfigBuilder {
 ///
 /// ## Invariants
 /// `shard_total` matches the gateway-reported shard count.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SessionInfo {
     pub shard_id: u32,
     pub shard_total: u32,
@@ -60,6 +60,11 @@ impl SessionInfo {
     fn matches(&self, shard_id: ShardId) -> bool {
         self.shard_id == shard_id.number() && self.shard_total == shard_id.total()
     }
+}
+
+fn normalize_for_persistence(mut info: Vec<SessionInfo>) -> Vec<SessionInfo> {
+    info.sort_unstable_by_key(|entry| (entry.shard_total, entry.shard_id));
+    info
 }
 
 impl From<&Shard> for SessionInfo {
@@ -80,7 +85,37 @@ impl From<&Shard> for SessionInfo {
 pub async fn save(info: &[SessionInfo]) -> anyhow::Result<()> {
     // Avoid creating empty files when resumption isn't possible.
     if info.iter().any(|resume| !resume.is_none()) {
-        let contents = serde_json::to_vec(&info)?;
+        let normalized_info = normalize_for_persistence(info.to_vec());
+        let persisted = match fs::read(INFO_FILE).await {
+            Ok(contents) => match serde_json::from_slice::<Vec<SessionInfo>>(&contents) {
+                Ok(info) => Some(normalize_for_persistence(info)),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "Existing resume info was invalid; overwriting"
+                    );
+                    None
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "Could not read existing resume info before save; rewriting"
+                );
+                None
+            }
+        };
+
+        if persisted.as_ref() == Some(&normalized_info) {
+            tracing::debug!(
+                count = normalized_info.len(),
+                "Resume info unchanged; skipping save"
+            );
+            return Ok(());
+        }
+
+        let contents = serde_json::to_vec(&normalized_info)?;
         let temp_file = temp_file_name();
         let mut file = fs::File::create(&temp_file).await?;
         file.write_all(&contents).await?;
@@ -96,7 +131,7 @@ pub async fn save(info: &[SessionInfo]) -> anyhow::Result<()> {
             dir.sync_all()
         })
         .await??;
-        tracing::debug!(count = info.len(), "Saved resume info");
+        tracing::debug!(count = normalized_info.len(), "Saved resume info");
     }
 
     Ok(())
@@ -185,5 +220,38 @@ mod tests {
         let temp = temp_file_name();
         assert!(temp.starts_with(INFO_FILE));
         assert!(temp.ends_with(".tmp"));
+    }
+
+    #[test]
+    fn normalize_for_persistence_sorts_by_shard_identity() {
+        let info = vec![
+            SessionInfo {
+                shard_id: 2,
+                shard_total: 8,
+                resume_url: Some("wss://resume.example/2".to_owned()),
+                session: None,
+            },
+            SessionInfo {
+                shard_id: 0,
+                shard_total: 8,
+                resume_url: Some("wss://resume.example/0".to_owned()),
+                session: None,
+            },
+            SessionInfo {
+                shard_id: 1,
+                shard_total: 8,
+                resume_url: Some("wss://resume.example/1".to_owned()),
+                session: None,
+            },
+        ];
+
+        let normalized = normalize_for_persistence(info);
+        assert_eq!(
+            normalized
+                .into_iter()
+                .map(|entry| entry.shard_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 }
