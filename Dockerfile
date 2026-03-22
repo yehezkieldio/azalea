@@ -1,6 +1,6 @@
 ARG YTDLP_TAG=2026.02.21
-ARG FFMPEG_TAG=autobuild-2026-02-24-16-00
-ARG FFMPEG_TARBALL=ffmpeg-N-122985-g145f6e5878-linux64-gpl.tar.xz
+ARG FFMPEG_TAG=latest
+ARG FFMPEG_TARBALL=ffmpeg-master-latest-linux64-gpl.tar.xz
 
 # --- 1. Toolchain (Chef) ---
 # We use cargo-chef to cache Rust dependencies separately from source code.
@@ -47,8 +47,20 @@ RUN curl -L "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_TAG}/yt-
 
 # Download and extract FFmpeg (Static build)
 # --strip-components=2 allows us to grab /bin/ffmpeg directly into the workdir.
-RUN curl -L "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_TAG}/${FFMPEG_TARBALL}" | \
-    tar xJ --strip-components=2 --wildcards "*/bin/ffmpeg" "*/bin/ffprobe"
+RUN set -eux; \
+    ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_TAG}/${FFMPEG_TARBALL}"; \
+    curl --fail --show-error --location "$ffmpeg_url" --output /tmp/ffmpeg.tar.xz; \
+    file_type="$(file -b /tmp/ffmpeg.tar.xz)"; \
+    case "$file_type" in \
+        *"XZ compressed data"*) ;; \
+        *) \
+            echo "Unexpected FFmpeg download type: $file_type"; \
+            echo "URL: $ffmpeg_url"; \
+            exit 1; \
+            ;; \
+    esac; \
+    tar xJf /tmp/ffmpeg.tar.xz --strip-components=2 --wildcards "*/bin/ffmpeg" "*/bin/ffprobe"; \
+    rm -f /tmp/ffmpeg.tar.xz
 
 # --- 5. Runtime Base ---
 # Common foundation for both CPU and VA-API targets.
