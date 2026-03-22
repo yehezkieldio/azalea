@@ -8,6 +8,9 @@ env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/${{ github.repository }}
   CACHE_IMAGE: ghcr.io/${{ github.repository }}/buildcache
+  YTDLP_TAG: 2026.02.21
+  FFMPEG_TAG: latest
+  FFMPEG_TARBALL: ffmpeg-master-latest-linux64-gpl.tar.xz
 
 jobs:
   build-and-push:
@@ -50,6 +53,10 @@ jobs:
           context: .
           target: runtime-${{ matrix.flavor }}
           platforms: linux/amd64
+          build-args: |
+            YTDLP_TAG=${{ env.YTDLP_TAG }}
+            FFMPEG_TAG=${{ env.FFMPEG_TAG }}
+            FFMPEG_TARBALL=${{ env.FFMPEG_TARBALL }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

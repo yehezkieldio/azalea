@@ -50,16 +50,12 @@ RUN curl -L "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_TAG}/yt-
 RUN set -eux; \
     ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_TAG}/${FFMPEG_TARBALL}"; \
     curl --fail --show-error --location "$ffmpeg_url" --output /tmp/ffmpeg.tar.xz; \
-    file_type="$(file -b /tmp/ffmpeg.tar.xz)"; \
-    case "$file_type" in \
-        *"XZ compressed data"*) ;; \
-        *) \
-            echo "Unexpected FFmpeg download type: $file_type"; \
-            echo "URL: $ffmpeg_url"; \
-            exit 1; \
-            ;; \
-    esac; \
-    tar xJf /tmp/ffmpeg.tar.xz --strip-components=2 --wildcards "*/bin/ffmpeg" "*/bin/ffprobe"; \
+    if ! tar xJf /tmp/ffmpeg.tar.xz --strip-components=2 --wildcards "*/bin/ffmpeg" "*/bin/ffprobe"; then \
+        echo "Failed to extract FFmpeg archive from: $ffmpeg_url"; \
+        exit 1; \
+    fi; \
+    test -x /downloads/ffmpeg; \
+    test -x /downloads/ffprobe; \
     rm -f /tmp/ffmpeg.tar.xz
 
 # --- 5. Runtime Base ---
