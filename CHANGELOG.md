@@ -7,6 +7,36 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.3.1 (March 22, 2026)
+
+### <!-- 10 -->🧪 Test
+- [`31e644d`](https://github.com/yehezkieldio/azalea/commit/31e644d594afe1290bf11d08b9335fe7442fe067) **pipeline**: Add negative cache tests for 404, timeout, 429
+- [`401eac8`](https://github.com/yehezkieldio/azalea/commit/401eac804f12919a6d44e829252abbcb8953299b) **pipeline**: Add select_best_format tests
+- [`43506f0`](https://github.com/yehezkieldio/azalea/commit/43506f03928b84234c9e49b8b3841abf259c8059) **pipeline**: Add proptest for bitrate monotonicity in upload budget
+- [`f56b814`](https://github.com/yehezkieldio/azalea/commit/f56b8144e175c108bffa4ecabcb4f989c07a0575) **pipeline**: Add assertion that sanitized does not contain ..
+- [`c58a7b3`](https://github.com/yehezkieldio/azalea/commit/c58a7b365d6de97d431d408a138722401a49132d) **media**: Add fuzz test for parse_tweet_urls to handle arbitrary bytes
+- [`99b023b`](https://github.com/yehezkieldio/azalea/commit/99b023b91a4c9e45e82583526568af63b8bd5720) **pipeline**: Add is_allowed_extension and enforce sanitize checks
+- [`60d7717`](https://github.com/yehezkieldio/azalea/commit/60d77177792b0ffb136e7aec8e544a676ce230e1) **pipeline**: Add exponential backoff saturation test
+
+### <!-- 2 -->🧩 Dependencies Updates
+- [`cb5f6e4`](https://github.com/yehezkieldio/azalea/commit/cb5f6e47522b9d9731e8151d7b5540771e4423df) **deps**: Update rust crate moka to v0.12.15 by renovate[bot] ([#6](https://github.com/yehezkieldio/azalea/issues/6))
+
+### <!-- 3 -->🚀 New Features
+- [`38e4897`](https://github.com/yehezkieldio/azalea/commit/38e48974f9099a1b5e19a92fde143e6fe547a4e8) **storage**: Add background flush notifier and task guard
+
+### <!-- 4 -->🐛 Bug Fixes
+- [`c3bb9e8`](https://github.com/yehezkieldio/azalea/commit/c3bb9e8010e972f292a42a3501ab4e611778cf93) **pipeline**: Resolve YtDlp parsing and select best format
+- [`4665145`](https://github.com/yehezkieldio/azalea/commit/46651458f70fe6e70a45737d3bc145e308b3a954) **resolve**: Narrow negative cache for network and partial parse errors
+
+### <!-- 7 -->🚜 Refactor
+- [`9a276d5`](https://github.com/yehezkieldio/azalea/commit/9a276d53927aff1d594f2552054826a42aaaf4ba) **pipeline**: Instrument pipeline with tracing spans and logs
+- [`13cd3bc`](https://github.com/yehezkieldio/azalea/commit/13cd3bc719e231ee249b66be6d59b073bceb25ae) **dedup**: Remove persistent lookup and defer hydration
+- [`e024988`](https://github.com/yehezkieldio/azalea/commit/e024988a7c3b5b410d49b5fe4a6728b4488fc03e) **pipeline**: Replace url box<str> with cow<'static,str>
+- [`819561a`](https://github.com/yehezkieldio/azalea/commit/819561a7940bb899ec4a18d10379b47d77dd36b2) **core**: Replace string with box<str> in pipeline and storage
+
+### <!-- 99 -->🌀 Other
+- [`70e7eba`](https://github.com/yehezkieldio/azalea/commit/70e7ebad06393902e6075f7ceafb7e56e32cca05) **gateway**: Introduce normalization to skip redundant saves
+
 ## 0.3.0 (March 7, 2026)
 
 ### <!-- 10 -->🧪 Test
@@ -18,6 +48,7 @@ All notable changes to this project will be documented in this file.
 - [`df021d8`](https://github.com/yehezkieldio/azalea/commit/df021d81503995aabb82e4c8e548d0977731f86a) **pipeline**: Add video bitrate boundaries and presets test
 
 ### <!-- 11 -->🛠️ Miscellaneous
+- [`a32264e`](https://github.com/yehezkieldio/azalea/commit/a32264e4ab3f3e108171697df1b2d7b72cc4f7a7) **release**: 0.3.0
 - [`828a1f3`](https://github.com/yehezkieldio/azalea/commit/828a1f30410c8a3d7c9d60706c860f5ce383073b) **changelog**: Regenerate changelog
 - [`4441b56`](https://github.com/yehezkieldio/azalea/commit/4441b56e3d2b6bffe4795e6583b1fd3e7c6cc1b8) **config**: Replace repo and issue URL in cliff.toml
 
