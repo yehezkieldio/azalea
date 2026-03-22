@@ -252,9 +252,15 @@ impl VxTwitter {
                 .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
 
             let media = self.select_best_media(&vx_response.media_extended)?;
-            let extension = sanitize_extension(
-                &infer_extension(&media.media_type, &media.url, Some(http)).await,
-            );
+            let extension = if let Some(ext) =
+                extension_from_vxtwitter_metadata(&media.media_type, &media.url)
+            {
+                sanitize_extension(&ext)
+            } else {
+                sanitize_extension(
+                    &infer_extension(&media.media_type, &media.url, Some(http)).await,
+                )
+            };
             let is_image = matches!(media.media_type.as_ref(), "image" | "photo");
 
             Ok(Arc::new(ResolvedMedia {
@@ -483,9 +489,8 @@ impl YtDlp {
             });
         }
 
-        let stdout = String::from_utf8_lossy(&stdout.data);
-        let ytdlp_output: YtDlpOutput =
-            serde_json::from_str(&stdout).map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
+        let ytdlp_output: YtDlpOutput = serde_json::from_slice(stdout.data.as_slice())
+            .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
 
         let (url, extension, is_image) = select_best_format(&ytdlp_output)?;
         let extension = sanitize_extension(&extension);
@@ -515,49 +520,21 @@ fn select_best_format(output: &YtDlpOutput) -> Result<(Box<str>, Box<str>, bool)
         return Ok((url.clone(), ext, is_image));
     }
 
-    // Filter down to video formats with a real URL for download.
-    let valid_formats: Vec<&YtDlpFormat> = output
-        .formats
-        .iter()
-        .filter(|f| f.url.is_some())
-        .filter(|f| f.vcodec.as_deref() != Some("none"))
-        .collect();
+    let mut best_any = None;
+    let mut best_compatible = None;
 
-    if valid_formats.is_empty() {
-        // Fall back to thumbnail for image-only tweets.
-        if let Some(thumbnail_url) = &output.thumbnail {
-            let ext = extension_from_url(thumbnail_url).unwrap_or_else(|| "jpg".into());
-            return Ok((thumbnail_url.clone(), ext, true));
+    for format in &output.formats {
+        if format.url.is_none() || format.vcodec.as_deref() == Some("none") {
+            continue;
         }
-        return Err(ResolveError::ParseFailed("no formats".to_string()));
+
+        choose_higher_tbr(&mut best_any, format);
+        if is_upload_compatible(format) {
+            choose_higher_tbr(&mut best_compatible, format);
+        }
     }
 
-    // Prefer formats that are likely to upload without re-encoding.
-    let compatible_formats: Vec<&YtDlpFormat> = valid_formats
-        .iter()
-        .filter(|f| {
-            let vcodec = f.vcodec.as_deref().unwrap_or("");
-            let acodec = f.acodec.as_deref().unwrap_or("");
-            let is_h264 = vcodec.starts_with("avc") || vcodec.contains("h264");
-            let is_aac = acodec.starts_with("mp4a") || acodec.contains("aac");
-            is_h264 && is_aac
-        })
-        .copied()
-        .collect();
-
-    if !compatible_formats.is_empty() {
-        // Pick the highest bitrate compatible format to minimize re-encode work.
-        let best = compatible_formats
-            .iter()
-            .max_by(|a, b| {
-                let a_tbr = a.tbr.unwrap_or(0.0);
-                let b_tbr = b.tbr.unwrap_or(0.0);
-                a_tbr
-                    .partial_cmp(&b_tbr)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .ok_or_else(|| ResolveError::ParseFailed("no compatible formats".to_string()))?;
-
+    if let Some(best) = best_compatible.or(best_any) {
         let url = best
             .url
             .clone()
@@ -566,24 +543,38 @@ fn select_best_format(output: &YtDlpOutput) -> Result<(Box<str>, Box<str>, bool)
         return Ok((url, ext, false));
     }
 
-    // Otherwise, pick the highest bitrate format and plan to transcode later.
-    let best = valid_formats
-        .iter()
-        .max_by(|a, b| {
-            let a_tbr = a.tbr.unwrap_or(0.0);
-            let b_tbr = b.tbr.unwrap_or(0.0);
-            a_tbr
-                .partial_cmp(&b_tbr)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .ok_or_else(|| ResolveError::ParseFailed("no formats".to_string()))?;
+    // Fall back to thumbnail for image-only tweets.
+    if let Some(thumbnail_url) = &output.thumbnail {
+        let ext = extension_from_url(thumbnail_url).unwrap_or_else(|| "jpg".into());
+        return Ok((thumbnail_url.clone(), ext, true));
+    }
 
-    let url = best
-        .url
-        .clone()
-        .ok_or_else(|| ResolveError::ParseFailed("format missing url".to_string()))?;
-    let ext = best.ext.clone().unwrap_or_else(|| "mp4".into());
-    Ok((url, ext, false))
+    Err(ResolveError::ParseFailed("no formats".to_string()))
+}
+
+fn is_upload_compatible(format: &YtDlpFormat) -> bool {
+    let vcodec = format.vcodec.as_deref().unwrap_or("");
+    let acodec = format.acodec.as_deref().unwrap_or("");
+    let is_h264 = vcodec.starts_with("avc") || vcodec.contains("h264");
+    let is_aac = acodec.starts_with("mp4a") || acodec.contains("aac");
+    is_h264 && is_aac
+}
+
+fn choose_higher_tbr<'a>(current: &mut Option<&'a YtDlpFormat>, candidate: &'a YtDlpFormat) {
+    let Some(best) = current else {
+        *current = Some(candidate);
+        return;
+    };
+
+    let candidate_tbr = candidate.tbr.unwrap_or(0.0);
+    let best_tbr = best.tbr.unwrap_or(0.0);
+    if candidate_tbr
+        .partial_cmp(&best_tbr)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        != std::cmp::Ordering::Less
+    {
+        *current = Some(candidate);
+    }
 }
 
 fn is_image_extension(ext: &str) -> bool {
@@ -591,11 +582,41 @@ fn is_image_extension(ext: &str) -> bool {
 }
 
 fn extension_from_url(url: &str) -> Option<Box<str>> {
-    url.split('?')
-        .next()?
-        .split('.')
-        .next_back()
-        .map(|s| s.to_lowercase().into_boxed_str())
+    let path = url.split('?').next()?;
+    let filename = path.rsplit('/').next()?;
+    let ext = filename.rsplit('.').next()?;
+    if ext == filename || ext.is_empty() {
+        return None;
+    }
+    Some(ext.to_lowercase().into_boxed_str())
+}
+
+fn extension_from_query_format(url: &str) -> Option<Box<str>> {
+    let (_, query) = url.split_once('?')?;
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=')
+            && key.eq_ignore_ascii_case("format")
+            && !value.is_empty()
+        {
+            return Some(value.to_ascii_lowercase().into_boxed_str());
+        }
+    }
+    None
+}
+
+fn extension_from_vxtwitter_metadata(media_type: &str, url: &str) -> Option<Box<str>> {
+    if let Some(ext) = extension_from_url(url) {
+        return Some(ext);
+    }
+
+    if let Some(ext) = extension_from_query_format(url) {
+        return Some(ext);
+    }
+
+    match media_type {
+        "gif" => Some("gif".into()),
+        _ => None,
+    }
 }
 
 async fn infer_extension(
@@ -721,7 +742,10 @@ async fn read_stderr_tail(
 
 #[cfg(test)]
 mod tests {
-    use super::{YtDlpFormat, YtDlpOutput, select_best_format, should_negative_cache};
+    use super::{
+        YtDlpFormat, YtDlpOutput, extension_from_vxtwitter_metadata, select_best_format,
+        should_negative_cache,
+    };
     use crate::pipeline::errors::ResolveError;
 
     fn format(
@@ -821,6 +845,43 @@ mod tests {
         assert_eq!(ext.as_ref(), "jpg");
         assert!(is_image);
         Ok(())
+    }
+
+    #[test]
+    fn select_best_format_direct_image_url_is_preserved() -> Result<(), ResolveError> {
+        let output = YtDlpOutput {
+            url: Some("https://example.invalid/image.jpg".into()),
+            formats: vec![],
+            duration: None,
+            width: None,
+            height: None,
+            ext: Some("jpg".into()),
+            thumbnail: None,
+        };
+
+        let (url, ext, is_image) = select_best_format(&output)?;
+
+        assert_eq!(url.as_ref(), "https://example.invalid/image.jpg");
+        assert_eq!(ext.as_ref(), "jpg");
+        assert!(is_image);
+        Ok(())
+    }
+
+    #[test]
+    fn vxtwitter_metadata_extension_uses_query_format() {
+        let ext = extension_from_vxtwitter_metadata(
+            "image",
+            "https://pbs.twimg.com/media/abcd1234?format=png&name=small",
+        );
+
+        assert_eq!(ext.as_deref(), Some("png"));
+    }
+
+    #[test]
+    fn vxtwitter_metadata_extension_uses_gif_type_without_probe() {
+        let ext = extension_from_vxtwitter_metadata("gif", "https://video.twimg.com/tweet");
+
+        assert_eq!(ext.as_deref(), Some("gif"));
     }
 
     #[test]
