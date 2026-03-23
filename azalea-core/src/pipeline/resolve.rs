@@ -22,19 +22,15 @@ use crate::concurrency::Permits;
 use crate::config::{PipelineSettings, StorageSettings, USER_AGENT};
 use crate::media::{TweetId, TweetLink};
 use crate::pipeline::errors::{Error, ResolveError};
-use crate::pipeline::process::{SubprocessGuard, kill_process_group, read_bounded};
+use crate::pipeline::process::{JsonSubprocessError, run_json_subprocess};
 use crate::pipeline::ssrf::validate_media_url;
 use crate::pipeline::types::{MediaType, ResolvedMedia, sanitize_extension};
 use moka::future::Cache;
 use serde::Deserialize;
 use std::borrow::Cow;
-use std::collections::VecDeque;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
 /// Resolves tweet media using a primary API and a yt-dlp fallback.
@@ -404,144 +400,53 @@ impl YtDlp {
 
         async {
             let mut command = Command::new(&self.path);
-            command
-                .args([
-                    "--dump-json",
-                    "--no-warnings",
-                    "--no-playlist",
-                    "--no-check-certificate",
-                    "--user-agent",
-                    USER_AGENT,
-                    "--extractor-args",
-                    "twitter:api=syndication",
-                    tweet_url.canonical_url(),
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut guard =
-                SubprocessGuard::spawn(&mut command).map_err(|e| ResolveError::ProcessFailed {
+            command.args([
+                "--dump-json",
+                "--no-warnings",
+                "--no-playlist",
+                "--no-check-certificate",
+                "--user-agent",
+                USER_AGENT,
+                "--extractor-args",
+                "twitter:api=syndication",
+                tweet_url.canonical_url(),
+            ]);
+            let output = run_json_subprocess(
+                &mut command,
+                self.timeout,
+                YTDLP_STDOUT_LIMIT,
+                YTDLP_STDERR_LINES,
+            )
+            .await
+            .map_err(|error| match error {
+                JsonSubprocessError::Io(error) => ResolveError::ProcessFailed {
                     exit_code: None,
-                    stderr: e.to_string(),
-                })?;
-
-            let stdout =
-                guard
-                    .child_mut()
-                    .stdout
-                    .take()
-                    .ok_or_else(|| ResolveError::ProcessFailed {
-                        exit_code: None,
-                        stderr: "yt-dlp stdout missing".to_string(),
-                    })?;
-            let stderr =
-                guard
-                    .child_mut()
-                    .stderr
-                    .take()
-                    .ok_or_else(|| ResolveError::ProcessFailed {
-                        exit_code: None,
-                        stderr: "yt-dlp stderr missing".to_string(),
-                    })?;
-
-            let (limit_tx, mut limit_rx) = mpsc::channel::<()>(1);
-            let limit_guard = limit_tx.clone();
-
-            // Bound stdout to prevent untrusted output from growing without limit.
-            let stdout_handle =
-                tokio::spawn(read_bounded(stdout, YTDLP_STDOUT_LIMIT, Some(limit_tx)));
-            let stderr_handle = tokio::spawn(read_stderr_tail(stderr, YTDLP_STDERR_LINES));
-
-            enum WaitOutcome {
-                Exit(std::io::Result<std::process::ExitStatus>),
-                Timeout,
-                OutputLimit,
-            }
-
-            let wait_outcome = tokio::select! {
-                res = tokio::time::timeout(self.timeout, guard.wait()) => {
-                    match res {
-                        Ok(status) => WaitOutcome::Exit(status),
-                        Err(_) => WaitOutcome::Timeout,
-                    }
-                }
-                _ = limit_rx.recv() => WaitOutcome::OutputLimit,
-            };
-            drop(limit_guard);
-
-            let status = match wait_outcome {
-                WaitOutcome::Exit(status) => status.map_err(|e| ResolveError::ProcessFailed {
+                    stderr: error.to_string(),
+                },
+                JsonSubprocessError::Timeout => ResolveError::ProcessFailed {
                     exit_code: None,
-                    stderr: e.to_string(),
-                })?,
-                WaitOutcome::Timeout => {
-                    // Ensure any child processes are terminated on timeout.
-                    tracing::warn!("yt-dlp timed out; killing process group");
-                    kill_process_group(guard.child_mut()).await;
-                    let _ = guard.wait().await;
-                    stdout_handle.abort();
-                    stderr_handle.abort();
-                    return Err(ResolveError::ProcessFailed {
-                        exit_code: None,
-                        stderr: "yt-dlp timed out".to_string(),
-                    });
-                }
-                WaitOutcome::OutputLimit => {
-                    // Output guard triggered; terminate to cap memory usage.
+                    stderr: "yt-dlp timed out".to_string(),
+                },
+                JsonSubprocessError::OutputLimit { stderr_tail } => {
                     tracing::warn!(
                         limit_bytes = YTDLP_STDOUT_LIMIT,
                         "yt-dlp output exceeded bounded read limit"
                     );
-                    kill_process_group(guard.child_mut()).await;
-                    let _ = guard.wait().await;
-                    let _ = stdout_handle.await;
-                    let stderr_tail = stderr_handle
-                        .await
-                        .ok()
-                        .and_then(|result| result.ok())
-                        .unwrap_or_else(|| "unknown error".into());
-                    return Err(ResolveError::ProcessFailed {
+                    ResolveError::ProcessFailed {
                         exit_code: None,
                         stderr: format!("yt-dlp output exceeded limit: {stderr_tail}"),
-                    });
+                    }
                 }
-            };
+            })?;
 
-            let stdout = stdout_handle
-                .await
-                .map_err(|e| ResolveError::ProcessFailed {
-                    exit_code: status.code(),
-                    stderr: e.to_string(),
-                })?
-                .map_err(|e| ResolveError::ProcessFailed {
-                    exit_code: status.code(),
-                    stderr: e.to_string(),
-                })?;
-
-            let stderr_tail = stderr_handle
-                .await
-                .ok()
-                .and_then(|result| result.ok())
-                .unwrap_or_else(|| "unknown error".into());
-
-            if stdout.exceeded {
+            if !output.status.success() {
+                let stderr_tail = output.stderr_tail.as_ref();
                 tracing::warn!(
-                    limit_bytes = YTDLP_STDOUT_LIMIT,
-                    "yt-dlp output exceeded bounded read limit"
-                );
-                return Err(ResolveError::ProcessFailed {
-                    exit_code: status.code(),
-                    stderr: format!("yt-dlp output exceeded limit: {stderr_tail}"),
-                });
-            }
-
-            if !status.success() {
-                tracing::warn!(
-                    exit_code = status.code(),
+                    exit_code = output.status.code(),
                     "yt-dlp process returned non-zero exit status"
                 );
                 return Err(ResolveError::ProcessFailed {
-                    exit_code: status.code(),
+                    exit_code: output.status.code(),
                     stderr: stderr_tail
                         .lines()
                         .next()
@@ -550,7 +455,7 @@ impl YtDlp {
                 });
             }
 
-            let ytdlp_output: YtDlpOutput = serde_json::from_slice(stdout.data.as_slice())
+            let ytdlp_output: YtDlpOutput = serde_json::from_slice(output.stdout.as_slice())
                 .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
 
             let (url, extension, is_image) = select_best_format(&ytdlp_output)?;
@@ -764,44 +669,6 @@ fn should_negative_cache(error: &ResolveError) -> bool {
                 || lower.contains("does not exist")
         }
     }
-}
-
-async fn read_stderr_tail(
-    stderr: tokio::process::ChildStderr,
-    max_lines: usize,
-) -> Result<Box<str>, std::io::Error> {
-    const MAX_LINE_BYTES: usize = 4096;
-    let mut reader = BufReader::new(stderr);
-    let mut lines = VecDeque::with_capacity(max_lines);
-    let mut buffer = Vec::with_capacity(256);
-
-    loop {
-        buffer.clear();
-        let read = reader.read_until(b'\n', &mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-
-        if buffer.len() > MAX_LINE_BYTES {
-            buffer.truncate(MAX_LINE_BYTES);
-        }
-
-        if buffer.last() == Some(&b'\n') {
-            buffer.pop();
-        }
-
-        let line = String::from_utf8_lossy(&buffer).to_string();
-        if lines.len() >= max_lines {
-            lines.pop_front();
-        }
-        lines.push_back(line);
-    }
-
-    Ok(lines
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .into_boxed_str())
 }
 
 #[cfg(test)]

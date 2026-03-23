@@ -15,17 +15,16 @@ use crate::config::EngineSettings;
 use crate::media::TempFileCleanup;
 use crate::pipeline::disk::ensure_disk_space;
 use crate::pipeline::errors::{DownloadError, Error};
-use crate::pipeline::process::{SubprocessGuard, kill_process_group, read_bounded};
+use crate::pipeline::process::{JsonSubprocessError, run_json_subprocess};
 use crate::pipeline::ssrf::validate_media_url;
 use crate::pipeline::types::{DownloadedFile, Job, ResolvedMedia, sanitize_extension};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
 /// Download media to a temp file while enforcing size and safety constraints.
@@ -349,6 +348,30 @@ struct ProbeResult {
     resolution: Option<(u32, u32)>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FfprobeOutput {
+    #[serde(default)]
+    format: Option<FfprobeFormat>,
+    #[serde(default)]
+    streams: Vec<FfprobeStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeFormat {
+    #[serde(default)]
+    duration: Option<Box<str>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeStream {
+    #[serde(default)]
+    codec_type: Option<Box<str>>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+}
+
 /// Probe the file with ffprobe to fill in missing duration/resolution.
 ///
 /// ## Rationale
@@ -360,6 +383,7 @@ async fn probe_file(path: &Path, config: &EngineSettings) -> Result<ProbeResult,
     let timeout = Duration::from_secs(config.transcode.ffprobe_timeout_secs);
 
     const FFPROBE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+    const FFPROBE_STDERR_LINES: usize = 10;
     // Output limits prevent unbounded logs from exhausting memory.
 
     let mut command = Command::new(&config.binaries.ffprobe);
@@ -372,142 +396,52 @@ async fn probe_file(path: &Path, config: &EngineSettings) -> Result<ProbeResult,
             "-show_format",
             "-show_streams",
         ])
-        .arg(path.as_os_str())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut guard = SubprocessGuard::spawn(&mut command).map_err(|e| Error::DownloadFailed {
-        source: DownloadError::WriteFailed(e),
-    })?;
-
-    let stdout = guard
-        .child_mut()
-        .stdout
-        .take()
-        .ok_or_else(|| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(std::io::Error::other("ffprobe stdout missing")),
-        })?;
-    let stderr = guard
-        .child_mut()
-        .stderr
-        .take()
-        .ok_or_else(|| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(std::io::Error::other("ffprobe stderr missing")),
-        })?;
-    let (limit_tx, mut limit_rx) = mpsc::channel::<()>(1);
-    let limit_guard = limit_tx.clone();
-
-    let stdout_handle = tokio::spawn(read_bounded(
-        stdout,
+        .arg(path.as_os_str());
+    let output = run_json_subprocess(
+        &mut command,
+        timeout,
         FFPROBE_OUTPUT_LIMIT,
-        Some(limit_tx.clone()),
-    ));
-    let stderr_handle = tokio::spawn(read_bounded(stderr, FFPROBE_OUTPUT_LIMIT, Some(limit_tx)));
-
-    enum WaitOutcome {
-        Exit(std::io::Result<std::process::ExitStatus>),
-        Timeout,
-        OutputLimit,
-    }
-
-    let wait_outcome = tokio::select! {
-        res = tokio::time::timeout(timeout, guard.wait()) => {
-            match res {
-                Ok(status) => WaitOutcome::Exit(status),
-                Err(_) => WaitOutcome::Timeout,
-            }
-        }
-        _ = limit_rx.recv() => WaitOutcome::OutputLimit,
-    };
-    drop(limit_guard);
-
-    let status = match wait_outcome {
-        WaitOutcome::Exit(status) => status.map_err(|e| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(e),
-        })?,
-        WaitOutcome::Timeout => {
-            // Timeout: kill the whole process group to avoid orphaned ffprobe processes.
-            kill_process_group(guard.child_mut()).await;
-            let _ = guard.wait().await;
-            stdout_handle.abort();
-            stderr_handle.abort();
-            return Err(Error::Timeout {
-                operation: "ffprobe",
-                duration: timeout,
-            });
-        }
-        WaitOutcome::OutputLimit => {
-            // Output limit hit: terminate subprocess to cap memory usage.
-            kill_process_group(guard.child_mut()).await;
-            let _ = guard.wait().await;
-            stdout_handle.abort();
-            stderr_handle.abort();
-            return Err(Error::DownloadFailed {
-                source: DownloadError::WriteFailed(std::io::Error::other(
-                    "ffprobe output exceeded limit",
-                )),
-            });
-        }
-    };
-
-    let stdout = stdout_handle
-        .await
-        .map_err(|e| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(std::io::Error::other(e.to_string())),
-        })?
-        .map_err(|e| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(e),
-        })?;
-
-    let stderr = stderr_handle
-        .await
-        .map_err(|e| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(std::io::Error::other(e.to_string())),
-        })?
-        .map_err(|e| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(e),
-        })?;
-
-    if stdout.exceeded || stderr.exceeded {
-        return Err(Error::DownloadFailed {
+        FFPROBE_STDERR_LINES,
+    )
+    .await
+    .map_err(|error| match error {
+        JsonSubprocessError::Io(error) => Error::DownloadFailed {
+            source: DownloadError::WriteFailed(error),
+        },
+        JsonSubprocessError::Timeout => Error::Timeout {
+            operation: "ffprobe",
+            duration: timeout,
+        },
+        JsonSubprocessError::OutputLimit { .. } => Error::DownloadFailed {
             source: DownloadError::WriteFailed(std::io::Error::other(
                 "ffprobe output exceeded limit",
             )),
-        });
-    }
+        },
+    })?;
 
-    if !status.success() {
+    if !output.status.success() {
         return Err(Error::DownloadFailed {
             source: DownloadError::WriteFailed(std::io::Error::other("ffprobe returned error")),
         });
     }
 
     // Parse is best-effort; missing fields are tolerated downstream.
-    let stdout = String::from_utf8_lossy(&stdout.data);
-    let probe: serde_json::Value =
-        serde_json::from_str(&stdout).map_err(|e| Error::DownloadFailed {
+    let probe: FfprobeOutput =
+        serde_json::from_slice(output.stdout.as_slice()).map_err(|e| Error::DownloadFailed {
             source: DownloadError::WriteFailed(std::io::Error::other(e)),
         })?;
 
     let duration = probe
-        .get("format")
-        .and_then(|format| format.get("duration"))
-        .and_then(|duration| duration.as_str())
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref())
         .and_then(|s| s.parse::<f64>().ok());
 
-    let video_stream = probe.get("streams").and_then(|streams| {
-        streams.as_array().and_then(|streams| {
-            streams.iter().find(|stream| {
-                stream.get("codec_type").and_then(|codec| codec.as_str()) == Some("video")
-            })
-        })
-    });
-
-    let resolution = video_stream.and_then(|vs| {
-        let width = vs.get("width").and_then(|v| v.as_u64())? as u32;
-        let height = vs.get("height").and_then(|v| v.as_u64())? as u32;
-        Some((width, height))
-    });
+    let resolution = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+        .and_then(|stream| Some((stream.width?, stream.height?)));
 
     Ok(ProbeResult {
         duration,
