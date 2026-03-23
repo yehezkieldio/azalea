@@ -7,6 +7,15 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.3.2 (March 23, 2026)
+
+### <!-- 5 -->📚 Documentation
+- [`e61db50`](https://github.com/yehezkieldio/azalea/commit/e61db50cf9cc7092b1109424fddb6b2b2bc6788a) **legal**: Remove repository license section
+
+### <!-- 8 -->🏗️ Build System
+- [`125ed34`](https://github.com/yehezkieldio/azalea/commit/125ed34deb74c868b860abcd1185108e5d770ab9) **docker**: Guard ffmpeg extraction and add build args
+- [`af12764`](https://github.com/yehezkieldio/azalea/commit/af1276423b9bc87ed68f5384b895dd9a96aecefd) **docker**: Add ffmpeg download validation and switch to latest tag
+
 ## 0.3.1 (March 22, 2026)
 
 ### <!-- 10 -->🧪 Test
@@ -17,6 +26,9 @@ All notable changes to this project will be documented in this file.
 - [`c58a7b3`](https://github.com/yehezkieldio/azalea/commit/c58a7b365d6de97d431d408a138722401a49132d) **media**: Add fuzz test for parse_tweet_urls to handle arbitrary bytes
 - [`99b023b`](https://github.com/yehezkieldio/azalea/commit/99b023b91a4c9e45e82583526568af63b8bd5720) **pipeline**: Add is_allowed_extension and enforce sanitize checks
 - [`60d7717`](https://github.com/yehezkieldio/azalea/commit/60d77177792b0ffb136e7aec8e544a676ce230e1) **pipeline**: Add exponential backoff saturation test
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`77d24ea`](https://github.com/yehezkieldio/azalea/commit/77d24eac716fc30035153218693715753eb3227c) **release**: 0.3.1
 
 ### <!-- 2 -->🧩 Dependencies Updates
 - [`cb5f6e4`](https://github.com/yehezkieldio/azalea/commit/cb5f6e47522b9d9731e8151d7b5540771e4423df) **deps**: Update rust crate moka to v0.12.15 by renovate[bot] ([#6](https://github.com/yehezkieldio/azalea/issues/6))
