@@ -8,12 +8,6 @@ Azalea is a Discord bot that retrieves media from X (formerly Twitter) and uploa
 
 Because this process automates the retrieval and redistribution of third-party content, operating Azalea carries legal and policy risks for the operator.
 
-## Repository License
-
-Azalea is dual-licensed under the MIT License or the Apache License 2.0, at your option. You may use, copy, modify, and distribute this software under the terms of either license. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) for the full license texts.
-
-This file is a risk notice. It does not alter or replace those license terms.
-
 ## Limitation of Liability
 
 Azalea is provided as-is, without warranty of any kind, to the maximum extent permitted by applicable law. The maintainers and contributors disclaim all liability for misuse of the software and for any claims, damages, or losses arising from your deployment or use of Azalea. You are solely responsible for ensuring your use complies with applicable law and any third-party terms or policies.
@@ -62,4 +56,4 @@ Azalea depends on external tools and services for URL resolution, media retrieva
 
 ## Project Intent
 
-Azalea is intended for educational and experimental use and for convenience within private community chat. It is not intended to facilitate copyright infringement, circumvent platform rules, or enable systematic scraping, archiving, or redistribution of content.
+Azalea is intended for educational and experimental use and for convenience within a private server. It is not intended to facilitate copyright infringement, circumvent platform rules, or enable systematic scraping, archiving, or redistribution of content.
