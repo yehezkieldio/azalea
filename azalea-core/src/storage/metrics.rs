@@ -6,13 +6,13 @@
 //! ## Trade-off acknowledgment
 //! Metrics are best-effort; failures are logged but do not halt the pipeline.
 
+use super::FlushWorker;
 use dashmap::DashMap;
 use redb::{AccessGuard, Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use tokio::sync::{Mutex, watch};
 
 const METRICS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metrics");
 const ERRORS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("errors");
@@ -32,26 +32,43 @@ pub enum Stage {
 
 /// Snapshot of counters used for status and statistics reporting.
 ///
-/// ## Invariants
-/// `stage_avg_ms` entries are zero when no samples exist.
-#[derive(Debug, Clone)]
+/// `totals` are cumulative for the lifetime of the persisted tracker.
+/// `stage_window` is the current in-memory timing window and resets at startup
+/// and after each successful flush.
+#[derive(Debug, Clone, Copy)]
 pub struct Snapshot {
+    pub totals: TotalsSnapshot,
+    pub stage_window: StageWindowSnapshot,
+}
+
+/// Lifetime counters persisted cumulatively.
+#[derive(Debug, Clone, Copy)]
+pub struct TotalsSnapshot {
     pub total_runs: u64,
     pub successes: u64,
     pub failures: u64,
-    pub stage_avg_ms: [u64; 4],
+}
+
+/// Current stage timing window used for rolling averages.
+///
+/// ## Invariants
+/// `avg_ms` entries are zero when the corresponding `sample_count` is zero.
+#[derive(Debug, Clone, Copy)]
+pub struct StageWindowSnapshot {
+    pub avg_ms: [u64; 4],
+    pub sample_count: [u64; 4],
 }
 
 struct LoadState {
     total_runs: u64,
     successes: u64,
     failures: u64,
-    stage_sum: [u64; 4],
-    stage_count: [u64; 4],
     errors: Vec<(Box<str>, u64)>,
 }
 
 impl Stage {
+    pub const ALL: [Self; 4] = [Self::Resolve, Self::Download, Self::Optimize, Self::Upload];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Resolve => "resolve",
@@ -80,8 +97,7 @@ struct Inner {
     stage_duration_sum_ms: [AtomicU64; 4],
     stage_count: [AtomicU64; 4],
     error_counts: DashMap<Box<str>, AtomicU64>,
-    flush_cancel: watch::Sender<bool>,
-    flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    flush_worker: FlushWorker,
 }
 
 impl Tracker {
@@ -92,7 +108,7 @@ impl Tracker {
     pub fn new(config: &crate::config::StorageSettings) -> anyhow::Result<Self> {
         if !config.metrics_enabled {
             return Ok(Self {
-                inner: Arc::new(Inner::disabled()),
+                inner: Arc::new(Inner::new(false, None)),
             });
         }
 
@@ -106,7 +122,7 @@ impl Tracker {
         write_txn.commit()?;
 
         Ok(Self {
-            inner: Arc::new(Inner::new(Some(Arc::new(db)))),
+            inner: Arc::new(Inner::new(true, Some(Arc::new(db)))),
         })
     }
 
@@ -188,8 +204,6 @@ impl Tracker {
             let mut total_runs = 0;
             let mut successes = 0;
             let mut failures = 0;
-            let mut stage_sum = [0u64; 4];
-            let mut stage_count = [0u64; 4];
             let mut errors = Vec::new();
 
             if let Ok(table) = read_txn.open_table(METRICS_TABLE) {
@@ -201,28 +215,6 @@ impl Tracker {
                 }
                 if let Ok(Some(value)) = table.get("failures") {
                     failures = value.value();
-                }
-
-                for stage in [
-                    Stage::Resolve,
-                    Stage::Download,
-                    Stage::Optimize,
-                    Stage::Upload,
-                ] {
-                    let idx = stage as usize;
-                    let sum_key = format!("stage.{}.duration_sum_ms", stage.as_str());
-                    let count_key = format!("stage.{}.count", stage.as_str());
-
-                    if let Ok(Some(value)) = table.get(sum_key.as_str())
-                        && let Some(slot) = stage_sum.get_mut(idx)
-                    {
-                        *slot = value.value();
-                    }
-                    if let Ok(Some(value)) = table.get(count_key.as_str())
-                        && let Some(slot) = stage_count.get_mut(idx)
-                    {
-                        *slot = value.value();
-                    }
                 }
             }
 
@@ -237,8 +229,6 @@ impl Tracker {
                 total_runs,
                 successes,
                 failures,
-                stage_sum,
-                stage_count,
                 errors,
             })
         })
@@ -255,15 +245,11 @@ impl Tracker {
             .failures
             .store(result.failures, Ordering::Relaxed);
 
-        for ((sum_slot, count_slot), (sum, count)) in self
-            .inner
-            .stage_duration_sum_ms
-            .iter()
-            .zip(self.inner.stage_count.iter())
-            .zip(result.stage_sum.iter().zip(result.stage_count.iter()))
-        {
-            sum_slot.store(*sum, Ordering::Relaxed);
-            count_slot.store(*count, Ordering::Relaxed);
+        for slot in self.inner.stage_duration_sum_ms.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+        for slot in self.inner.stage_count.iter() {
+            slot.store(0, Ordering::Relaxed);
         }
 
         self.inner.error_counts.clear();
@@ -279,32 +265,37 @@ impl Tracker {
     /// ## Time complexity
     /// $O(1)$ over a fixed number of stages.
     pub fn snapshot(&self) -> Snapshot {
-        let total_runs = self.inner.total_runs.load(Ordering::Relaxed);
-        let successes = self.inner.successes.load(Ordering::Relaxed);
-        let failures = self.inner.failures.load(Ordering::Relaxed);
-
-        let stage_avg_ms = std::array::from_fn(|idx| {
-            let sum = self
-                .inner
-                .stage_duration_sum_ms
-                .get(idx)
-                .map(|slot| slot.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let count = self
-                .inner
-                .stage_count
-                .get(idx)
-                .map(|slot| slot.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            // Avoid division by zero when no samples exist.
-            sum.checked_div(count).unwrap_or(0)
-        });
-
         Snapshot {
-            total_runs,
-            successes,
-            failures,
-            stage_avg_ms,
+            totals: TotalsSnapshot {
+                total_runs: self.inner.total_runs.load(Ordering::Relaxed),
+                successes: self.inner.successes.load(Ordering::Relaxed),
+                failures: self.inner.failures.load(Ordering::Relaxed),
+            },
+            stage_window: StageWindowSnapshot {
+                avg_ms: std::array::from_fn(|idx| {
+                    let sum = self
+                        .inner
+                        .stage_duration_sum_ms
+                        .get(idx)
+                        .map(|slot| slot.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    let count = self
+                        .inner
+                        .stage_count
+                        .get(idx)
+                        .map(|slot| slot.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    // Avoid division by zero when no samples exist.
+                    sum.checked_div(count).unwrap_or(0)
+                }),
+                sample_count: std::array::from_fn(|idx| {
+                    self.inner
+                        .stage_count
+                        .get(idx)
+                        .map(|slot| slot.load(Ordering::Relaxed))
+                        .unwrap_or(0)
+                }),
+            },
         }
     }
 
@@ -323,31 +314,6 @@ impl Tracker {
         let successes = self.inner.successes.load(Ordering::Relaxed);
         let failures = self.inner.failures.load(Ordering::Relaxed);
 
-        let stage_data: Vec<(Box<str>, u64, u64)> = [
-            Stage::Resolve,
-            Stage::Download,
-            Stage::Optimize,
-            Stage::Upload,
-        ]
-        .iter()
-        .map(|stage| {
-            let idx = *stage as usize;
-            (
-                stage.as_str().into(),
-                self.inner
-                    .stage_duration_sum_ms
-                    .get(idx)
-                    .map(|slot| slot.load(Ordering::Relaxed))
-                    .unwrap_or(0),
-                self.inner
-                    .stage_count
-                    .get(idx)
-                    .map(|slot| slot.load(Ordering::Relaxed))
-                    .unwrap_or(0),
-            )
-        })
-        .collect();
-
         let error_counts: Vec<(Box<str>, u64)> = self
             .inner
             .error_counts
@@ -363,13 +329,6 @@ impl Tracker {
                 let _ = table.insert("total_runs", total_runs);
                 let _ = table.insert("successes", successes);
                 let _ = table.insert("failures", failures);
-
-                for (stage, sum, count) in stage_data {
-                    let sum_key = format!("stage.{}.duration_sum_ms", stage.as_ref());
-                    let count_key = format!("stage.{}.count", stage.as_ref());
-                    let _ = table.insert(sum_key.as_str(), sum);
-                    let _ = table.insert(count_key.as_str(), count);
-                }
             }
 
             {
@@ -405,49 +364,32 @@ impl Tracker {
 
     /// Start a periodic flush task; no-op when disabled.
     pub async fn start_flush_task(&self, interval: std::time::Duration) {
-        if !self.inner.enabled || interval.is_zero() {
+        if !self.inner.enabled {
             return;
         }
 
-        let mut handle_guard = self.inner.flush_handle.lock().await;
-        if handle_guard.is_some() {
-            return;
-        }
-
-        let _ = self.inner.flush_cancel.send(false);
         let metrics = self.clone();
-        let mut cancel_rx = self.inner.flush_cancel.subscribe();
-        *handle_guard = Some(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                tokio::select! {
-                    _ = cancel_rx.changed() => {
-                        if *cancel_rx.borrow() {
-                            break;
-                        }
-                    }
-                    _ = ticker.tick() => {
-                        metrics.flush().await;
-                    }
+        self.inner
+            .flush_worker
+            .start(interval, move || {
+                let metrics = metrics.clone();
+                async move {
+                    metrics.flush().await;
                 }
-            }
-        }));
+            })
+            .await;
     }
 
     /// Stop the periodic flush task.
     pub async fn stop_flush_task(&self) {
-        let _ = self.inner.flush_cancel.send(true);
-        if let Some(handle) = self.inner.flush_handle.lock().await.take() {
-            let _ = handle.await;
-        }
+        self.inner.flush_worker.stop().await;
     }
 }
 
 impl Inner {
-    fn new(db: Option<Arc<Database>>) -> Self {
-        let (flush_cancel, _) = watch::channel(false);
+    fn new(enabled: bool, db: Option<Arc<Database>>) -> Self {
         Self {
-            enabled: true,
+            enabled,
             db,
             total_runs: AtomicU64::new(0),
             successes: AtomicU64::new(0),
@@ -455,24 +397,7 @@ impl Inner {
             stage_duration_sum_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             stage_count: std::array::from_fn(|_| AtomicU64::new(0)),
             error_counts: DashMap::new(),
-            flush_cancel,
-            flush_handle: Mutex::new(None),
-        }
-    }
-
-    fn disabled() -> Self {
-        let (flush_cancel, _) = watch::channel(false);
-        Self {
-            enabled: false,
-            db: None,
-            total_runs: AtomicU64::new(0),
-            successes: AtomicU64::new(0),
-            failures: AtomicU64::new(0),
-            stage_duration_sum_ms: std::array::from_fn(|_| AtomicU64::new(0)),
-            stage_count: std::array::from_fn(|_| AtomicU64::new(0)),
-            error_counts: DashMap::new(),
-            flush_cancel,
-            flush_handle: Mutex::new(None),
+            flush_worker: FlushWorker::new(),
         }
     }
 }
@@ -511,10 +436,11 @@ mod tests {
         tracker.record_error("resolve_failed");
 
         let snapshot = tracker.snapshot();
-        assert_eq!(snapshot.total_runs, 0);
-        assert_eq!(snapshot.successes, 0);
-        assert_eq!(snapshot.failures, 0);
-        assert_eq!(snapshot.stage_avg_ms, [0; 4]);
+        assert_eq!(snapshot.totals.total_runs, 0);
+        assert_eq!(snapshot.totals.successes, 0);
+        assert_eq!(snapshot.totals.failures, 0);
+        assert_eq!(snapshot.stage_window.avg_ms, [0; 4]);
+        assert_eq!(snapshot.stage_window.sample_count, [0; 4]);
     }
 
     #[test]
@@ -529,16 +455,32 @@ mod tests {
         tracker.record_stage_duration(Stage::Upload, 80);
 
         let snapshot = tracker.snapshot();
-        assert_eq!(snapshot.total_runs, 2);
-        assert_eq!(snapshot.successes, 1);
-        assert_eq!(snapshot.failures, 1);
+        assert_eq!(snapshot.totals.total_runs, 2);
+        assert_eq!(snapshot.totals.successes, 1);
+        assert_eq!(snapshot.totals.failures, 1);
         assert_eq!(
-            snapshot.stage_avg_ms.get(Stage::Resolve as usize).copied(),
+            snapshot
+                .stage_window
+                .avg_ms
+                .get(Stage::Resolve as usize)
+                .copied(),
             Some(200)
         );
         assert_eq!(
-            snapshot.stage_avg_ms.get(Stage::Upload as usize).copied(),
+            snapshot
+                .stage_window
+                .avg_ms
+                .get(Stage::Upload as usize)
+                .copied(),
             Some(80)
+        );
+        assert_eq!(
+            snapshot
+                .stage_window
+                .sample_count
+                .get(Stage::Resolve as usize)
+                .copied(),
+            Some(2)
         );
         let _ = std::fs::remove_file(path);
     }
@@ -559,13 +501,11 @@ mod tests {
         restored.load_from_db().await.expect("load should succeed");
 
         let snapshot = restored.snapshot();
-        assert_eq!(snapshot.total_runs, 1);
-        assert_eq!(snapshot.successes, 1);
-        assert_eq!(snapshot.failures, 0);
-        assert_eq!(
-            snapshot.stage_avg_ms.get(Stage::Download as usize).copied(),
-            Some(250)
-        );
+        assert_eq!(snapshot.totals.total_runs, 1);
+        assert_eq!(snapshot.totals.successes, 1);
+        assert_eq!(snapshot.totals.failures, 0);
+        assert_eq!(snapshot.stage_window.avg_ms, [0; 4]);
+        assert_eq!(snapshot.stage_window.sample_count, [0; 4]);
 
         let _ = std::fs::remove_file(path);
     }

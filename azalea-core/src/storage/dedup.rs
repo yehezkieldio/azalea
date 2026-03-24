@@ -12,6 +12,7 @@
 //! ## Trade-off acknowledgment
 //! Persistence failures degrade to in-memory mode to keep the pipeline alive.
 
+use super::FlushWorker;
 use crate::config::{PipelineSettings, StorageSettings, TranscodeSettings};
 use crate::media::TweetId;
 use moka::future::Cache as MokaCache;
@@ -22,7 +23,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, watch};
 
 /// Compact dedup key.
 ///
@@ -123,10 +124,7 @@ pub struct Cache {
     flush_failures: Arc<AtomicUsize>,
     flush_backoff_until: Arc<AtomicU64>,
     persistence_disabled: Arc<AtomicBool>,
-    flush_notify: Arc<Notify>,
-    flush_task_running: Arc<AtomicBool>,
-    flush_cancel: watch::Sender<bool>,
-    flush_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    flush_worker: Arc<FlushWorker>,
     maintenance_cancel: watch::Sender<bool>,
     maintenance_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -168,7 +166,6 @@ impl Cache {
             (None, Arc::new(RwLock::new(VecDeque::new())))
         };
 
-        let (flush_cancel, _) = watch::channel(false);
         let (maintenance_cancel, _) = watch::channel(false);
         let pending_cap = DEFAULT_BATCH_SIZE
             .saturating_mul(PENDING_WRITE_CAP_MULTIPLIER)
@@ -185,10 +182,7 @@ impl Cache {
             flush_failures: Arc::new(AtomicUsize::new(0)),
             flush_backoff_until: Arc::new(AtomicU64::new(0)),
             persistence_disabled: Arc::new(AtomicBool::new(false)),
-            flush_notify: Arc::new(Notify::new()),
-            flush_task_running: Arc::new(AtomicBool::new(false)),
-            flush_cancel,
-            flush_handle: Arc::new(Mutex::new(None)),
+            flush_worker: Arc::new(FlushWorker::new()),
             maintenance_cancel,
             maintenance_handle: Arc::new(Mutex::new(None)),
         })
@@ -339,9 +333,7 @@ impl Cache {
         if should_flush {
             // Wake the background flusher so the batch can be committed in one
             // Redb transaction instead of blocking this hot path.
-            if self.flush_task_running.load(Ordering::Relaxed) {
-                self.flush_notify.notify_one();
-            } else {
+            if !self.flush_worker.schedule() {
                 self.flush().await;
             }
         }
@@ -463,55 +455,24 @@ impl Cache {
 
     /// Start a periodic flush task to persist pending writes.
     pub async fn start_flush_task(&self, interval: Duration) {
-        if self.db.is_none() || interval.is_zero() {
+        if self.db.is_none() {
             return;
         }
 
-        if self.flush_task_running.swap(true, Ordering::Relaxed) {
-            return;
-        }
-
-        let mut handle_guard = self.flush_handle.lock().await;
-        if handle_guard.is_some() {
-            self.flush_task_running.store(false, Ordering::Relaxed);
-            return;
-        }
-
-        let _ = self.flush_cancel.send(false);
         let dedup = self.clone();
-        let flush_notify = Arc::clone(&self.flush_notify);
-        let mut cancel_rx = self.flush_cancel.subscribe();
-        *handle_guard = Some(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            // Skip the immediate first tick so startup does not flush partial
-            // batches before the queue has a chance to fill under load.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel_rx.changed() => {
-                        if *cancel_rx.borrow() {
-                            break;
-                        }
-                    }
-                    _ = flush_notify.notified() => {
-                        dedup.flush().await;
-                    }
-                    _ = ticker.tick() => {
-                        dedup.flush().await;
-                    }
+        self.flush_worker
+            .start(interval, move || {
+                let dedup = dedup.clone();
+                async move {
+                    dedup.flush().await;
                 }
-            }
-        }));
+            })
+            .await;
     }
 
     /// Stop the periodic flush task.
     pub async fn stop_flush_task(&self) {
-        self.flush_task_running.store(false, Ordering::Relaxed);
-        let _ = self.flush_cancel.send(true);
-        if let Some(handle) = self.flush_handle.lock().await.take() {
-            let _ = handle.await;
-        }
+        self.flush_worker.stop().await;
     }
 
     async fn prune_expired(&self, batch_size: usize) -> usize {

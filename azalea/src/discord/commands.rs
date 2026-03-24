@@ -213,6 +213,7 @@ async fn respond(
 async fn format_status(app: &App) -> String {
     let uptime = app.start_time.elapsed();
     let snapshot = app.engine.metrics.snapshot();
+    let totals = snapshot.totals;
     let queue_depth = app.queue_depth.load(Ordering::Relaxed);
     let dedup_entries = app.engine.dedup.cache_entries();
     let pending_writes = app.engine.dedup.pending_writes_len().await;
@@ -222,9 +223,9 @@ async fn format_status(app: &App) -> String {
         "Azalea is online.\nUptime: {}s\nQueue depth: {}\nTotal runs: {} ({} ok / {} failed)\nDedup cache: {} entries ({} pending writes)\nResolver cache: {} ok / {} negative",
         uptime.as_secs(),
         queue_depth,
-        snapshot.total_runs,
-        snapshot.successes,
-        snapshot.failures,
+        totals.total_runs,
+        totals.successes,
+        totals.failures,
         dedup_entries,
         pending_writes,
         resolver_stats.positive_entries,
@@ -234,28 +235,34 @@ async fn format_status(app: &App) -> String {
 
 fn format_stats(app: &App) -> String {
     let snapshot = app.engine.metrics.snapshot();
-    let stage_avg = snapshot.stage_avg_ms;
-    let resolve_avg = stage_avg.get(Stage::Resolve as usize).copied().unwrap_or(0);
-    let download_avg = stage_avg
-        .get(Stage::Download as usize)
-        .copied()
-        .unwrap_or(0);
-    let optimize_avg = stage_avg
-        .get(Stage::Optimize as usize)
-        .copied()
-        .unwrap_or(0);
-    let upload_avg = stage_avg.get(Stage::Upload as usize).copied().unwrap_or(0);
+    let totals = snapshot.totals;
+    let stage_window = snapshot.stage_window;
 
-    format!(
-        "Pipeline stats:\nTotal runs: {}\nSuccesses: {}\nFailures: {}\nAvg resolve: {} ms\nAvg download: {} ms\nAvg optimize: {} ms\nAvg upload: {} ms",
-        snapshot.total_runs,
-        snapshot.successes,
-        snapshot.failures,
-        resolve_avg,
-        download_avg,
-        optimize_avg,
-        upload_avg
-    )
+    let mut lines = vec![
+        "Pipeline stats:".to_string(),
+        format!(
+            "Lifetime totals: {} runs ({} ok / {} failed)",
+            totals.total_runs, totals.successes, totals.failures
+        ),
+        "Stage timing window: since startup or last successful metrics flush".to_string(),
+    ];
+
+    for stage in Stage::ALL {
+        let idx = stage as usize;
+        let avg_ms = stage_window.avg_ms.get(idx).copied().unwrap_or(0);
+        let sample_count = stage_window.sample_count.get(idx).copied().unwrap_or(0);
+        let label = stage.as_str();
+
+        if sample_count == 0 {
+            lines.push(format!("{label}: no samples in current window"));
+        } else {
+            lines.push(format!(
+                "{label}: {avg_ms} ms avg over {sample_count} samples"
+            ));
+        }
+    }
+
+    lines.join("\n")
 }
 
 /// Render a minimal, non-sensitive configuration summary.
