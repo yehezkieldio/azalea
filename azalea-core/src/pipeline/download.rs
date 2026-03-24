@@ -23,6 +23,7 @@ use crate::pipeline::types::{
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
+use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::fs;
@@ -312,28 +313,19 @@ async fn fetch_with_redirects(
     http: &reqwest::Client,
     start_url: reqwest::Url,
 ) -> Result<reqwest::Response, Error> {
-    const MAX_REDIRECTS: usize = 5;
+    fetch_with_redirects_inner(
+        start_url,
+        |current| async move {
+            let response =
+                http.get(current.clone())
+                    .send()
+                    .await
+                    .map_err(|e| Error::DownloadFailed {
+                        source: DownloadError::WriteFailed(std::io::Error::other(e)),
+                    })?;
 
-    let mut current = start_url;
-    for hop in 0..=MAX_REDIRECTS {
-        tracing::trace!(hop, url = %current, "Fetching media URL");
-        let response =
-            http.get(current.clone())
-                .send()
-                .await
-                .map_err(|e| Error::DownloadFailed {
-                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
-                })?;
-
-        if response.status().is_redirection() {
-            if hop == MAX_REDIRECTS {
-                tracing::warn!(
-                    max_redirects = MAX_REDIRECTS,
-                    "Too many redirects while downloading media"
-                );
-                return Err(Error::DownloadFailed {
-                    source: DownloadError::WriteFailed(std::io::Error::other("too many redirects")),
-                });
+            if !response.status().is_redirection() {
+                return Ok(FetchStep::Complete(response));
             }
 
             let location = response
@@ -349,19 +341,65 @@ async fn fetch_with_redirects(
                     source: DownloadError::WriteFailed(std::io::Error::other(e)),
                 })?;
 
-            let next = response
-                .url()
-                .join(location)
-                .map_err(|e| Error::DownloadFailed {
-                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
-                })?;
+            Ok(FetchStep::Redirect {
+                base: response.url().clone(),
+                location: location.into(),
+            })
+        },
+        |next| async move { validate_media_url(next.as_str()).await },
+    )
+    .await
+}
 
-            tracing::trace!(hop, location, next = %next, "Following redirect");
-            current = validate_media_url(next.as_str()).await?;
-            continue;
+const MAX_REDIRECTS: usize = 5;
+
+enum FetchStep<T> {
+    Complete(T),
+    Redirect {
+        base: reqwest::Url,
+        location: Box<str>,
+    },
+}
+
+async fn fetch_with_redirects_inner<T, Fetch, FetchFuture, Validate, ValidateFuture>(
+    start_url: reqwest::Url,
+    mut fetch: Fetch,
+    mut validate_redirect: Validate,
+) -> Result<T, Error>
+where
+    Fetch: FnMut(reqwest::Url) -> FetchFuture,
+    FetchFuture: Future<Output = Result<FetchStep<T>, Error>>,
+    Validate: FnMut(reqwest::Url) -> ValidateFuture,
+    ValidateFuture: Future<Output = Result<reqwest::Url, Error>>,
+{
+    let mut current = start_url;
+    for hop in 0..=MAX_REDIRECTS {
+        tracing::trace!(hop, url = %current, "Fetching media URL");
+        match fetch(current.clone()).await? {
+            FetchStep::Complete(response) => return Ok(response),
+            FetchStep::Redirect { base, location } => {
+                if hop == MAX_REDIRECTS {
+                    tracing::warn!(
+                        max_redirects = MAX_REDIRECTS,
+                        "Too many redirects while downloading media"
+                    );
+                    return Err(Error::DownloadFailed {
+                        source: DownloadError::WriteFailed(std::io::Error::other(
+                            "too many redirects",
+                        )),
+                    });
+                }
+
+                let next = base
+                    .join(location.as_ref())
+                    .map_err(|e| Error::DownloadFailed {
+                        source: DownloadError::WriteFailed(std::io::Error::other(e)),
+                    })?;
+
+                tracing::trace!(hop, location, next = %next, "Following redirect");
+                current = validate_redirect(next).await?;
+            }
         }
-
-        return Ok(response);
     }
 
     Err(Error::DownloadFailed {
@@ -581,8 +619,14 @@ fn parse_bitrate_kbps(bit_rate: &str) -> Option<u32> {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{content_length_header_bytes, estimate_bitrate_kbps, parse_bitrate_kbps};
+    use super::{
+        FetchStep, MAX_REDIRECTS, content_length_header_bytes, estimate_bitrate_kbps,
+        fetch_with_redirects_inner, parse_bitrate_kbps,
+    };
+    use crate::pipeline::errors::{DownloadError, Error};
+    use reqwest::Url;
     use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn parses_content_length_header_bytes() {
@@ -610,5 +654,151 @@ mod tests {
     fn parses_ffprobe_bitrate_in_kbps() {
         assert_eq!(parse_bitrate_kbps("1234567"), Some(1235));
         assert_eq!(parse_bitrate_kbps("nope"), None);
+    }
+
+    #[tokio::test]
+    async fn fetch_with_redirects_returns_depth_error_at_limit() {
+        let start_url = Url::parse("https://pbs.twimg.com/media/start.mp4").expect("valid url");
+        let fetches = Arc::new(Mutex::new(Vec::new()));
+        let validations = Arc::new(Mutex::new(Vec::new()));
+
+        let err = fetch_with_redirects_inner(
+            start_url,
+            {
+                let fetches = Arc::clone(&fetches);
+                move |current| {
+                    let fetches = Arc::clone(&fetches);
+                    async move {
+                        fetches
+                            .lock()
+                            .expect("fetch log should not be poisoned")
+                            .push(current.as_str().to_string());
+
+                        Ok(FetchStep::<()>::Redirect {
+                            base: current,
+                            location: format!(
+                                "/media/hop-{}",
+                                fetches
+                                    .lock()
+                                    .expect("fetch log should not be poisoned")
+                                    .len()
+                            )
+                            .into(),
+                        })
+                    }
+                }
+            },
+            {
+                let validations = Arc::clone(&validations);
+                move |next| {
+                    validations
+                        .lock()
+                        .expect("validation log should not be poisoned")
+                        .push(next.to_string());
+                    let parsed = next;
+                    async move { Ok(parsed) }
+                }
+            },
+        )
+        .await
+        .expect_err("redirect chain should hit the hop limit");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("too many redirects"));
+        assert_eq!(
+            fetches
+                .lock()
+                .expect("fetch log should not be poisoned")
+                .len(),
+            MAX_REDIRECTS + 1
+        );
+        assert_eq!(
+            validations
+                .lock()
+                .expect("validation log should not be poisoned")
+                .len(),
+            MAX_REDIRECTS
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_with_redirects_revalidates_each_redirect_target_for_ssrf() {
+        let start_url = Url::parse("https://pbs.twimg.com/media/start.mp4").expect("valid url");
+        let fetches = Arc::new(Mutex::new(Vec::new()));
+        let validations = Arc::new(Mutex::new(Vec::new()));
+
+        let err = fetch_with_redirects_inner(
+            start_url,
+            {
+                let fetches = Arc::clone(&fetches);
+                move |current| {
+                    let fetches = Arc::clone(&fetches);
+                    async move {
+                        let mut fetches = fetches.lock().expect("fetch log should not be poisoned");
+                        let hop = fetches.len();
+                        fetches.push(current.as_str().to_string());
+
+                        let location = match hop {
+                            0 => "https://video.twimg.com/media/next.mp4",
+                            1 => "https://127.0.0.1/private.mp4",
+                            _ => {
+                                return Ok(FetchStep::Complete(()));
+                            }
+                        };
+
+                        Ok(FetchStep::<()>::Redirect {
+                            base: current,
+                            location: location.into(),
+                        })
+                    }
+                }
+            },
+            {
+                let validations = Arc::clone(&validations);
+                move |next| {
+                    validations
+                        .lock()
+                        .expect("validation log should not be poisoned")
+                        .push(next.to_string());
+
+                    let result = if next.as_str() == "https://127.0.0.1/private.mp4" {
+                        Err(Error::DownloadFailed {
+                            source: DownloadError::SsrfBlocked("ip literal rejected".to_string()),
+                        })
+                    } else {
+                        Ok(next)
+                    };
+
+                    async move { result }
+                }
+            },
+        )
+        .await
+        .expect_err("ssrf validation should reject the second redirect");
+
+        assert!(
+            err.to_string()
+                .contains("ssrf blocked: ip literal rejected")
+        );
+        assert_eq!(
+            fetches
+                .lock()
+                .expect("fetch log should not be poisoned")
+                .as_slice(),
+            [
+                "https://pbs.twimg.com/media/start.mp4",
+                "https://video.twimg.com/media/next.mp4",
+            ]
+        );
+        assert_eq!(
+            validations
+                .lock()
+                .expect("validation log should not be poisoned")
+                .as_slice(),
+            [
+                "https://video.twimg.com/media/next.mp4",
+                "https://127.0.0.1/private.mp4",
+            ]
+        );
     }
 }
