@@ -218,10 +218,24 @@ async fn format_status(app: &App) -> String {
     let dedup_entries = app.engine.dedup.cache_entries();
     let pending_writes = app.engine.dedup.pending_writes_len().await;
     let resolver_stats = app.engine.resolver.cache_stats();
+    let active_backend = app.engine.transcode_runtime.active_backend();
+    let configured_backend = app.engine.transcode_runtime.configured_backend();
+    let transcode_backend = if app.engine.transcode_runtime.software_fallback_active() {
+        format!(
+            "{} (runtime fallback from {})",
+            active_backend.encoder(),
+            configured_backend
+        )
+    } else if active_backend.is_hardware() {
+        format!("{} ({})", active_backend.encoder(), active_backend)
+    } else {
+        format!("{} (software)", active_backend.encoder())
+    };
 
     format!(
-        "Azalea is online.\nUptime: {}s\nQueue depth: {}\nTotal runs: {} ({} ok / {} failed)\nDedup cache: {} entries ({} pending writes)\nResolver cache: {} ok / {} negative",
+        "Azalea is online.\nUptime: {}s\nTranscode backend: {}\nQueue depth: {}\nTotal runs: {} ({} ok / {} failed)\nDedup cache: {} entries ({} pending writes)\nResolver cache: {} ok / {} negative",
         uptime.as_secs(),
+        transcode_backend,
         queue_depth,
         totals.total_runs,
         totals.successes,
@@ -291,6 +305,7 @@ mod tests {
 
     use super::*;
     use crate::config::{AppConfig, ApplicationId};
+    use azalea_core::config::HardwareAcceleration;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use twilight_model::id::marker::{ChannelMarker, UserMarker};
@@ -304,10 +319,15 @@ mod tests {
     }
 
     fn test_app() -> App {
+        test_app_with_hwacc(HardwareAcceleration::None)
+    }
+
+    fn test_app_with_hwacc(hardware_acceleration: HardwareAcceleration) -> App {
         let mut config = AppConfig {
             application_id: ApplicationId::new(1),
             ..Default::default()
         };
+        config.engine.transcode.hardware_acceleration = hardware_acceleration;
         config.engine.storage.temp_dir = unique_temp_path("discord-commands-temp");
         config.engine.storage.dedup_persistent = false;
         config.engine.storage.metrics_enabled = false;
@@ -418,5 +438,15 @@ mod tests {
             response,
             "please provide exactly one tweet URL per command."
         );
+    }
+
+    #[tokio::test]
+    async fn status_reports_runtime_hwacc_fallback() {
+        let app = test_app_with_hwacc(HardwareAcceleration::Vaapi);
+        assert!(app.engine.transcode_runtime.activate_software_fallback());
+
+        let status = format_status(&app).await;
+
+        assert!(status.contains("Transcode backend: libx264 (runtime fallback from vaapi)"));
     }
 }

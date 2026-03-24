@@ -6,4 +6,4 @@ pub mod storage;
 
 mod engine;
 
-pub use engine::Engine;
+pub use engine::{Engine, TranscodeRuntime};

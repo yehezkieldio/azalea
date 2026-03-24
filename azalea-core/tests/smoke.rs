@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used, unused_crate_dependencies)]
 
+use azalea_core::TranscodeRuntime;
 use azalea_core::concurrency::Permits;
 use azalea_core::config::{EngineSettings, StorageSettings, TranscodeSettings};
 use azalea_core::media::{TempFileCleanup, TweetId, parse_tweet_urls};
@@ -88,6 +89,7 @@ async fn pass_through_local_fixture_smoke_flow() {
         extension: "mp4".into(),
     };
     let permits = Permits::new(&settings.concurrency);
+    let runtime = TranscodeRuntime::new(settings.transcode.hardware_acceleration);
 
     let prepared = optimize::optimize(
         downloaded,
@@ -95,6 +97,7 @@ async fn pass_through_local_fixture_smoke_flow() {
         &permits,
         &temp_files,
         &settings,
+        &runtime,
         None,
     )
     .await

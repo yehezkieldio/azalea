@@ -1030,14 +1030,13 @@ fn is_timeout_error(error: &pipeline::Error) -> bool {
 
 fn is_hwacc_error(error: &pipeline::Error) -> bool {
     match error {
-        pipeline::Error::Core(core_pipeline::Error::TranscodeFailed { stderr_tail, .. }) => {
-            let stderr = stderr_tail.to_ascii_lowercase();
-            stderr.contains("vaapi")
-                || stderr.contains("nvenc")
-                || stderr.contains("videotoolbox")
-                || stderr.contains("cuda")
-                || stderr.contains("hwaccel")
-        }
+        pipeline::Error::Core(core_pipeline::Error::TranscodeFailed { stderr_tail, .. }) => [
+            HardwareAcceleration::Vaapi,
+            HardwareAcceleration::Nvenc,
+            HardwareAcceleration::VideoToolbox,
+        ]
+        .into_iter()
+        .any(|backend| backend.matches_failure_output(stderr_tail)),
         _ => false,
     }
 }

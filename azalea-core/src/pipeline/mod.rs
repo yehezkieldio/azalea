@@ -195,6 +195,7 @@ pub async fn run(
                     &engine.permits,
                     &engine.temp_files,
                     &engine.config,
+                    &engine.transcode_runtime,
                     progress.clone(),
                 )
                 .await

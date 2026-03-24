@@ -13,7 +13,8 @@
 //! Strategy selection avoids repeated probes by reusing downloaded metadata.
 
 use crate::concurrency::Permits;
-use crate::config::{EngineSettings, QualityPreset};
+use crate::config::{EngineSettings, HardwareAcceleration, QualityPreset, TranscodeSettings};
+use crate::engine::TranscodeRuntime;
 use crate::media::{TempFileCleanup, TempFileGuard};
 use crate::pipeline::disk::ensure_disk_space;
 use crate::pipeline::errors::{Error, TranscodeStage};
@@ -30,6 +31,12 @@ use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
 const MIN_PLAUSIBLE_SPLIT_COPY_SEGMENT_SECS: f64 = 10.0;
+
+struct TranscodeContext<'a> {
+    permits: &'a Permits,
+    config: &'a EngineSettings,
+    runtime: &'a TranscodeRuntime,
+}
 
 /// Prepare media for Discord upload, choosing the cheapest viable strategy.
 ///
@@ -49,8 +56,15 @@ pub async fn optimize(
     permits: &Permits,
     temp_files: &TempFileCleanup,
     config: &EngineSettings,
+    transcode_runtime: &TranscodeRuntime,
     progress_tx: Option<mpsc::Sender<Progress>>,
 ) -> Result<PreparedUpload, Error> {
+    let transcode = TranscodeContext {
+        permits,
+        config,
+        runtime: transcode_runtime,
+    };
+
     tracing::trace!(path = %downloaded.path.display(), "Entered optimize stage");
     tracing::info!(
         size_bytes = downloaded.size,
@@ -164,9 +178,8 @@ pub async fn optimize(
                     &downloaded,
                     duration,
                     balanced_height,
-                    permits,
                     temp_files,
-                    config,
+                    &transcode,
                     &mut dir_guard,
                 )
                 .instrument(tracing::info_span!(
@@ -187,9 +200,8 @@ pub async fn optimize(
                     &downloaded,
                     duration,
                     aggressive_height,
-                    permits,
                     temp_files,
-                    config,
+                    &transcode,
                     &mut dir_guard,
                 )
                 .instrument(tracing::info_span!(
@@ -229,19 +241,12 @@ pub async fn optimize(
                 downloaded._dir_guard = dir_guard;
             }
             TranscodeStrategy::SplitTranscode => {
-                return split_video(
-                    downloaded,
-                    duration,
-                    permits,
-                    temp_files,
-                    config,
-                    progress_tx,
-                )
-                .instrument(tracing::info_span!(
-                    "optimize.strategy.split_transcode",
-                    duration_secs = duration
-                ))
-                .await;
+                return split_video(downloaded, duration, temp_files, &transcode, progress_tx)
+                    .instrument(tracing::info_span!(
+                        "optimize.strategy.split_transcode",
+                        duration_secs = duration
+                    ))
+                    .await;
             }
             TranscodeStrategy::PassThrough | TranscodeStrategy::ImageCompress => {}
         }
@@ -506,23 +511,13 @@ async fn try_transcode(
     downloaded: &DownloadedFile,
     duration: f64,
     max_height: Option<u32>,
-    permits: &Permits,
     temp_files: &TempFileCleanup,
-    config: &EngineSettings,
+    ctx: &TranscodeContext<'_>,
     dir_guard: &mut Option<TempFileGuard>,
 ) -> Result<Option<PreparedUpload>, Error> {
     let transcode_path = transcode_path(&downloaded.path);
-    match transcode(
-        &downloaded.path,
-        &transcode_path,
-        duration,
-        max_height,
-        permits,
-        config,
-    )
-    .await
-    {
-        Ok(size) if size <= config.transcode.max_upload_bytes => {
+    match transcode(&downloaded.path, &transcode_path, duration, max_height, ctx).await {
+        Ok(size) if size <= ctx.config.transcode.max_upload_bytes => {
             // Success path: keep the transcode output and attach temp guards.
             let dir_guard = dir_guard
                 .take()
@@ -585,31 +580,33 @@ async fn transcode(
     output: &Path,
     duration: f64,
     max_height: Option<u32>,
-    permits: &Permits,
-    config: &EngineSettings,
+    ctx: &TranscodeContext<'_>,
 ) -> Result<u64, Error> {
-    let _permit = permits
+    let _permit = ctx
+        .permits
         .transcode
         .acquire()
         .await
         .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
 
-    let params = BitrateParams::compute(&config.transcode, duration)?;
-    let args = ffmpeg::transcode_args(
-        input,
-        output,
-        params.video_bitrate_kbps,
-        params.audio_bitrate_kbps,
-        max_height,
-        &config.transcode,
-        config.concurrency.transcode,
-    );
-
-    ffmpeg::execute(
-        &config.binaries.ffmpeg,
-        &args,
-        Duration::from_secs(config.transcode.ffmpeg_timeout_secs),
+    let params = BitrateParams::compute(&ctx.config.transcode, duration)?;
+    execute_with_hwacc_fallback(
+        &ctx.config.binaries.ffmpeg,
+        Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
         TranscodeStage::Transcode,
+        &ctx.config.transcode,
+        ctx.runtime,
+        |active_settings| {
+            ffmpeg::transcode_args(
+                input,
+                output,
+                params.video_bitrate_kbps,
+                params.audio_bitrate_kbps,
+                max_height,
+                active_settings,
+                ctx.config.concurrency.transcode,
+            )
+        },
     )
     .await?;
 
@@ -619,21 +616,20 @@ async fn transcode(
 async fn split_video(
     mut downloaded: DownloadedFile,
     duration: f64,
-    permits: &Permits,
     temp_files: &TempFileCleanup,
-    config: &EngineSettings,
+    ctx: &TranscodeContext<'_>,
     progress_tx: Option<mpsc::Sender<Progress>>,
 ) -> Result<PreparedUpload, Error> {
     let dir_guard = downloaded
         ._dir_guard
         .take()
         .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
-    let target_segment_size =
-        (config.transcode.max_upload_bytes as f64 * config.transcode.split_target_ratio) as u64;
+    let target_segment_size = (ctx.config.transcode.max_upload_bytes as f64
+        * ctx.config.transcode.split_target_ratio) as u64;
 
     let segment_params = BitrateParams::compute_for_split(
-        &config.transcode,
-        config.transcode.max_single_video_duration_secs as f64,
+        &ctx.config.transcode,
+        ctx.config.transcode.max_single_video_duration_secs as f64,
     )?;
 
     let target_kbps = segment_params.video_bitrate_kbps + segment_params.audio_bitrate_kbps;
@@ -642,10 +638,10 @@ async fn split_video(
     // Estimate a segment duration that keeps each piece within upload size.
     let segment_duration = (target_segment_size as f64 * 8.0 / target_bps)
         .max(10.0)
-        .min(config.transcode.max_single_video_duration_secs as f64);
+        .min(ctx.config.transcode.max_single_video_duration_secs as f64);
 
     let num_segments = (duration / segment_duration).ceil() as u32;
-    let use_parallel = num_segments >= config.pipeline.parallel_segment_threshold;
+    let use_parallel = num_segments >= ctx.config.pipeline.parallel_segment_threshold;
 
     tracing::info!(
         segment_duration_secs = segment_duration,
@@ -660,9 +656,8 @@ async fn split_video(
             downloaded,
             segment_duration,
             &segment_params,
-            permits,
             temp_files,
-            config,
+            ctx,
             progress_tx,
             dir_guard,
         )
@@ -672,9 +667,8 @@ async fn split_video(
             downloaded,
             segment_duration,
             &segment_params,
-            permits,
             temp_files,
-            config,
+            ctx,
             dir_guard,
         )
         .await
@@ -685,16 +679,16 @@ async fn split_serial(
     downloaded: DownloadedFile,
     segment_duration: f64,
     segment_params: &BitrateParams,
-    permits: &Permits,
     temp_files: &TempFileCleanup,
-    config: &EngineSettings,
+    ctx: &TranscodeContext<'_>,
     dir_guard: TempFileGuard,
 ) -> Result<PreparedUpload, Error> {
     tracing::trace!(
         segment_duration_secs = segment_duration,
         "Starting serial split"
     );
-    let _permit = permits
+    let _permit = ctx
+        .permits
         .transcode
         .acquire()
         .await
@@ -709,21 +703,23 @@ async fn split_serial(
         .path
         .with_file_name(format!("{}_seg%03d.mp4", stem));
 
-    let args = ffmpeg::split_args(
-        &downloaded.path,
-        &output_pattern,
-        segment_duration,
-        segment_params.video_bitrate_kbps,
-        segment_params.audio_bitrate_kbps,
-        &config.transcode,
-        config.concurrency.transcode,
-    );
-
-    ffmpeg::execute(
-        &config.binaries.ffmpeg,
-        &args,
-        Duration::from_secs(config.transcode.ffmpeg_timeout_secs),
+    execute_with_hwacc_fallback(
+        &ctx.config.binaries.ffmpeg,
+        Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
         TranscodeStage::Split,
+        &ctx.config.transcode,
+        ctx.runtime,
+        |active_settings| {
+            ffmpeg::split_args(
+                &downloaded.path,
+                &output_pattern,
+                segment_duration,
+                segment_params.video_bitrate_kbps,
+                segment_params.audio_bitrate_kbps,
+                active_settings,
+                ctx.config.concurrency.transcode,
+            )
+        },
     )
     .await?;
 
@@ -749,9 +745,8 @@ async fn split_parallel(
     downloaded: DownloadedFile,
     segment_duration: f64,
     segment_params: &BitrateParams,
-    permits: &Permits,
     temp_files: &TempFileCleanup,
-    config: &EngineSettings,
+    ctx: &TranscodeContext<'_>,
     progress_tx: Option<mpsc::Sender<Progress>>,
     dir_guard: TempFileGuard,
 ) -> Result<PreparedUpload, Error> {
@@ -771,7 +766,8 @@ async fn split_parallel(
 
     {
         // First pass: split without re-encoding for speed and determinism.
-        let _permit = permits
+        let _permit = ctx
+            .permits
             .transcode
             .acquire()
             .await
@@ -779,9 +775,9 @@ async fn split_parallel(
 
         let split_args = ffmpeg::split_copy_args(&downloaded.path, &raw_pattern, segment_duration);
         ffmpeg::execute(
-            &config.binaries.ffmpeg,
+            &ctx.config.binaries.ffmpeg,
             &split_args,
-            Duration::from_secs(config.transcode.ffmpeg_timeout_secs),
+            Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
             TranscodeStage::Split,
         )
         .await?;
@@ -814,7 +810,12 @@ async fn split_parallel(
 
     let mut join_set = tokio::task::JoinSet::new();
 
-    let ffmpeg_path = config.binaries.ffmpeg.clone();
+    let ffmpeg_path = ctx.config.binaries.ffmpeg.clone();
+    let transcode_settings = ctx.config.transcode.clone();
+    let transcode_runtime = ctx.runtime.clone();
+    let transcode_concurrency = ctx.config.concurrency.transcode;
+    let segment_video_kbps = segment_params.video_bitrate_kbps;
+    let segment_audio_kbps = segment_params.audio_bitrate_kbps;
     for (idx, raw_segment) in raw_segments.iter().enumerate() {
         let out_path = output_segments.get(idx).cloned().unwrap_or_else(|| {
             downloaded
@@ -822,19 +823,13 @@ async fn split_parallel(
                 .with_file_name(format!("{}_seg{:03}.mp4", stem, idx))
         });
 
-        let args = ffmpeg::transcode_args(
-            &raw_segment.path,
-            &out_path,
-            segment_params.video_bitrate_kbps,
-            segment_params.audio_bitrate_kbps,
-            None,
-            &config.transcode,
-            config.concurrency.transcode,
-        );
-
-        let permit = Arc::clone(&permits.transcode);
-        let timeout = Duration::from_secs(config.transcode.ffmpeg_timeout_secs);
+        let permit = Arc::clone(&ctx.permits.transcode);
+        let timeout = Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs);
         let raw_path_clone = raw_segment.path.clone();
+        let input_path = raw_segment.path.clone();
+        let output_path = out_path.clone();
+        let transcode_settings = transcode_settings.clone();
+        let transcode_runtime = transcode_runtime.clone();
 
         let ffmpeg_path = ffmpeg_path.clone();
         join_set.spawn(async move {
@@ -843,7 +838,25 @@ async fn split_parallel(
                 .acquire()
                 .await
                 .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
-            let result = ffmpeg::execute(&ffmpeg_path, &args, timeout, TranscodeStage::Split).await;
+            let result = execute_with_hwacc_fallback(
+                &ffmpeg_path,
+                timeout,
+                TranscodeStage::Split,
+                &transcode_settings,
+                &transcode_runtime,
+                |active_settings| {
+                    ffmpeg::transcode_args(
+                        &input_path,
+                        &output_path,
+                        segment_video_kbps,
+                        segment_audio_kbps,
+                        None,
+                        active_settings,
+                        transcode_concurrency,
+                    )
+                },
+            )
+            .await;
             let _ = fs::remove_file(&raw_path_clone).await;
             result?;
             let size = fs::metadata(&out_path).await?.len();
@@ -913,6 +926,54 @@ async fn split_parallel(
 
     tracing::info!(segments = parts.len(), "Parallel split completed");
     Ok(PreparedUpload::split(parts, dir_guard))
+}
+
+async fn execute_with_hwacc_fallback<F>(
+    ffmpeg_path: &Path,
+    timeout: Duration,
+    stage: TranscodeStage,
+    base_settings: &TranscodeSettings,
+    transcode_runtime: &TranscodeRuntime,
+    build_args: F,
+) -> Result<(), Error>
+where
+    F: Fn(&TranscodeSettings) -> ffmpeg::Args,
+{
+    let active_settings = transcode_runtime.effective_settings(base_settings);
+    let args = build_args(&active_settings);
+
+    match ffmpeg::execute(ffmpeg_path, &args, timeout, stage).await {
+        Ok(()) => Ok(()),
+        Err(error) if should_retry_with_software(&error, active_settings.hardware_acceleration) => {
+            let latched = transcode_runtime.activate_software_fallback();
+            let retry_settings = transcode_runtime.effective_settings(base_settings);
+
+            tracing::warn!(
+                ?stage,
+                error = %error,
+                configured_backend = %transcode_runtime.configured_backend(),
+                failed_backend = %active_settings.hardware_acceleration,
+                fallback_encoder = retry_settings.hardware_acceleration.encoder(),
+                latched,
+                "Hardware encoder failed; retrying with software encoder"
+            );
+
+            let retry_args = build_args(&retry_settings);
+            ffmpeg::execute(ffmpeg_path, &retry_args, timeout, stage).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn should_retry_with_software(error: &Error, backend: HardwareAcceleration) -> bool {
+    if !backend.is_hardware() {
+        return false;
+    }
+
+    match error {
+        Error::TranscodeFailed { stderr_tail, .. } => backend.matches_failure_output(stderr_tail),
+        _ => false,
+    }
 }
 
 async fn try_split_copy(
@@ -1090,13 +1151,23 @@ fn transcode_path(input: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{TranscodeStrategy, build_strategy_plan, split_copy_is_plausible};
-    use crate::config::EngineSettings;
+    #![allow(clippy::expect_used)]
+
+    use super::{
+        TranscodeStrategy, build_strategy_plan, execute_with_hwacc_fallback,
+        split_copy_is_plausible,
+    };
+    use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings};
+    use crate::engine::TranscodeRuntime;
     use crate::media::TempFileCleanup;
     use crate::pipeline::types::{
         AudioCodec, DownloadedFile, MediaContainer, MediaFacts, VideoCodec,
     };
+    use crate::pipeline::{self, errors::TranscodeStage};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn downloaded_file(path: &str, size: u64, duration: f64, facts: MediaFacts) -> DownloadedFile {
         let temp_files = TempFileCleanup::new();
@@ -1109,6 +1180,14 @@ mod tests {
             _guard: temp_files.guard(PathBuf::from(path)),
             _dir_guard: None,
         }
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("azalea-{name}-{nanos}"))
     }
 
     #[test]
@@ -1211,5 +1290,52 @@ mod tests {
         );
 
         assert!(split_copy_is_plausible(&downloaded, 20.0, &config).is_none());
+    }
+
+    #[tokio::test]
+    async fn hardware_failure_retries_with_software_encoder() {
+        let script_path = unique_temp_path("ffmpeg-fallback.sh");
+        let log_path = unique_temp_path("ffmpeg-fallback.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \" $* \" in\n  *\" h264_vaapi \"*)\n    printf '%s\\n' 'vaapi init failed' >&2\n    exit 1\n    ;;\n  *\" libx264 \"*)\n    exit 0\n    ;;\nesac\nprintf '%s\\n' 'unexpected encoder args' >&2\nexit 2\n",
+            log_path.display()
+        );
+        fs::write(&script_path, script).expect("write ffmpeg stub");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("stat ffmpeg stub")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod ffmpeg stub");
+
+        let runtime = TranscodeRuntime::new(HardwareAcceleration::Vaapi);
+        let settings = TranscodeSettings {
+            hardware_acceleration: HardwareAcceleration::Vaapi,
+            ..TranscodeSettings::default()
+        };
+
+        execute_with_hwacc_fallback(
+            &script_path,
+            Duration::from_secs(1),
+            TranscodeStage::Transcode,
+            &settings,
+            &runtime,
+            |active_settings| {
+                let mut args = pipeline::ffmpeg::Args::new();
+                args.push("-c:v".into());
+                args.push(active_settings.hardware_acceleration.encoder().into());
+                args
+            },
+        )
+        .await
+        .expect("fallback retry should succeed");
+
+        let invocations = fs::read_to_string(&log_path).expect("read ffmpeg invocation log");
+        assert!(invocations.contains("h264_vaapi"));
+        assert!(invocations.contains("libx264"));
+        assert_eq!(runtime.active_backend(), HardwareAcceleration::None);
+        assert!(runtime.software_fallback_active());
+
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_file(log_path);
     }
 }

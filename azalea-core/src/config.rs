@@ -67,6 +67,7 @@ impl QualityPreset {
 }
 
 /// Hardware acceleration provider.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +84,33 @@ pub enum HardwareAcceleration {
 }
 
 impl HardwareAcceleration {
+    pub const fn from_repr(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::Nvenc),
+            2 => Some(Self::Vaapi),
+            3 => Some(Self::VideoToolbox),
+            _ => None,
+        }
+    }
+
+    pub const fn as_repr(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn is_hardware(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Nvenc => "nvenc",
+            Self::Vaapi => "vaapi",
+            Self::VideoToolbox => "videotoolbox",
+        }
+    }
+
     /// Encoder name passed to ffmpeg for the selected acceleration backend.
     pub fn encoder(self) -> &'static str {
         match self {
@@ -91,6 +119,29 @@ impl HardwareAcceleration {
             Self::Vaapi => "h264_vaapi",
             Self::VideoToolbox => "h264_videotoolbox",
         }
+    }
+
+    /// Best-effort classifier for ffmpeg stderr when hardware encode setup fails.
+    pub fn matches_failure_output(self, stderr: &str) -> bool {
+        if !self.is_hardware() {
+            return false;
+        }
+
+        let stderr = stderr.to_ascii_lowercase();
+        match self {
+            Self::None => false,
+            Self::Nvenc => {
+                stderr.contains("nvenc") || stderr.contains("cuda") || stderr.contains("hwaccel")
+            }
+            Self::Vaapi => stderr.contains("vaapi") || stderr.contains("hwaccel"),
+            Self::VideoToolbox => stderr.contains("videotoolbox") || stderr.contains("hwaccel"),
+        }
+    }
+}
+
+impl std::fmt::Display for HardwareAcceleration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
