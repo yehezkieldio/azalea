@@ -33,6 +33,7 @@ use mimalloc::MiMalloc;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -457,7 +458,7 @@ fn validate_temp_dir_writable(temp_dir: &Path) -> anyhow::Result<()> {
         std::process::id()
     ));
 
-    std::fs::OpenOptions::new()
+    let mut probe_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&probe_path)
@@ -470,16 +471,52 @@ fn validate_temp_dir_writable(temp_dir: &Path) -> anyhow::Result<()> {
             )
         })?;
 
-    std::fs::remove_file(&probe_path).map_err(|e| {
+    let write_result = probe_file.write_all(b"azalea-temp-dir-probe").map_err(|e| {
+        anyhow::anyhow!(
+            "temp dir '{}' is not writable: failed to write probe file '{}': {}",
+            temp_dir.display(),
+            probe_path.display(),
+            e
+        )
+    });
+    if let Err(error) = write_result {
+        drop(probe_file);
+        return Err(match remove_probe_file(temp_dir, &probe_path) {
+            Ok(()) => error,
+            Err(cleanup_error) => anyhow::anyhow!("{error}; {cleanup_error}"),
+        });
+    }
+
+    let sync_result = probe_file.sync_all().map_err(|e| {
+        anyhow::anyhow!(
+            "temp dir '{}' is not writable: failed to sync probe file '{}': {}",
+            temp_dir.display(),
+            probe_path.display(),
+            e
+        )
+    });
+    drop(probe_file);
+    if let Err(error) = sync_result {
+        return Err(match remove_probe_file(temp_dir, &probe_path) {
+            Ok(()) => error,
+            Err(cleanup_error) => anyhow::anyhow!("{error}; {cleanup_error}"),
+        });
+    }
+
+    remove_probe_file(temp_dir, &probe_path)?;
+
+    Ok(())
+}
+
+fn remove_probe_file(temp_dir: &Path, probe_path: &Path) -> anyhow::Result<()> {
+    std::fs::remove_file(probe_path).map_err(|e| {
         anyhow::anyhow!(
             "temp dir '{}' failed writability probe cleanup for '{}': {}",
             temp_dir.display(),
             probe_path.display(),
             e
         )
-    })?;
-
-    Ok(())
+    })
 }
 
 /// Raise the file descriptor soft limit where possible.
@@ -1348,6 +1385,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
 
         validate_temp_dir_writable(&dir).expect("writable temp dir should pass");
+        let mut entries = std::fs::read_dir(&dir).expect("read temp dir entries");
+        assert!(entries.next().is_none(), "probe file should be removed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
