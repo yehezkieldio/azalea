@@ -12,6 +12,7 @@
 use crate::config::{HardwareAcceleration, TranscodeSettings};
 use crate::pipeline::errors::{Error, TranscodeStage};
 use crate::pipeline::process::{SubprocessGuard, kill_process_group, read_bounded};
+use crate::pipeline::types::{AudioCodec, MediaFacts, VideoCodec};
 use smallvec::SmallVec;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -44,6 +45,12 @@ fn arg_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
         }
         args.get(index + 1).and_then(|value| value.to_str())
     })
+}
+
+/// Stream-copy paths write MP4 outputs, so only MP4-friendly codecs qualify.
+pub fn mp4_stream_copy_viable(facts: MediaFacts) -> bool {
+    matches!(facts.video_codec, VideoCodec::H264)
+        && matches!(facts.audio_codec, AudioCodec::Aac | AudioCodec::None)
 }
 
 fn push_video_encoding_args(
@@ -492,5 +499,24 @@ mod tests {
         let as_text = to_strings(&args);
         assert!(as_text.windows(2).any(|w| w == ["-f", "segment"]));
         assert!(as_text.windows(2).any(|w| w == ["-segment_time", "11.5"]));
+    }
+
+    #[test]
+    fn mp4_stream_copy_viability_requires_h264_and_aac_or_silence() {
+        assert!(mp4_stream_copy_viable(MediaFacts {
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Aac,
+            ..MediaFacts::default()
+        }));
+        assert!(mp4_stream_copy_viable(MediaFacts {
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::None,
+            ..MediaFacts::default()
+        }));
+        assert!(!mp4_stream_copy_viable(MediaFacts {
+            video_codec: VideoCodec::Vp9,
+            audio_codec: AudioCodec::Opus,
+            ..MediaFacts::default()
+        }));
     }
 }

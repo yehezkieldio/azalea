@@ -27,6 +27,8 @@ use tokio::fs;
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
+const MIN_PLAUSIBLE_SPLIT_COPY_SEGMENT_SECS: f64 = 10.0;
+
 /// Prepare media for Discord upload, choosing the cheapest viable strategy.
 ///
 /// ## Preconditions
@@ -108,18 +110,16 @@ pub async fn optimize(
         "Computed transcode targets"
     );
 
-    // Ordered from cheapest to most expensive in CPU and latency.
-    let mut strategies = vec![
-        TranscodeStrategy::Remux,
-        TranscodeStrategy::TranscodeBalanced,
-    ];
-    if aggressive_height != balanced_height {
-        strategies.push(TranscodeStrategy::TranscodeAggressive);
-    }
-    strategies.push(TranscodeStrategy::SplitCopy);
-    strategies.push(TranscodeStrategy::SplitTranscode);
+    let strategy_plan = build_strategy_plan(
+        &downloaded,
+        duration,
+        balanced_height,
+        aggressive_height,
+        config,
+    );
+    let split_copy_plan = strategy_plan.split_copy;
 
-    for strategy in strategies {
+    for strategy in strategy_plan.strategies {
         tracing::info!(strategy = %strategy, "Using transcode strategy");
         match strategy {
             TranscodeStrategy::Remux => {
@@ -205,9 +205,11 @@ pub async fn optimize(
             }
             TranscodeStrategy::SplitCopy => {
                 let mut dir_guard = downloaded._dir_guard.take();
+                let split_copy_plan = split_copy_plan
+                    .ok_or_else(|| Error::Io(std::io::Error::other("missing split-copy plan")))?;
                 let result = try_split_copy(
                     &downloaded,
-                    duration,
+                    split_copy_plan,
                     permits,
                     temp_files,
                     config,
@@ -215,7 +217,9 @@ pub async fn optimize(
                 )
                 .instrument(tracing::info_span!(
                     "optimize.strategy.split_copy",
-                    duration_secs = duration
+                    duration_secs = duration,
+                    segment_duration_secs = split_copy_plan.segment_duration,
+                    estimated_segments = split_copy_plan.estimated_segments
                 ))
                 .await?;
                 if let Some(result) = result {
@@ -278,6 +282,100 @@ impl std::fmt::Display for TranscodeStrategy {
         };
         write!(f, "{}", label)
     }
+}
+
+#[derive(Debug, Clone)]
+struct StrategyPlan {
+    strategies: Vec<TranscodeStrategy>,
+    split_copy: Option<SplitCopyPlan>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SplitCopyPlan {
+    segment_duration: f64,
+    estimated_segments: u32,
+}
+
+fn build_strategy_plan(
+    downloaded: &DownloadedFile,
+    duration: f64,
+    balanced_height: Option<u32>,
+    aggressive_height: Option<u32>,
+    config: &EngineSettings,
+) -> StrategyPlan {
+    let remux_viable = remux_is_plausible(downloaded);
+    let single_transcode_viable = single_transcode_is_plausible(duration, config);
+    let split_copy = split_copy_is_plausible(downloaded, duration, config);
+
+    let mut strategies = Vec::with_capacity(5);
+
+    if remux_viable {
+        strategies.push(TranscodeStrategy::Remux);
+    } else {
+        tracing::trace!(
+            container = ?downloaded.facts.container,
+            video_codec = ?downloaded.facts.video_codec,
+            audio_codec = ?downloaded.facts.audio_codec,
+            "Skipping remux preflight"
+        );
+    }
+
+    if single_transcode_viable {
+        strategies.push(TranscodeStrategy::TranscodeBalanced);
+        if aggressive_height != balanced_height {
+            strategies.push(TranscodeStrategy::TranscodeAggressive);
+        }
+    } else {
+        tracing::trace!(
+            duration_secs = duration,
+            "Skipping full-file transcode preflight"
+        );
+    }
+
+    if let Some(plan) = split_copy {
+        tracing::trace!(
+            segment_duration_secs = plan.segment_duration,
+            estimated_segments = plan.estimated_segments,
+            "Split-copy preflight succeeded"
+        );
+        strategies.push(TranscodeStrategy::SplitCopy);
+    } else {
+        tracing::trace!(
+            bitrate_kbps = downloaded.facts.bitrate_kbps,
+            duration_secs = duration,
+            "Skipping split-copy preflight"
+        );
+    }
+
+    strategies.push(TranscodeStrategy::SplitTranscode);
+
+    StrategyPlan {
+        strategies,
+        split_copy,
+    }
+}
+
+fn remux_is_plausible(downloaded: &DownloadedFile) -> bool {
+    ffmpeg::mp4_stream_copy_viable(downloaded.facts) && !downloaded.facts.container.is_mp4_family()
+}
+
+fn single_transcode_is_plausible(duration: f64, config: &EngineSettings) -> bool {
+    match BitrateParams::compute(&config.transcode, duration) {
+        Ok(params) => params.video_bitrate_kbps >= config.transcode.min_bitrate_kbps,
+        Err(_) => false,
+    }
+}
+
+fn split_copy_is_plausible(
+    downloaded: &DownloadedFile,
+    duration: f64,
+    config: &EngineSettings,
+) -> Option<SplitCopyPlan> {
+    if !ffmpeg::mp4_stream_copy_viable(downloaded.facts) {
+        return None;
+    }
+
+    copy_segment_plan(downloaded, duration, config)
 }
 
 async fn optimize_image(
@@ -807,18 +905,15 @@ async fn split_parallel(
 
 async fn try_split_copy(
     downloaded: &DownloadedFile,
-    duration: f64,
+    plan: SplitCopyPlan,
     permits: &Permits,
     temp_files: &TempFileCleanup,
     config: &EngineSettings,
     dir_guard: &mut Option<TempFileGuard>,
 ) -> Result<Option<PreparedUpload>, Error> {
-    let Some(segment_duration) = copy_segment_duration(downloaded, duration, config) else {
-        return Ok(None);
-    };
-
     tracing::trace!(
-        segment_duration_secs = segment_duration,
+        segment_duration_secs = plan.segment_duration,
+        estimated_segments = plan.estimated_segments,
         "Trying split-copy strategy"
     );
 
@@ -832,7 +927,7 @@ async fn try_split_copy(
         .path
         .with_file_name(format!("{}%03d.mp4", prefix));
 
-    let args = ffmpeg::split_copy_args(&downloaded.path, &output_pattern, segment_duration);
+    let args = ffmpeg::split_copy_args(&downloaded.path, &output_pattern, plan.segment_duration);
     let _permit = permits
         .transcode
         .acquire()
@@ -876,18 +971,18 @@ async fn try_split_copy(
     }))
 }
 
-fn copy_segment_duration(
+fn copy_segment_plan(
     downloaded: &DownloadedFile,
     duration: f64,
     config: &EngineSettings,
-) -> Option<f64> {
+) -> Option<SplitCopyPlan> {
     if duration <= 0.0 {
         return None;
     }
 
-    // Estimate bitrate from source size to size copy-split segments.
-    let bytes_per_sec = downloaded.size as f64 / duration;
-    if bytes_per_sec <= 0.0 {
+    let bitrate_kbps = downloaded.facts.bitrate_kbps?;
+    let bytes_per_sec = bitrate_kbps as f64 * 1000.0 / 8.0;
+    if !(bytes_per_sec.is_finite() && bytes_per_sec > 0.0) {
         return None;
     }
 
@@ -895,7 +990,9 @@ fn copy_segment_duration(
         (config.transcode.max_upload_bytes as f64 * config.transcode.split_target_ratio).max(1.0);
     let mut segment_duration = target_segment_size / bytes_per_sec;
 
-    if !segment_duration.is_finite() || segment_duration <= 0.5 {
+    // Copy-split sizing becomes too noisy below this threshold because keyframe
+    // alignment and mux overhead dominate the estimate.
+    if !segment_duration.is_finite() || segment_duration < MIN_PLAUSIBLE_SPLIT_COPY_SEGMENT_SECS {
         return None;
     }
 
@@ -908,7 +1005,10 @@ fn copy_segment_duration(
         return None;
     }
 
-    Some(segment_duration)
+    Some(SplitCopyPlan {
+        segment_duration,
+        estimated_segments: (duration / segment_duration).ceil() as u32,
+    })
 }
 
 async fn collect_segments(path: &Path, prefix: &str) -> Result<Vec<PathBuf>, Error> {
@@ -958,4 +1058,130 @@ fn remux_path(input: &Path) -> PathBuf {
 fn transcode_path(input: &Path) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
     input.with_file_name(format!("{}_transcode.mp4", stem))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TranscodeStrategy, build_strategy_plan, split_copy_is_plausible};
+    use crate::config::EngineSettings;
+    use crate::media::TempFileCleanup;
+    use crate::pipeline::types::{
+        AudioCodec, DownloadedFile, MediaContainer, MediaFacts, VideoCodec,
+    };
+    use std::path::PathBuf;
+
+    fn downloaded_file(path: &str, size: u64, duration: f64, facts: MediaFacts) -> DownloadedFile {
+        let temp_files = TempFileCleanup::new();
+        DownloadedFile {
+            path: PathBuf::from(path),
+            size,
+            duration: Some(duration),
+            resolution: Some((1920, 1080)),
+            facts,
+            _guard: temp_files.guard(PathBuf::from(path)),
+            _dir_guard: None,
+        }
+    }
+
+    #[test]
+    fn strategy_plan_skips_remux_for_already_h264_mp4() {
+        let config = EngineSettings::default();
+        let downloaded = downloaded_file(
+            "already-h264.mp4",
+            20 * 1024 * 1024,
+            60.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(2_800),
+            },
+        );
+
+        let plan = build_strategy_plan(&downloaded, 60.0, Some(720), Some(480), &config);
+
+        assert_eq!(
+            plan.strategies,
+            vec![
+                TranscodeStrategy::TranscodeBalanced,
+                TranscodeStrategy::TranscodeAggressive,
+                TranscodeStrategy::SplitCopy,
+                TranscodeStrategy::SplitTranscode,
+            ]
+        );
+        assert!(plan.split_copy.is_some());
+    }
+
+    #[test]
+    fn strategy_plan_skips_stream_copy_for_incompatible_codecs() {
+        let config = EngineSettings::default();
+        let downloaded = downloaded_file(
+            "vp9.webm",
+            20 * 1024 * 1024,
+            60.0,
+            MediaFacts {
+                container: MediaContainer::Webm,
+                video_codec: VideoCodec::Vp9,
+                audio_codec: AudioCodec::Opus,
+                bitrate_kbps: Some(2_800),
+            },
+        );
+
+        let plan = build_strategy_plan(&downloaded, 60.0, Some(720), Some(480), &config);
+
+        assert_eq!(
+            plan.strategies,
+            vec![
+                TranscodeStrategy::TranscodeBalanced,
+                TranscodeStrategy::TranscodeAggressive,
+                TranscodeStrategy::SplitTranscode,
+            ]
+        );
+        assert!(plan.split_copy.is_none());
+    }
+
+    #[test]
+    fn strategy_plan_skips_full_transcodes_for_long_oversized_video() {
+        let config = EngineSettings::default();
+        let downloaded = downloaded_file(
+            "long.mp4",
+            120 * 1024 * 1024,
+            720.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+        );
+
+        let plan = build_strategy_plan(&downloaded, 720.0, Some(720), Some(480), &config);
+
+        assert_eq!(
+            plan.strategies,
+            vec![
+                TranscodeStrategy::SplitCopy,
+                TranscodeStrategy::SplitTranscode
+            ]
+        );
+        assert!(plan.split_copy.is_some());
+    }
+
+    #[test]
+    fn split_copy_preflight_rejects_tiny_segments() {
+        let config = EngineSettings::default();
+        let downloaded = downloaded_file(
+            "tiny-segments.mp4",
+            80 * 1024 * 1024,
+            20.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(32_000),
+            },
+        );
+
+        assert!(split_copy_is_plausible(&downloaded, 20.0, &config).is_none());
+    }
 }

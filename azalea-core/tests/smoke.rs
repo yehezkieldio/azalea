@@ -4,7 +4,9 @@ use azalea_core::concurrency::Permits;
 use azalea_core::config::{EngineSettings, StorageSettings, TranscodeSettings};
 use azalea_core::media::{TempFileCleanup, TweetId, parse_tweet_urls};
 use azalea_core::pipeline::optimize;
-use azalea_core::pipeline::types::{DownloadedFile, MediaType, PreparedUpload, ResolvedMedia};
+use azalea_core::pipeline::types::{
+    DownloadedFile, MediaFacts, MediaType, PreparedUpload, ResolvedMedia,
+};
 use azalea_core::storage::DedupCache;
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,6 +76,7 @@ async fn pass_through_local_fixture_smoke_flow() {
         size: fixture_bytes.len() as u64,
         duration: Some(1.0),
         resolution: Some((640, 360)),
+        facts: MediaFacts::from_extension("mp4"),
         _guard: temp_files.guard(fixture_path.clone()),
         _dir_guard: Some(temp_files.guard(fixture_dir)),
     };

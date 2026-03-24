@@ -57,6 +57,123 @@ pub struct ResolvedMedia {
     pub extension: Box<str>,
 }
 
+/// Container identity used to preflight stream-copy strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaContainer {
+    Mp4,
+    Mov,
+    Webm,
+    Matroska,
+    Avi,
+    MpegTs,
+    Gif,
+    #[default]
+    Unknown,
+}
+
+impl MediaContainer {
+    pub fn from_extension(ext: &str) -> Self {
+        match sanitize_extension(ext).as_str() {
+            "mp4" => Self::Mp4,
+            "mov" => Self::Mov,
+            "webm" => Self::Webm,
+            "mkv" => Self::Matroska,
+            "avi" => Self::Avi,
+            "ts" => Self::MpegTs,
+            "gif" => Self::Gif,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn from_ffprobe_name(format_name: &str) -> Self {
+        for name in format_name.split(',') {
+            match name.trim() {
+                "mp4" | "m4a" | "3gp" | "3g2" | "mj2" => return Self::Mp4,
+                "mov" => return Self::Mov,
+                "webm" => return Self::Webm,
+                "matroska" => return Self::Matroska,
+                "avi" => return Self::Avi,
+                "mpegts" => return Self::MpegTs,
+                "gif" => return Self::Gif,
+                _ => {}
+            }
+        }
+
+        Self::Unknown
+    }
+
+    pub fn is_mp4_family(self) -> bool {
+        matches!(self, Self::Mp4 | Self::Mov)
+    }
+}
+
+/// Video codec identity used to gate stream-copy remux and split paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoCodec {
+    H264,
+    H265,
+    Vp8,
+    Vp9,
+    Av1,
+    #[default]
+    Other,
+}
+
+impl VideoCodec {
+    pub fn from_ffprobe_name(codec_name: &str) -> Self {
+        match codec_name {
+            "h264" => Self::H264,
+            "hevc" | "h265" => Self::H265,
+            "vp8" => Self::Vp8,
+            "vp9" => Self::Vp9,
+            "av1" => Self::Av1,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Audio codec identity used to gate stream-copy remux and split paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioCodec {
+    Aac,
+    Opus,
+    Vorbis,
+    Mp3,
+    None,
+    #[default]
+    Other,
+}
+
+impl AudioCodec {
+    pub fn from_ffprobe_name(codec_name: &str) -> Self {
+        match codec_name {
+            "aac" => Self::Aac,
+            "opus" => Self::Opus,
+            "vorbis" => Self::Vorbis,
+            "mp3" => Self::Mp3,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Probe facts reused across the optimization strategy ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MediaFacts {
+    pub container: MediaContainer,
+    pub video_codec: VideoCodec,
+    pub audio_codec: AudioCodec,
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl MediaFacts {
+    pub fn from_extension(ext: &str) -> Self {
+        Self {
+            container: MediaContainer::from_extension(ext),
+            ..Self::default()
+        }
+    }
+}
+
 /// Output of download stage.
 ///
 /// ## Invariant-preserving notes
@@ -67,6 +184,7 @@ pub struct DownloadedFile {
     pub size: u64,
     pub duration: Option<f64>,
     pub resolution: Option<(u32, u32)>,
+    pub facts: MediaFacts,
     /// Guard ensures the temp file lives through later pipeline stages.
     pub _guard: TempFileGuard,
     /// Optional guard for a temp directory holding additional artifacts.
@@ -177,6 +295,31 @@ mod tests {
         assert_eq!(sanitize_extension("../etc/passwd"), "mp4");
         assert_eq!(sanitize_extension(""), "mp4");
         assert_eq!(sanitize_extension("tar.gz"), "mp4");
+    }
+
+    #[test]
+    fn media_container_parses_extensions_and_ffprobe_names() {
+        assert_eq!(MediaContainer::from_extension("mov"), MediaContainer::Mov);
+        assert_eq!(
+            MediaContainer::from_extension("mkv"),
+            MediaContainer::Matroska
+        );
+        assert_eq!(
+            MediaContainer::from_ffprobe_name("mov,mp4,m4a,3gp,3g2,mj2"),
+            MediaContainer::Mov
+        );
+        assert_eq!(
+            MediaContainer::from_ffprobe_name("matroska,webm"),
+            MediaContainer::Matroska
+        );
+    }
+
+    #[test]
+    fn codec_parsing_recognizes_common_stream_copy_cases() {
+        assert_eq!(VideoCodec::from_ffprobe_name("h264"), VideoCodec::H264);
+        assert_eq!(VideoCodec::from_ffprobe_name("vp9"), VideoCodec::Vp9);
+        assert_eq!(AudioCodec::from_ffprobe_name("aac"), AudioCodec::Aac);
+        assert_eq!(AudioCodec::from_ffprobe_name("opus"), AudioCodec::Opus);
     }
 
     #[test]

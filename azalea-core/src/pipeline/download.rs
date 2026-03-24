@@ -17,7 +17,10 @@ use crate::pipeline::disk::ensure_disk_space;
 use crate::pipeline::errors::{DownloadError, Error};
 use crate::pipeline::process::{JsonSubprocessError, run_json_subprocess};
 use crate::pipeline::ssrf::validate_media_url;
-use crate::pipeline::types::{DownloadedFile, Job, ResolvedMedia, sanitize_extension};
+use crate::pipeline::types::{
+    AudioCodec, DownloadedFile, Job, MediaContainer, MediaFacts, MediaType, ResolvedMedia,
+    VideoCodec, sanitize_extension,
+};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::path::Path;
@@ -224,17 +227,32 @@ pub async fn download(
             source: DownloadError::WriteFailed(e),
         })?;
 
-        let (duration, resolution) = if resolved.duration.is_some() && !must_probe {
-            // Prefer resolver metadata when Content-Length is known.
-            tracing::trace!("Using metadata from resolver");
-            (resolved.duration, resolved.resolution)
-        } else {
+        let should_probe = must_probe
+            || resolved.duration.is_none()
+            || resolved.resolution.is_none()
+            || (resolved.media_type == MediaType::Video
+                && downloaded > config.transcode.max_upload_bytes);
+
+        let mut duration = resolved.duration;
+        let mut resolution = resolved.resolution;
+        let mut facts = MediaFacts::from_extension(&resolved.extension);
+
+        if should_probe {
             tracing::trace!("Probing downloaded file for metadata");
             match probe_file(&output_path, config)
                 .instrument(tracing::info_span!("download.ffprobe", path = %output_path.display()))
                 .await
             {
-                Ok(result) => (result.duration, result.resolution),
+                Ok(result) => {
+                    duration = result.duration.or(duration);
+                    resolution = result.resolution.or(resolution);
+                    if matches!(facts.container, MediaContainer::Unknown) {
+                        facts.container = result.facts.container;
+                    }
+                    facts.video_codec = result.facts.video_codec;
+                    facts.audio_codec = result.facts.audio_codec;
+                    facts.bitrate_kbps = result.facts.bitrate_kbps;
+                }
                 Err(e) => {
                     tracing::trace!(error = %e, "Probe failed");
                     if must_probe {
@@ -244,10 +262,17 @@ pub async fn download(
                             )),
                         });
                     }
-                    (None, None)
                 }
             }
-        };
+        } else {
+            // Prefer resolver metadata when Content-Length is known and
+            // optimization preflight does not need additional facts.
+            tracing::trace!("Using metadata from resolver");
+        }
+
+        facts.bitrate_kbps = facts
+            .bitrate_kbps
+            .or_else(|| estimate_bitrate_kbps(downloaded, duration));
 
         tracing::info!(
             duration_ms = download_start.elapsed().as_millis(),
@@ -261,6 +286,7 @@ pub async fn download(
             size: downloaded,
             duration,
             resolution,
+            facts,
             _guard: guard,
             _dir_guard: Some(dir_guard),
         })
@@ -346,6 +372,7 @@ async fn fetch_with_redirects(
 struct ProbeResult {
     duration: Option<f64>,
     resolution: Option<(u32, u32)>,
+    facts: MediaFacts,
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,12 +387,18 @@ struct FfprobeOutput {
 struct FfprobeFormat {
     #[serde(default)]
     duration: Option<Box<str>>,
+    #[serde(default)]
+    format_name: Option<Box<str>>,
+    #[serde(default)]
+    bit_rate: Option<Box<str>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
     #[serde(default)]
     codec_type: Option<Box<str>>,
+    #[serde(default)]
+    codec_name: Option<Box<str>>,
     #[serde(default)]
     width: Option<u32>,
     #[serde(default)]
@@ -431,21 +464,44 @@ async fn probe_file(path: &Path, config: &EngineSettings) -> Result<ProbeResult,
             source: DownloadError::WriteFailed(std::io::Error::other(e)),
         })?;
 
-    let duration = probe
-        .format
-        .as_ref()
+    let format = probe.format.as_ref();
+    let video_stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"));
+    let audio_stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+
+    let duration = format
         .and_then(|format| format.duration.as_deref())
         .and_then(|s| s.parse::<f64>().ok());
 
-    let resolution = probe
-        .streams
-        .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("video"))
-        .and_then(|stream| Some((stream.width?, stream.height?)));
+    let resolution = video_stream.and_then(|stream| Some((stream.width?, stream.height?)));
+
+    let facts = MediaFacts {
+        container: format
+            .and_then(|format| format.format_name.as_deref())
+            .map(MediaContainer::from_ffprobe_name)
+            .unwrap_or_default(),
+        video_codec: video_stream
+            .and_then(|stream| stream.codec_name.as_deref())
+            .map(VideoCodec::from_ffprobe_name)
+            .unwrap_or_default(),
+        audio_codec: audio_stream
+            .and_then(|stream| stream.codec_name.as_deref())
+            .map(AudioCodec::from_ffprobe_name)
+            .unwrap_or(AudioCodec::None),
+        bitrate_kbps: format
+            .and_then(|format| format.bit_rate.as_deref())
+            .and_then(parse_bitrate_kbps),
+    };
 
     Ok(ProbeResult {
         duration,
         resolution,
+        facts,
     })
 }
 
@@ -493,11 +549,39 @@ fn content_length_header_bytes(headers: &reqwest::header::HeaderMap) -> Option<u
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+fn estimate_bitrate_kbps(size_bytes: u64, duration: Option<f64>) -> Option<u32> {
+    let duration = duration?;
+    if !(duration.is_finite() && duration > 0.1) {
+        return None;
+    }
+
+    let bitrate_kbps = (size_bytes as f64 * 8.0 / duration / 1000.0).ceil();
+    if !(bitrate_kbps.is_finite() && bitrate_kbps > 0.0 && bitrate_kbps <= u32::MAX as f64) {
+        return None;
+    }
+
+    Some(bitrate_kbps as u32)
+}
+
+fn parse_bitrate_kbps(bit_rate: &str) -> Option<u32> {
+    let bits_per_sec = bit_rate.parse::<f64>().ok()?;
+    if !(bits_per_sec.is_finite() && bits_per_sec > 0.0) {
+        return None;
+    }
+
+    let bitrate_kbps = (bits_per_sec / 1000.0).ceil();
+    if bitrate_kbps > u32::MAX as f64 {
+        return None;
+    }
+
+    Some(bitrate_kbps as u32)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::content_length_header_bytes;
+    use super::{content_length_header_bytes, estimate_bitrate_kbps, parse_bitrate_kbps};
     use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
 
     #[test]
@@ -514,5 +598,17 @@ mod tests {
         headers.insert(CONTENT_LENGTH, HeaderValue::from_static("abc"));
 
         assert_eq!(content_length_header_bytes(&headers), None);
+    }
+
+    #[test]
+    fn estimates_bitrate_from_size_and_duration() {
+        assert_eq!(estimate_bitrate_kbps(8_000_000, Some(10.0)), Some(6400));
+        assert_eq!(estimate_bitrate_kbps(8_000_000, Some(0.0)), None);
+    }
+
+    #[test]
+    fn parses_ffprobe_bitrate_in_kbps() {
+        assert_eq!(parse_bitrate_kbps("1234567"), Some(1235));
+        assert_eq!(parse_bitrate_kbps("nope"), None);
     }
 }
