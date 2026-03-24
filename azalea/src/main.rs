@@ -67,6 +67,75 @@ const JOB_DURATION_WARN_MS: u64 = 45_000;
 const UPLOAD_DURATION_WARN_MS: u64 = 20_000;
 const QUEUE_DEPTH_WARN_THRESHOLD: usize = 80;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RateLimitScope {
+    User,
+    Channel,
+}
+
+impl RateLimitScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Channel => "channel",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupConfigWarning {
+    RateLimitDisabled {
+        scope: RateLimitScope,
+    },
+    RateLimitWindowDisabled {
+        scope: RateLimitScope,
+        max_requests: u32,
+    },
+    SoftwareTranscodeCpuOversubscribed {
+        available_parallelism: usize,
+        transcode_concurrency: u32,
+        ffmpeg_threads_per_job: u32,
+        total_ffmpeg_threads: usize,
+    },
+}
+
+impl StartupConfigWarning {
+    fn log(self) {
+        match self {
+            Self::RateLimitDisabled { scope } => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    "Rate limiting is disabled for this scope; untrusted users can saturate the pipeline"
+                );
+            }
+            Self::RateLimitWindowDisabled {
+                scope,
+                max_requests,
+            } => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    max_requests,
+                    "Rate limit window is zero while requests remain enabled; throttling is effectively disabled"
+                );
+            }
+            Self::SoftwareTranscodeCpuOversubscribed {
+                available_parallelism,
+                transcode_concurrency,
+                ffmpeg_threads_per_job,
+                total_ffmpeg_threads,
+            } => {
+                tracing::warn!(
+                    available_parallelism,
+                    transcode_concurrency,
+                    ffmpeg_threads_per_job,
+                    total_ffmpeg_threads,
+                    "Software transcode thread budget oversubscribes available CPU"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct ParsedVersion {
     major: u64,
@@ -1004,6 +1073,9 @@ fn log_startup_snapshot(config: &AppConfig) {
     let runtime = &config.runtime;
     let engine = &config.engine;
     let transcode = &engine.transcode;
+    for warning in startup_config_sanity_warnings(config) {
+        warning.log();
+    }
     tracing::info!(
         worker_threads = runtime.worker_threads,
         max_blocking_threads = runtime.max_blocking_threads,
@@ -1026,6 +1098,71 @@ fn log_startup_snapshot(config: &AppConfig) {
         queue_capacity = JOB_QUEUE_CAPACITY,
         "Startup diagnostics details"
     );
+}
+
+fn startup_config_sanity_warnings(config: &AppConfig) -> Vec<StartupConfigWarning> {
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4);
+    startup_config_sanity_warnings_with_available_parallelism(config, available_parallelism)
+}
+
+fn startup_config_sanity_warnings_with_available_parallelism(
+    config: &AppConfig,
+    available_parallelism: usize,
+) -> Vec<StartupConfigWarning> {
+    let mut warnings = Vec::with_capacity(5);
+    let pipeline = &config.engine.pipeline;
+    let transcode = &config.engine.transcode;
+    let concurrency = &config.engine.concurrency;
+
+    push_rate_limit_warnings(
+        &mut warnings,
+        RateLimitScope::User,
+        pipeline.user_rate_limit_requests,
+        pipeline.user_rate_limit_window_secs,
+    );
+    push_rate_limit_warnings(
+        &mut warnings,
+        RateLimitScope::Channel,
+        pipeline.channel_rate_limit_requests,
+        pipeline.channel_rate_limit_window_secs,
+    );
+
+    let ffmpeg_threads_per_job = transcode.effective_ffmpeg_threads(concurrency.transcode);
+    let total_ffmpeg_threads =
+        ffmpeg_threads_per_job as usize * concurrency.transcode.max(1) as usize;
+    if transcode.hardware_acceleration == HardwareAcceleration::None
+        && total_ffmpeg_threads > available_parallelism.max(1)
+    {
+        warnings.push(StartupConfigWarning::SoftwareTranscodeCpuOversubscribed {
+            available_parallelism: available_parallelism.max(1),
+            transcode_concurrency: concurrency.transcode,
+            ffmpeg_threads_per_job,
+            total_ffmpeg_threads,
+        });
+    }
+
+    warnings
+}
+
+fn push_rate_limit_warnings(
+    warnings: &mut Vec<StartupConfigWarning>,
+    scope: RateLimitScope,
+    max_requests: u32,
+    window_secs: u64,
+) {
+    if max_requests == 0 {
+        warnings.push(StartupConfigWarning::RateLimitDisabled { scope });
+        return;
+    }
+
+    if window_secs == 0 {
+        warnings.push(StartupConfigWarning::RateLimitWindowDisabled {
+            scope,
+            max_requests,
+        });
+    }
 }
 
 fn is_timeout_error(error: &pipeline::Error) -> bool {
@@ -1221,5 +1358,97 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("is not writable"));
         assert!(message.contains(&missing_dir.display().to_string()));
+    }
+
+    #[test]
+    fn startup_config_sanity_warnings_skip_default_config() {
+        let mut config = AppConfig::default();
+        config.application_id = crate::config::ApplicationId::new(1);
+
+        let warnings = startup_config_sanity_warnings_with_available_parallelism(&config, 8);
+
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn startup_config_sanity_warnings_flag_disabled_rate_limits() {
+        let mut config = AppConfig::default();
+        config.application_id = crate::config::ApplicationId::new(1);
+        config.engine.pipeline.user_rate_limit_requests = 0;
+        config.engine.pipeline.channel_rate_limit_requests = 0;
+
+        let warnings = startup_config_sanity_warnings_with_available_parallelism(&config, 8);
+
+        assert_eq!(
+            warnings,
+            vec![
+                StartupConfigWarning::RateLimitDisabled {
+                    scope: RateLimitScope::User,
+                },
+                StartupConfigWarning::RateLimitDisabled {
+                    scope: RateLimitScope::Channel,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_config_sanity_warnings_flag_zero_rate_limit_windows() {
+        let mut config = AppConfig::default();
+        config.application_id = crate::config::ApplicationId::new(1);
+        config.engine.pipeline.user_rate_limit_window_secs = 0;
+        config.engine.pipeline.channel_rate_limit_window_secs = 0;
+
+        let warnings = startup_config_sanity_warnings_with_available_parallelism(&config, 8);
+
+        assert_eq!(
+            warnings,
+            vec![
+                StartupConfigWarning::RateLimitWindowDisabled {
+                    scope: RateLimitScope::User,
+                    max_requests: config.engine.pipeline.user_rate_limit_requests,
+                },
+                StartupConfigWarning::RateLimitWindowDisabled {
+                    scope: RateLimitScope::Channel,
+                    max_requests: config.engine.pipeline.channel_rate_limit_requests,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_config_sanity_warnings_flag_cpu_oversubscription_for_software_transcode() {
+        let mut config = AppConfig::default();
+        config.application_id = crate::config::ApplicationId::new(1);
+        config.engine.transcode.hardware_acceleration = HardwareAcceleration::None;
+        config.engine.transcode.ffmpeg_threads = 4;
+        config.engine.concurrency.transcode = 3;
+
+        let warnings = startup_config_sanity_warnings_with_available_parallelism(&config, 8);
+
+        assert!(
+            warnings.contains(&StartupConfigWarning::SoftwareTranscodeCpuOversubscribed {
+                available_parallelism: 8,
+                transcode_concurrency: 3,
+                ffmpeg_threads_per_job: 4,
+                total_ffmpeg_threads: 12,
+            })
+        );
+    }
+
+    #[test]
+    fn startup_config_sanity_warnings_skip_cpu_oversubscription_for_hwacc() {
+        let mut config = AppConfig::default();
+        config.application_id = crate::config::ApplicationId::new(1);
+        config.engine.transcode.hardware_acceleration = HardwareAcceleration::Vaapi;
+        config.engine.transcode.ffmpeg_threads = 4;
+        config.engine.concurrency.transcode = 3;
+
+        let warnings = startup_config_sanity_warnings_with_available_parallelism(&config, 8);
+
+        assert!(!warnings.iter().any(|warning| matches!(
+            warning,
+            StartupConfigWarning::SoftwareTranscodeCpuOversubscribed { .. }
+        )));
     }
 }
