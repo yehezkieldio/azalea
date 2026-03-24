@@ -12,7 +12,7 @@
 //! ## Trade-off acknowledgment
 //! Persistence failures degrade to in-memory mode to keep the pipeline alive.
 
-use super::FlushWorker;
+use super::{FlushWorker, open_or_rotate_corrupt_store};
 use crate::config::{PipelineSettings, StorageSettings, TranscodeSettings};
 use crate::media::TweetId;
 use moka::future::Cache as MokaCache;
@@ -151,13 +151,16 @@ impl Cache {
             .build();
 
         let (db, pending_writes) = if config.dedup_persistent {
-            // Opens existing DBs or initializes new ones.
-            let db = Database::create(&config.dedup_db_path)?;
-            let write_txn = db.begin_write()?;
-            {
-                let _ = write_txn.open_table(DEDUP_TABLE)?;
-            }
-            write_txn.commit()?;
+            let db = open_or_rotate_corrupt_store("dedup", &config.dedup_db_path, |db| {
+                let write_txn = db.begin_write().map_err(redb::Error::from)?;
+                {
+                    let _ = write_txn
+                        .open_table(DEDUP_TABLE)
+                        .map_err(redb::Error::from)?;
+                }
+                write_txn.commit().map_err(redb::Error::from)?;
+                Ok(())
+            })?;
             (
                 Some(Arc::new(db)),
                 Arc::new(RwLock::new(VecDeque::with_capacity(DEFAULT_BATCH_SIZE))),
@@ -633,6 +636,30 @@ mod tests {
         ))
     }
 
+    fn rotated_store_paths(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Some(file_name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+            return Vec::new();
+        };
+        let prefix = format!("{file_name}.corrupt.");
+        let Some(parent) = path.parent() else {
+            return Vec::new();
+        };
+
+        let mut rotated = std::fs::read_dir(parent)
+            .expect("parent directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect::<Vec<_>>();
+        rotated.sort();
+        rotated
+    }
+
     #[test]
     fn key_binary_roundtrip_is_stable() {
         let key = Key::new(42, TweetId(999));
@@ -885,5 +912,39 @@ mod tests {
         assert!(restored.is_duplicate(scope_id, TweetId(1)).await);
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn corrupt_persistent_store_is_rotated_and_recreated() {
+        let db_path = unique_test_db_path("dedup-corrupt-rotate");
+        let original = b"dedup-corruption-evidence";
+        std::fs::write(&db_path, original).expect("corrupt seed should be written");
+
+        let cache = Cache::new(
+            &persistent_storage_settings(db_path.clone()),
+            &PipelineSettings::default(),
+            &TranscodeSettings::default(),
+        )
+        .expect("cache should recreate corrupt store");
+
+        assert!(db_path.exists(), "fresh dedup store should exist");
+        assert!(
+            cache.db.is_some(),
+            "persistent cache should still have a db"
+        );
+
+        let rotated = rotated_store_paths(&db_path);
+        assert_eq!(rotated.len(), 1, "corrupt store should be preserved once");
+        let rotated_path = rotated
+            .first()
+            .cloned()
+            .expect("corrupt store should have been rotated");
+        assert_eq!(
+            std::fs::read(&rotated_path).expect("rotated store should be readable"),
+            original
+        );
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(rotated_path);
     }
 }

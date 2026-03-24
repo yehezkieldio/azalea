@@ -6,7 +6,7 @@
 //! ## Trade-off acknowledgment
 //! Metrics are best-effort; failures are logged but do not halt the pipeline.
 
-use super::FlushWorker;
+use super::{FlushWorker, open_or_rotate_corrupt_store};
 use dashmap::DashMap;
 use redb::{AccessGuard, Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::sync::{
@@ -112,14 +112,19 @@ impl Tracker {
             });
         }
 
-        // Opens existing DBs or initializes new ones.
-        let db = Database::create(&config.metrics_db_path)?;
-        let write_txn = db.begin_write()?;
-        {
-            let _ = write_txn.open_table(METRICS_TABLE)?;
-            let _ = write_txn.open_table(ERRORS_TABLE)?;
-        }
-        write_txn.commit()?;
+        let db = open_or_rotate_corrupt_store("metrics", &config.metrics_db_path, |db| {
+            let write_txn = db.begin_write().map_err(redb::Error::from)?;
+            {
+                let _ = write_txn
+                    .open_table(METRICS_TABLE)
+                    .map_err(redb::Error::from)?;
+                let _ = write_txn
+                    .open_table(ERRORS_TABLE)
+                    .map_err(redb::Error::from)?;
+            }
+            write_txn.commit().map_err(redb::Error::from)?;
+            Ok(())
+        })?;
 
         Ok(Self {
             inner: Arc::new(Inner::new(true, Some(Arc::new(db)))),
@@ -426,6 +431,30 @@ mod tests {
         }
     }
 
+    fn rotated_store_paths(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Some(file_name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+            return Vec::new();
+        };
+        let prefix = format!("{file_name}.corrupt.");
+        let Some(parent) = path.parent() else {
+            return Vec::new();
+        };
+
+        let mut rotated = std::fs::read_dir(parent)
+            .expect("parent directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect::<Vec<_>>();
+        rotated.sort();
+        rotated
+    }
+
     #[test]
     fn disabled_metrics_are_noop() {
         let path = unique_metrics_path("metrics-disabled");
@@ -508,5 +537,35 @@ mod tests {
         assert_eq!(snapshot.stage_window.sample_count, [0; 4]);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_metrics_store_is_rotated_and_recreated() {
+        let path = unique_metrics_path("metrics-corrupt-rotate");
+        let original = b"metrics-corruption-evidence";
+        std::fs::write(&path, original).expect("corrupt seed should be written");
+
+        let tracker =
+            Tracker::new(&storage_config(true, path.clone())).expect("tracker should recreate db");
+
+        assert!(
+            tracker.inner.enabled,
+            "metrics tracker should remain enabled"
+        );
+        assert!(path.exists(), "fresh metrics store should exist");
+
+        let rotated = rotated_store_paths(&path);
+        assert_eq!(rotated.len(), 1, "corrupt store should be preserved once");
+        let rotated_path = rotated
+            .first()
+            .cloned()
+            .expect("corrupt store should have been rotated");
+        assert_eq!(
+            std::fs::read(&rotated_path).expect("rotated store should be readable"),
+            original
+        );
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(rotated_path);
     }
 }

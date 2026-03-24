@@ -1,7 +1,11 @@
+use anyhow::{Context, anyhow};
+use redb::Database;
+use std::ffi::OsString;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, watch};
 
 pub mod dedup;
@@ -9,6 +13,98 @@ pub mod metrics;
 
 pub use dedup::Cache as DedupCache;
 pub use metrics::{Snapshot as MetricsSnapshot, Stage, Tracker as Metrics};
+
+/// Open a redb store, rotating the file aside when the on-disk contents are
+/// corrupt so startup can continue with a fresh database.
+pub(crate) fn open_or_rotate_corrupt_store<F>(
+    kind: &'static str,
+    path: &Path,
+    init: F,
+) -> anyhow::Result<Database>
+where
+    F: Fn(&Database) -> Result<(), redb::Error>,
+{
+    match open_store_once(path, &init) {
+        Ok(db) => Ok(db),
+        Err(error) if is_corruption_error(&error) => {
+            let rotated_path = rotate_corrupt_store(path)?;
+            let db = open_store_once(path, &init).with_context(|| {
+                format!(
+                    "failed to recreate {kind} redb store after rotating {}",
+                    path.display()
+                )
+            })?;
+
+            tracing::error!(
+                store = kind,
+                path = %path.display(),
+                rotated_path = %rotated_path.display(),
+                error = %error,
+                "Detected redb corruption; rotated store and created a fresh one"
+            );
+
+            Ok(db)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn open_store_once<F>(path: &Path, init: &F) -> Result<Database, redb::Error>
+where
+    F: Fn(&Database) -> Result<(), redb::Error>,
+{
+    let db = Database::create(path).map_err(redb::Error::from)?;
+    init(&db)?;
+    Ok(db)
+}
+
+fn is_corruption_error(error: &redb::Error) -> bool {
+    matches!(error, redb::Error::Corrupted(_))
+}
+
+fn rotate_corrupt_store(path: &Path) -> anyhow::Result<PathBuf> {
+    let rotated_path = next_corrupt_store_path(path)?;
+    std::fs::rename(path, &rotated_path).with_context(|| {
+        format!(
+            "failed to rotate corrupt redb store {} to {}",
+            path.display(),
+            rotated_path.display()
+        )
+    })?;
+    Ok(rotated_path)
+}
+
+fn next_corrupt_store_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        anyhow!(
+            "redb store path {} has no file name to rotate",
+            path.display()
+        )
+    })?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    for attempt in 0..=u16::MAX {
+        let mut rotated_name = OsString::from(file_name);
+        if attempt == 0 {
+            rotated_name.push(format!(".corrupt.{timestamp}"));
+        } else {
+            rotated_name.push(format!(".corrupt.{timestamp}.{attempt}"));
+        }
+
+        let rotated_path = path.with_file_name(rotated_name);
+        if !rotated_path.exists() {
+            return Ok(rotated_path);
+        }
+    }
+
+    Err(anyhow!(
+        "failed to allocate unique corrupt-store path for {}",
+        path.display()
+    ))
+}
 
 /// Shared flush worker for storage-backed subsystems.
 ///
