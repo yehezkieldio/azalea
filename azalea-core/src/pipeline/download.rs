@@ -13,7 +13,7 @@
 use crate::concurrency::Permits;
 use crate::config::EngineSettings;
 use crate::media::TempFileCleanup;
-use crate::pipeline::disk::ensure_disk_space;
+use crate::pipeline::disk::{ensure_disk_space, reserve_download_bytes};
 use crate::pipeline::errors::{DownloadError, Error};
 use crate::pipeline::process::{JsonSubprocessError, run_json_subprocess};
 use crate::pipeline::ssrf::validate_media_url;
@@ -25,6 +25,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::future::Future;
 use std::path::Path;
+use std::sync::{Arc, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -45,6 +46,7 @@ pub async fn download(
     job: &Job,
     http: &reqwest::Client,
     permits: &Permits,
+    reserved_download_bytes: &Arc<AtomicU64>,
     temp_files: &TempFileCleanup,
     config: &EngineSettings,
 ) -> Result<DownloadedFile, Error> {
@@ -67,14 +69,6 @@ pub async fn download(
         .map_err(|_| Error::DownloadFailed {
             source: DownloadError::WriteFailed(std::io::Error::other("download semaphore closed")),
         })?;
-
-    tracing::trace!("Checking disk space");
-    // Fail fast before allocating or downloading to avoid partial artifacts.
-    ensure_disk_space(
-        &config.storage.temp_dir,
-        config.pipeline.min_disk_space_bytes,
-    )
-    .await?;
 
     // Normalize extension to a safe, predictable filename suffix.
     let safe_extension = sanitize_extension(&resolved.extension);
@@ -128,6 +122,31 @@ pub async fn download(
                 },
             });
         }
+
+        let reserve_bytes = header_content_length
+            .or(total_size)
+            .filter(|size| *size > 0)
+            .or_else(|| (max_download > 0).then_some(max_download))
+            .unwrap_or(0);
+        tracing::trace!(reserve_bytes, "Reserving disk budget for download");
+        let _download_reservation = if reserve_bytes > 0 {
+            Some(
+                reserve_download_bytes(
+                    &config.storage.temp_dir,
+                    config.pipeline.min_disk_space_bytes,
+                    reserve_bytes,
+                    reserved_download_bytes,
+                )
+                .await?,
+            )
+        } else {
+            ensure_disk_space(
+                &config.storage.temp_dir,
+                config.pipeline.min_disk_space_bytes,
+            )
+            .await?;
+            None
+        };
 
         let mut stream = response.bytes_stream();
         // Preallocate to reduce fragmentation and avoid repeated growth syscalls.

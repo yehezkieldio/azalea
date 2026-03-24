@@ -145,6 +145,7 @@ pub async fn run(
                     &job,
                     &engine.http,
                     &engine.permits,
+                    &engine.reserved_download_bytes,
                     &engine.temp_files,
                     &engine.config,
                 )

@@ -115,6 +115,7 @@ pub struct Engine {
     pub transcode_runtime: TranscodeRuntime,
     pub http: reqwest::Client,
     pub permits: Permits,
+    pub reserved_download_bytes: Arc<AtomicU64>,
     pub dedup: DedupCache,
     pub metrics: Metrics,
     pub resolver: ResolverChain,
@@ -137,6 +138,7 @@ impl Engine {
         let http = build_http_client(&config)?;
         let transcode_runtime = TranscodeRuntime::new(config.transcode.hardware_acceleration);
         let permits = Permits::new(&config.concurrency);
+        let reserved_download_bytes = Arc::new(AtomicU64::new(0));
         let dedup = DedupCache::new(&config.storage, &config.pipeline, &config.transcode)?;
         let metrics = Metrics::new(&config.storage)?;
         let resolver = ResolverChain::new(&config.storage, &config.pipeline, &config.binaries);
@@ -147,6 +149,7 @@ impl Engine {
             transcode_runtime,
             http,
             permits,
+            reserved_download_bytes,
             dedup,
             metrics,
             resolver,
