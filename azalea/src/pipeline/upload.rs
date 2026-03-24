@@ -281,6 +281,11 @@ async fn send_with_retry(
 ) -> Result<twilight_http::Response<twilight_model::channel::Message>, Error> {
     const MAX_RETRIES: usize = 3;
 
+    let attachment = Attachment::from_bytes(
+        filename,
+        read_file_with_limit(part, ctx.config, ctx.part, ctx.total).await?,
+        0,
+    );
     let mut attempt = 0usize;
     loop {
         tracing::trace!(
@@ -290,21 +295,13 @@ async fn send_with_retry(
             path = %part.path().display(),
             "Sending upload attempt"
         );
-        // Re-read each attempt to avoid holding large buffers across retries.
-        let file_bytes = read_file_with_limit(part, ctx.config, ctx.part, ctx.total).await?;
-        let attachment = Attachment {
-            description: None,
-            file: file_bytes,
-            filename: filename.clone(),
-            id: 0,
-        };
 
         let mut request = ctx.discord.create_message(ctx.channel_id);
         if let Some(reply_to) = ctx.reply_to {
             request = request.reply(reply_to);
         }
 
-        match request.attachments(&[attachment]).await {
+        match request.attachments(std::slice::from_ref(&attachment)).await {
             Ok(response) => {
                 tracing::info!(
                     part = ctx.part,
