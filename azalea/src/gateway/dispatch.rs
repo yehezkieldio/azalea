@@ -10,7 +10,6 @@
 
 use crate::gateway::resume::SessionInfo;
 use std::{error::Error, future::Future, pin::pin};
-use tokio::signal;
 use tokio_util::task::TaskTracker;
 use twilight_gateway::{CloseFrame, Event, Shard, StreamExt as _};
 
@@ -53,13 +52,20 @@ pub async fn run(
     mut shard: Shard,
     mut event_handler: impl FnMut(Dispatcher, Event),
 ) -> SessionInfo {
-    let mut shutdown = pin!(signal::ctrl_c());
+    let mut shutdown = pin!(crate::shutdown::wait_for_shutdown_signal());
     let tracker = TaskTracker::new();
 
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                tracing::info!("ctrl-c received; closing shard");
+            signal = &mut shutdown => {
+                match signal {
+                    Ok(signal) => {
+                        tracing::info!(signal = signal.name(), "shutdown signal received; closing shard");
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "shutdown signal listener failed; closing shard");
+                    }
+                }
                 shard.close(CloseFrame::RESUME);
                 break;
             }

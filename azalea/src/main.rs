@@ -21,6 +21,7 @@ mod config;
 mod discord;
 mod gateway;
 mod pipeline;
+mod shutdown;
 
 use app::App;
 use azalea_core::config::{BinarySettings, HardwareAcceleration, TranscodeSettings};
@@ -39,7 +40,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{process::Command, signal, sync::mpsc, task::JoinSet};
+use tokio::{process::Command, sync::mpsc, task::JoinSet};
 use tracing::Instrument as _;
 use twilight_gateway::{ConfigBuilder, queue::InMemoryQueue};
 use twilight_http::Client;
@@ -296,12 +297,19 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
     }
 
     // Wait for shutdown signal before tearing down workers.
-    signal::ctrl_c().await?;
-    tracing::info!("shutting down; press CTRL-C to abort");
+    let shutdown_signal = shutdown::wait_for_shutdown_signal().await?;
+    tracing::info!(
+        signal = shutdown_signal.name(),
+        "shutting down; send another shutdown signal to abort"
+    );
 
     let mut resume_info = Vec::new();
     let forced_shutdown = tokio::select! {
-        _ = signal::ctrl_c() => true,
+        signal = shutdown::wait_for_shutdown_signal() => {
+            let signal = signal?;
+            tracing::warn!(signal = signal.name(), "forced shutdown requested");
+            true
+        }
         _ = async {
             while let Some(result) = shard_set.join_next().await {
                 match result {
@@ -319,7 +327,6 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
     };
 
     if forced_shutdown {
-        tracing::warn!("Forced shutdown requested; aborting shard tasks");
         shard_set.abort_all();
         while let Some(result) = shard_set.join_next().await {
             if let Err(error) = result {
