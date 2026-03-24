@@ -19,7 +19,9 @@ use crate::pipeline::disk::ensure_disk_space;
 use crate::pipeline::errors::{Error, TranscodeStage};
 use crate::pipeline::ffmpeg;
 use crate::pipeline::quality::{BitrateParams, Ladder};
-use crate::pipeline::types::{DownloadedFile, MediaType, PreparedUpload, Progress, ResolvedMedia};
+use crate::pipeline::types::{
+    DownloadedFile, MediaType, PreparedPart, PreparedUpload, Progress, ResolvedMedia,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,11 +75,10 @@ pub async fn optimize(
             ._dir_guard
             .take()
             .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
-        return Ok(PreparedUpload::Single {
-            path: downloaded.path,
-            _guard: downloaded._guard,
-            _dir_guard: dir_guard,
-        });
+        return Ok(PreparedUpload::single(
+            PreparedPart::new(downloaded.path, downloaded.size, downloaded._guard),
+            dir_guard,
+        ));
     }
 
     let min_space = config.pipeline.min_disk_space_bytes;
@@ -136,11 +137,11 @@ pub async fn optimize(
                         let dir_guard = downloaded._dir_guard.take().ok_or_else(|| {
                             Error::Io(std::io::Error::other("missing temp dir guard"))
                         })?;
-                        return Ok(PreparedUpload::Single {
-                            path: remux_path.clone(),
-                            _guard: temp_files.guard(remux_path),
-                            _dir_guard: dir_guard,
-                        });
+                        let guard = temp_files.guard(remux_path.clone());
+                        return Ok(PreparedUpload::single(
+                            PreparedPart::new(remux_path, size, guard),
+                            dir_guard,
+                        ));
                     }
                     Ok(_) => {
                         tracing::trace!(
@@ -455,11 +456,11 @@ async fn optimize_image(
                     let dir_guard = downloaded._dir_guard.take().ok_or_else(|| {
                         Error::Io(std::io::Error::other("missing temp dir guard"))
                     })?;
-                    return Ok(PreparedUpload::Single {
-                        path: output_path.clone(),
-                        _guard: temp_files.guard(output_path),
-                        _dir_guard: dir_guard,
-                    });
+                    let guard = temp_files.guard(output_path.clone());
+                    return Ok(PreparedUpload::single(
+                        PreparedPart::new(output_path, metadata.len(), guard),
+                        dir_guard,
+                    ));
                 }
                 let _ = fs::remove_file(&output_path).await;
             }
@@ -526,11 +527,11 @@ async fn try_transcode(
             let dir_guard = dir_guard
                 .take()
                 .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
-            Ok(Some(PreparedUpload::Single {
-                path: transcode_path.clone(),
-                _guard: temp_files.guard(transcode_path),
-                _dir_guard: dir_guard,
-            }))
+            let guard = temp_files.guard(transcode_path.clone());
+            Ok(Some(PreparedUpload::single(
+                PreparedPart::new(transcode_path, size, guard),
+                dir_guard,
+            )))
         }
         Ok(_) => {
             tracing::trace!(
@@ -737,16 +738,10 @@ async fn split_serial(
         });
     }
 
-    let guards = segments
-        .iter()
-        .map(|p| temp_files.guard(p.clone()))
-        .collect();
-    tracing::info!(segments = segments.len(), "Serial split completed");
-    Ok(PreparedUpload::Split {
-        paths: segments,
-        _guards: guards,
-        _dir_guard: dir_guard,
-    })
+    let segments_len = segments.len();
+    let parts = into_prepared_parts(segments, temp_files);
+    tracing::info!(segments = segments_len, "Serial split completed");
+    Ok(PreparedUpload::split(parts, dir_guard))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -820,7 +815,7 @@ async fn split_parallel(
     let mut join_set = tokio::task::JoinSet::new();
 
     let ffmpeg_path = config.binaries.ffmpeg.clone();
-    for (idx, raw_path) in raw_segments.iter().enumerate() {
+    for (idx, raw_segment) in raw_segments.iter().enumerate() {
         let out_path = output_segments.get(idx).cloned().unwrap_or_else(|| {
             downloaded
                 .path
@@ -828,7 +823,7 @@ async fn split_parallel(
         });
 
         let args = ffmpeg::transcode_args(
-            raw_path,
+            &raw_segment.path,
             &out_path,
             segment_params.video_bitrate_kbps,
             segment_params.audio_bitrate_kbps,
@@ -839,7 +834,7 @@ async fn split_parallel(
 
         let permit = Arc::clone(&permits.transcode);
         let timeout = Duration::from_secs(config.transcode.ffmpeg_timeout_secs);
-        let raw_path_clone = raw_path.clone();
+        let raw_path_clone = raw_segment.path.clone();
 
         let ffmpeg_path = ffmpeg_path.clone();
         join_set.spawn(async move {
@@ -850,17 +845,32 @@ async fn split_parallel(
                 .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
             let result = ffmpeg::execute(&ffmpeg_path, &args, timeout, TranscodeStage::Split).await;
             let _ = fs::remove_file(&raw_path_clone).await;
-            result.map(|_| out_path)
+            result?;
+            let size = fs::metadata(&out_path).await?.len();
+            Ok((
+                idx,
+                SegmentOutput {
+                    path: out_path,
+                    size,
+                },
+            ))
         });
     }
 
-    let mut final_segments = Vec::with_capacity(total_segments);
+    let mut final_segments = vec![None; total_segments];
     let mut finished = 0;
 
     while let Some(res) = join_set.join_next().await {
         match res {
-            Ok(Ok(path)) => {
-                final_segments.push(path);
+            Ok(Ok((index, segment))) => {
+                let slot = final_segments
+                    .get_mut(index)
+                    .ok_or_else(|| Error::TranscodeFailed {
+                        stage: TranscodeStage::Split,
+                        exit_code: None,
+                        stderr_tail: "parallel split reported an out-of-range segment".to_string(),
+                    })?;
+                *slot = Some(segment);
                 finished += 1;
                 if let Some(tx) = &progress_tx {
                     let _ = tx
@@ -871,14 +881,14 @@ async fn split_parallel(
             Ok(Err(e)) => {
                 join_set.abort_all();
                 while join_set.join_next().await.is_some() {}
-                cleanup_segments(&raw_segments).await;
+                cleanup_segment_outputs(&raw_segments).await;
                 cleanup_segments(&output_segments).await;
                 return Err(e);
             }
             Err(e) => {
                 join_set.abort_all();
                 while join_set.join_next().await.is_some() {}
-                cleanup_segments(&raw_segments).await;
+                cleanup_segment_outputs(&raw_segments).await;
                 cleanup_segments(&output_segments).await;
                 return Err(Error::TranscodeFailed {
                     stage: TranscodeStage::Split,
@@ -889,18 +899,20 @@ async fn split_parallel(
         }
     }
 
-    final_segments.sort();
-    let guards = final_segments
-        .iter()
-        .map(|p| temp_files.guard(p.clone()))
-        .collect();
+    let final_segments = final_segments
+        .into_iter()
+        .map(|segment| {
+            segment.ok_or_else(|| Error::TranscodeFailed {
+                stage: TranscodeStage::Split,
+                exit_code: None,
+                stderr_tail: "parallel split finished with missing segment".to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let parts = into_prepared_parts(final_segments, temp_files);
 
-    tracing::info!(segments = final_segments.len(), "Parallel split completed");
-    Ok(PreparedUpload::Split {
-        paths: final_segments,
-        _guards: guards,
-        _dir_guard: dir_guard,
-    })
+    tracing::info!(segments = parts.len(), "Parallel split completed");
+    Ok(PreparedUpload::split(parts, dir_guard))
 }
 
 async fn try_split_copy(
@@ -951,24 +963,16 @@ async fn try_split_copy(
         return Ok(None);
     }
 
-    if !segments_fit_limit(&segments, config).await? {
-        cleanup_segments(&segments).await;
+    if !segments_fit_limit(&segments, config) {
+        cleanup_segment_outputs(&segments).await;
         return Ok(None);
     }
-
-    let guards = segments
-        .iter()
-        .map(|p| temp_files.guard(p.clone()))
-        .collect();
 
     let dir_guard = dir_guard
         .take()
         .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
-    Ok(Some(PreparedUpload::Split {
-        paths: segments,
-        _guards: guards,
-        _dir_guard: dir_guard,
-    }))
+    let parts = into_prepared_parts(segments, temp_files);
+    Ok(Some(PreparedUpload::split(parts, dir_guard)))
 }
 
 fn copy_segment_plan(
@@ -1011,7 +1015,26 @@ fn copy_segment_plan(
     })
 }
 
-async fn collect_segments(path: &Path, prefix: &str) -> Result<Vec<PathBuf>, Error> {
+#[derive(Debug, Clone)]
+struct SegmentOutput {
+    path: PathBuf,
+    size: u64,
+}
+
+fn into_prepared_parts(
+    segments: Vec<SegmentOutput>,
+    temp_files: &TempFileCleanup,
+) -> Vec<PreparedPart> {
+    segments
+        .into_iter()
+        .map(|segment| {
+            let guard = temp_files.guard(segment.path.clone());
+            PreparedPart::new(segment.path, segment.size, guard)
+        })
+        .collect()
+}
+
+async fn collect_segments(path: &Path, prefix: &str) -> Result<Vec<SegmentOutput>, Error> {
     let parent_dir = path.parent().unwrap_or(Path::new("."));
     let mut segments = Vec::new();
 
@@ -1025,28 +1048,33 @@ async fn collect_segments(path: &Path, prefix: &str) -> Result<Vec<PathBuf>, Err
         {
             let size = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
             if size > 0 {
-                segments.push(path);
+                segments.push(SegmentOutput { path, size });
             }
         }
     }
 
-    segments.sort();
+    segments.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(segments)
 }
 
-async fn segments_fit_limit(segments: &[PathBuf], config: &EngineSettings) -> Result<bool, Error> {
-    for path in segments {
-        let size = fs::metadata(path).await?.len();
-        if size > config.transcode.max_upload_bytes {
-            return Ok(false);
+fn segments_fit_limit(segments: &[SegmentOutput], config: &EngineSettings) -> bool {
+    for segment in segments {
+        if segment.size > config.transcode.max_upload_bytes {
+            return false;
         }
     }
-    Ok(true)
+    true
 }
 
 async fn cleanup_segments(segments: &[PathBuf]) {
     for path in segments {
         let _ = fs::remove_file(path).await;
+    }
+}
+
+async fn cleanup_segment_outputs(segments: &[SegmentOutput]) {
+    for segment in segments {
+        let _ = fs::remove_file(&segment.path).await;
     }
 }
 

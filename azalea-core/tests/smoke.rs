@@ -101,10 +101,10 @@ async fn pass_through_local_fixture_smoke_flow() {
     .expect("pass-through optimize should succeed");
 
     assert!(matches!(&prepared, PreparedUpload::Single { .. }));
-    if let PreparedUpload::Single { path, .. } = &prepared {
-        assert_eq!(path, &fixture_path);
+    if let PreparedUpload::Single { part, .. } = &prepared {
+        assert_eq!(part.path(), fixture_path.as_path());
         assert!(
-            tokio::fs::try_exists(path)
+            tokio::fs::try_exists(part.path())
                 .await
                 .expect("output file existence check should succeed")
         );

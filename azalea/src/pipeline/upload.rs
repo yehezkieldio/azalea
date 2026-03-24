@@ -12,12 +12,11 @@ use crate::pipeline::{Error, Progress, UploadOutcome};
 use azalea_core::concurrency::Permits;
 use azalea_core::config::EngineSettings;
 use azalea_core::media::TweetId;
-use azalea_core::pipeline::PreparedUpload;
+use azalea_core::pipeline::{PreparedPart, PreparedUpload};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::fs;
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
 use twilight_http::Client;
@@ -58,18 +57,36 @@ pub async fn upload(
         )))
     })?;
 
-    // Normalize upload inputs into a flat list of paths.
-    let (paths, total_files) = match prepared {
-        PreparedUpload::Single { path, .. } => (vec![path.clone()], 1),
-        PreparedUpload::Split { paths, .. } => (paths.clone(), paths.len()),
-    };
+    let total_files = prepared.len();
     tracing::info!(parts = total_files, "Uploading media");
 
-    let mut first_message_id = None;
-    let mut last_message_id = None;
+    match prepared {
+        PreparedUpload::Single { part, .. } => {
+            upload_parts(
+                std::slice::from_ref(part),
+                channel_id,
+                tweet_id,
+                discord,
+                config,
+                progress_tx,
+            )
+            .await
+        }
+        PreparedUpload::Split { parts, .. } => {
+            upload_parts(parts, channel_id, tweet_id, discord, config, progress_tx).await
+        }
+    }
+}
 
-    if paths.is_empty() {
-        // Guard against unexpected empty payloads from the pipeline.
+async fn upload_parts(
+    parts: &[PreparedPart],
+    channel_id: Id<ChannelMarker>,
+    tweet_id: TweetId,
+    discord: &Client,
+    config: &EngineSettings,
+    progress_tx: Option<&mpsc::Sender<Progress>>,
+) -> Result<UploadOutcome, Error> {
+    if parts.is_empty() {
         return Err(Error::UploadFailed {
             part: 0,
             total: 0,
@@ -80,7 +97,11 @@ pub async fn upload(
         });
     }
 
-    for (index, file_path) in paths.iter().enumerate() {
+    let total_files = parts.len();
+    let mut first_message_id = None;
+    let mut last_message_id = None;
+
+    for (index, part) in parts.iter().enumerate() {
         if let Some(tx) = progress_tx {
             let stage = if total_files > 1 {
                 Progress::UploadingSegment(index + 1, total_files)
@@ -90,8 +111,8 @@ pub async fn upload(
             let _ = tx.send(stage).await;
         }
 
-        // Read each part with size enforcement before hitting the API.
-        let file_size = file_size_checked(file_path, config).await?;
+        let file_path = part.path();
+        let file_size = file_size_checked(part, config, index + 1, total_files)?;
         tracing::trace!(
             part = index + 1,
             total = total_files,
@@ -118,7 +139,7 @@ pub async fn upload(
             total: total_files,
         };
 
-        let response = send_with_retry(&ctx, file_path, filename)
+        let response = send_with_retry(&ctx, part, filename)
             .instrument(tracing::info_span!(
                 "upload.part",
                 part = index + 1,
@@ -134,10 +155,8 @@ pub async fn upload(
         })?;
 
         if first_message_id.is_none() {
-            // Capture the first message for cleanup and threading.
             first_message_id = Some(message.id);
         }
-        // Keep the last message id to thread subsequent replies.
         last_message_id = Some(message.id);
         tracing::info!(
             part = index + 1,
@@ -160,27 +179,24 @@ pub async fn upload(
     })
 }
 
-/// Read the file into memory with a size check against the upload limit.
-///
-/// ## Security-sensitive paths
-/// Ensures file size does not exceed configured upload caps before reading.
-async fn file_size_checked(path: &Path, config: &EngineSettings) -> Result<u64, Error> {
-    let metadata = fs::metadata(path)
-        .await
-        .map_err(|e| Error::Core(azalea_core::pipeline::Error::Io(e)))?;
-    let file_size = metadata.len();
+fn file_size_checked(
+    part: &PreparedPart,
+    config: &EngineSettings,
+    part_number: usize,
+    total: usize,
+) -> Result<u64, Error> {
+    let file_size = part.size();
 
     tracing::trace!(
-        path = %path.display(),
+        path = %part.path().display(),
         size_bytes = file_size,
         "Reading upload file"
     );
 
     if file_size > config.transcode.max_upload_bytes {
-        // Hard size limit to prevent Discord API errors.
         return Err(Error::UploadFailed {
-            part: 1,
-            total: 1,
+            part: part_number,
+            total,
             source: Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "file too large",
@@ -189,10 +205,9 @@ async fn file_size_checked(path: &Path, config: &EngineSettings) -> Result<u64, 
     }
 
     if file_size > usize::MAX as u64 {
-        // Avoid reading into memory on platforms where size exceeds addressable space.
         return Err(Error::UploadFailed {
-            part: 1,
-            total: 1,
+            part: part_number,
+            total,
             source: Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "file size exceeds addressable memory",
@@ -203,12 +218,17 @@ async fn file_size_checked(path: &Path, config: &EngineSettings) -> Result<u64, 
     Ok(file_size)
 }
 
-async fn read_file_with_limit(path: &Path, config: &EngineSettings) -> Result<Vec<u8>, Error> {
-    let _ = file_size_checked(path, config).await?;
+async fn read_file_with_limit(
+    part: &PreparedPart,
+    config: &EngineSettings,
+    part_number: usize,
+    total: usize,
+) -> Result<Vec<u8>, Error> {
+    let size = file_size_checked(part, config, part_number, total)?;
 
-    let path = path.to_path_buf();
+    let path = part.path().to_path_buf();
     // Use a blocking task for file IO to avoid starving async tasks.
-    let data = tokio::task::spawn_blocking(move || read_file_preallocated(&path))
+    let data = tokio::task::spawn_blocking(move || read_file_preallocated(&path, size))
         .await
         .map_err(|e| Error::Core(azalea_core::pipeline::Error::Io(std::io::Error::other(e))))?
         .map_err(|e| Error::Core(azalea_core::pipeline::Error::Io(e)))?;
@@ -219,9 +239,8 @@ async fn read_file_with_limit(path: &Path, config: &EngineSettings) -> Result<Ve
 ///
 /// ## Performance hints
 /// Preallocation reduces reallocations for large uploads.
-fn read_file_preallocated(path: &Path) -> std::io::Result<Vec<u8>> {
+fn read_file_preallocated(path: &Path, size: u64) -> std::io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
-    let size = file.metadata()?.len();
     let capacity = checked_preallocation_len(size)?;
     // Preallocate to reduce reallocations for large uploads.
     let mut buf = Vec::with_capacity(capacity);
@@ -257,7 +276,7 @@ struct UploadRetryContext<'a> {
 
 async fn send_with_retry(
     ctx: &UploadRetryContext<'_>,
-    file_path: &Path,
+    part: &PreparedPart,
     filename: String,
 ) -> Result<twilight_http::Response<twilight_model::channel::Message>, Error> {
     const MAX_RETRIES: usize = 3;
@@ -268,11 +287,11 @@ async fn send_with_retry(
             part = ctx.part,
             total = ctx.total,
             attempt = attempt + 1,
-            path = %file_path.display(),
+            path = %part.path().display(),
             "Sending upload attempt"
         );
         // Re-read each attempt to avoid holding large buffers across retries.
-        let file_bytes = read_file_with_limit(file_path, ctx.config).await?;
+        let file_bytes = read_file_with_limit(part, ctx.config, ctx.part, ctx.total).await?;
         let attachment = Attachment {
             description: None,
             file: file_bytes,
@@ -402,6 +421,7 @@ fn jitter_millis(max_ms: u64) -> u64 {
 mod tests {
     use super::*;
     use azalea_core::config::EngineSettings;
+    use azalea_core::media::TempFileCleanup;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -423,6 +443,15 @@ mod tests {
 
     fn cleanup_file(path: &Path) {
         let _ = std::fs::remove_file(path);
+    }
+
+    fn prepared_part(path: &Path, size: u64) -> PreparedPart {
+        let temp_files = TempFileCleanup::new();
+        PreparedPart::new(
+            path.to_path_buf(),
+            size,
+            temp_files.guard(path.to_path_buf()),
+        )
     }
 
     #[test]
@@ -496,12 +525,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_size_checked_missing_file_returns_not_found() {
+    async fn read_file_with_limit_missing_file_returns_not_found() {
         let config = EngineSettings::default();
         let path = unique_temp_file_path("missing-size-check");
         cleanup_file(&path);
 
-        let result = file_size_checked(&path, &config).await;
+        let part = prepared_part(&path, 4);
+        let result = read_file_with_limit(&part, &config, 1, 1).await;
         assert!(matches!(
             result,
             Err(Error::Core(azalea_core::pipeline::Error::Io(ref err)))
@@ -515,7 +545,8 @@ mod tests {
         let mut config = EngineSettings::default();
         config.transcode.max_upload_bytes = 4;
 
-        let result = file_size_checked(&path, &config).await;
+        let part = prepared_part(&path, 8);
+        let result = file_size_checked(&part, &config, 1, 1);
         cleanup_file(&path);
 
         let rendered = result.as_ref().err().map(ToString::to_string);
@@ -541,7 +572,8 @@ mod tests {
         let mut config = EngineSettings::default();
         config.transcode.max_upload_bytes = payload.len() as u64 + 1;
 
-        let result = file_size_checked(&path, &config).await;
+        let part = prepared_part(&path, payload.len() as u64);
+        let result = file_size_checked(&part, &config, 1, 1);
         cleanup_file(&path);
 
         assert_eq!(result.ok(), Some(payload.len() as u64));
@@ -552,7 +584,7 @@ mod tests {
         let path = unique_temp_file_path("missing-read-preallocated");
         cleanup_file(&path);
 
-        let result = read_file_preallocated(&path);
+        let result = read_file_preallocated(&path, 1);
         assert!(matches!(
             result,
             Err(ref err) if err.kind() == std::io::ErrorKind::NotFound
@@ -574,7 +606,7 @@ mod tests {
     fn read_file_preallocated_normal_file_returns_contents() {
         let payload = b"normal-read";
         let path = write_temp_file("normal-read-preallocated", payload);
-        let result = read_file_preallocated(&path);
+        let result = read_file_preallocated(&path, payload.len() as u64);
         cleanup_file(&path);
 
         assert_eq!(result.ok().as_deref(), Some(payload.as_slice()));

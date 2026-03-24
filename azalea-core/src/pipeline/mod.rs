@@ -24,7 +24,7 @@ pub mod types;
 
 pub use errors::Error;
 pub use resolve::ResolverChain;
-pub use types::{Job, PreparedUpload, Progress, RequestId};
+pub use types::{Job, PreparedPart, PreparedUpload, Progress, RequestId};
 
 use crate::engine::Engine;
 use crate::pipeline::errors::DownloadError;
@@ -210,7 +210,7 @@ pub async fn run(
                 warn_if_slow(Stage::Optimize, optimize_duration_ms, OPTIMIZE_WARN_MS);
                 let (prepared_kind, prepared_parts) = match &prepared {
                     types::PreparedUpload::Single { .. } => ("single", 1),
-                    types::PreparedUpload::Split { paths, .. } => ("split", paths.len()),
+                    types::PreparedUpload::Split { parts, .. } => ("split", parts.len()),
                 };
                 tracing::info!(
                     duration_ms = optimize_duration_ms,

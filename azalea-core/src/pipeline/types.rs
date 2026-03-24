@@ -5,7 +5,11 @@
 //! - Guards own temporary files until upload completes.
 //! - `RequestId` is stable across all log statements for a job.
 
-use std::{borrow::Cow, fmt, path::PathBuf};
+use std::{
+    borrow::Cow,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use crate::media::{TempFileGuard, TweetLink};
 
@@ -191,26 +195,76 @@ pub struct DownloadedFile {
     pub _dir_guard: Option<TempFileGuard>,
 }
 
+/// Upload-ready media artifact paired with the guard that keeps it alive.
+#[derive(Debug)]
+pub struct PreparedPart {
+    path: PathBuf,
+    size: u64,
+    _guard: TempFileGuard,
+}
+
+impl PreparedPart {
+    pub fn new(path: PathBuf, size: u64, guard: TempFileGuard) -> Self {
+        Self {
+            path,
+            size,
+            _guard: guard,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
 /// Output of optimize stage.
-///
-/// ## Postconditions
-/// All paths are ready for upload; segments are ordered when `Split`.
 #[derive(Debug)]
 pub enum PreparedUpload {
     Single {
-        path: PathBuf,
-        /// Keep the single output file alive until upload completes.
-        _guard: TempFileGuard,
+        part: PreparedPart,
         /// Directory guard for intermediate artifacts.
         _dir_guard: TempFileGuard,
     },
     Split {
-        paths: Vec<PathBuf>,
-        /// Guards for each produced segment.
-        _guards: Vec<TempFileGuard>,
+        parts: Vec<PreparedPart>,
         /// Directory guard for intermediate artifacts.
         _dir_guard: TempFileGuard,
     },
+}
+
+impl PreparedUpload {
+    pub fn single(part: PreparedPart, dir_guard: TempFileGuard) -> Self {
+        Self::Single {
+            part,
+            _dir_guard: dir_guard,
+        }
+    }
+
+    pub fn split(parts: Vec<PreparedPart>, dir_guard: TempFileGuard) -> Self {
+        debug_assert!(
+            !parts.is_empty(),
+            "split uploads must contain at least one part"
+        );
+        Self::Split {
+            parts,
+            _dir_guard: dir_guard,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Single { .. } => 1,
+            Self::Split { parts, .. } => parts.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Split { parts, .. } if parts.is_empty())
+    }
 }
 
 /// Stages of pipeline processing for progress updates.
