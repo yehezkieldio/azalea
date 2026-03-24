@@ -60,6 +60,10 @@ where
 
 fn is_corruption_error(error: &redb::Error) -> bool {
     matches!(error, redb::Error::Corrupted(_))
+        || matches!(
+            error,
+            redb::Error::Io(io_error) if io_error.kind() == std::io::ErrorKind::InvalidData
+        )
 }
 
 fn rotate_corrupt_store(path: &Path) -> anyhow::Result<PathBuf> {
