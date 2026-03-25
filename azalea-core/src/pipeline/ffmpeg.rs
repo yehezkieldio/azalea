@@ -29,6 +29,8 @@ use tracing::{Instrument as _, debug, trace, warn};
 pub type Args = SmallVec<[OsString; 40]>;
 
 const MAX_FFMPEG_KBPS: u64 = 100_000;
+const FFMPEG_ERROR_STDERR_TAIL_LINES: usize = 10;
+const FFMPEG_SUCCESS_STDERR_TAIL_LINES: usize = 20;
 
 fn clamp_kbps(value: u64) -> u64 {
     value.min(MAX_FFMPEG_KBPS)
@@ -45,6 +47,22 @@ fn arg_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
         }
         args.get(index + 1).and_then(|value| value.to_str())
     })
+}
+
+fn format_stderr_tail(stderr: &[u8], max_lines: usize, truncated: bool) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    let mut joined = lines.join("\n");
+    if truncated {
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined.push_str("[stderr truncated]");
+    }
+    joined
 }
 
 /// Stream-copy paths write MP4 outputs, so only MP4-friendly codecs qualify.
@@ -408,25 +426,29 @@ pub async fn execute(
             }
         };
 
-        // Capture only the tail of stderr to keep error payloads bounded.
-        let stderr_output = match stderr_handle.await {
-            Ok(Ok(output)) => {
-                let text = String::from_utf8_lossy(&output.data);
-                let mut lines: Vec<&str> = text.lines().collect();
-                if lines.len() > 10 {
-                    lines = lines.split_off(lines.len() - 10);
-                }
-                let mut joined = lines.join("\n");
-                if output.exceeded {
-                    if !joined.is_empty() {
-                        joined.push('\n');
-                    }
-                    joined.push_str("[stderr truncated]");
-                }
-                joined
+        // Keep error payloads compact while still surfacing ffmpeg's final
+        // encoder progress lines in debug logs on successful runs.
+        let (stderr_error_tail, stderr_debug_tail) = match stderr_handle.await {
+            Ok(Ok(output)) => (
+                format_stderr_tail(
+                    &output.data,
+                    FFMPEG_ERROR_STDERR_TAIL_LINES,
+                    output.exceeded,
+                ),
+                format_stderr_tail(
+                    &output.data,
+                    FFMPEG_SUCCESS_STDERR_TAIL_LINES,
+                    output.exceeded,
+                ),
+            ),
+            Ok(Err(e)) => {
+                let error = format!("stderr read failed: {e}");
+                (error.clone(), error)
             }
-            Ok(Err(e)) => format!("stderr read failed: {e}"),
-            Err(_) => "unknown stderr error".to_string(),
+            Err(_) => {
+                let error = "unknown stderr error".to_string();
+                (error.clone(), error)
+            }
         };
 
         if !status.success() {
@@ -439,13 +461,14 @@ pub async fn execute(
             return Err(Error::TranscodeFailed {
                 stage,
                 exit_code: status.code(),
-                stderr_tail: stderr_output,
+                stderr_tail: stderr_error_tail,
             });
         }
 
-        trace!(
+        debug!(
             ?stage,
             elapsed_ms = started.elapsed().as_millis() as u64,
+            stderr_tail = %stderr_debug_tail,
             "ffmpeg execution succeeded"
         );
         Ok(())
@@ -499,6 +522,31 @@ mod tests {
         let as_text = to_strings(&args);
         assert!(as_text.windows(2).any(|w| w == ["-f", "segment"]));
         assert!(as_text.windows(2).any(|w| w == ["-segment_time", "11.5"]));
+    }
+
+    #[test]
+    fn format_stderr_tail_keeps_last_20_lines_for_success_logs() {
+        let stderr = (1..=25)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let tail = format_stderr_tail(stderr.as_bytes(), FFMPEG_SUCCESS_STDERR_TAIL_LINES, false);
+
+        assert_eq!(
+            tail,
+            (6..=25)
+                .map(|line| format!("line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn format_stderr_tail_appends_truncation_marker() {
+        let tail = format_stderr_tail(b"speed=8.2x\n", FFMPEG_SUCCESS_STDERR_TAIL_LINES, true);
+
+        assert_eq!(tail, "speed=8.2x\n[stderr truncated]");
     }
 
     #[test]
