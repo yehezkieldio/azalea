@@ -7,21 +7,21 @@
 //! This is a simple, approximate limiter; it prioritizes low overhead over
 //! perfect precision (see `moka` TTL semantics).
 
+use crate::ids::{ChannelId, UserId};
 use moka::future::Cache;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
 };
 use std::time::Duration;
-use twilight_model::id::Id;
 
-/// Per-user rate limiter with sliding window.
+/// Sliding-window limiter backed by a TTL cache keyed on raw Discord ids.
 ///
 /// ## Invariants
-/// - Counters are stored per user id and expire after the TTL window.
-/// - `max_requests == 0` disables limiting (see [`RateLimiter::check`]).
+/// - Counters are stored per Discord id and expire after the TTL window.
+/// - `max_requests == 0` disables limiting (see [`RateLimiter::check_raw`]).
 #[derive(Debug, Clone)]
-pub struct RateLimiter {
+struct RateLimiter {
     cache: Cache<u64, Arc<AtomicU32>>,
     max_requests: u32,
 }
@@ -50,16 +50,15 @@ impl RateLimiter {
     ///
     /// The counter is updated with relaxed ordering because we only need
     /// eventual convergence on a per-user count, not a total ordering.
-    pub async fn check<Marker>(&self, id: Id<Marker>) -> bool {
+    async fn check_raw(&self, id: u64) -> bool {
         if self.max_requests == 0 {
             // Explicitly disabled: always allow.
             return true;
         }
 
-        let user_key = id.get();
         let counter = self
             .cache
-            .get_with(user_key, async { Arc::new(AtomicU32::new(0)) })
+            .get_with(id, async { Arc::new(AtomicU32::new(0)) })
             .await;
         // Relaxed ordering is sufficient for a per-user approximate count.
         let current = counter.fetch_add(1, Ordering::Relaxed);
@@ -67,15 +66,40 @@ impl RateLimiter {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct UserRateLimiter(RateLimiter);
+
+impl UserRateLimiter {
+    pub fn new(max_requests: u32, window_secs: u64) -> Self {
+        Self(RateLimiter::new(max_requests, window_secs))
+    }
+
+    pub async fn check(&self, id: UserId) -> bool {
+        self.0.check_raw(id.get()).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelRateLimiter(RateLimiter);
+
+impl ChannelRateLimiter {
+    pub fn new(max_requests: u32, window_secs: u64) -> Self {
+        Self(RateLimiter::new(max_requests, window_secs))
+    }
+
+    pub async fn check(&self, id: ChannelId) -> bool {
+        self.0.check_raw(id.get()).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use twilight_model::id::{Id, marker::UserMarker};
 
     #[tokio::test]
     async fn zero_limit_disables_rate_limiting() {
-        let limiter = RateLimiter::new(0, 60);
-        let user = Id::<UserMarker>::new(1);
+        let limiter = UserRateLimiter::new(0, 60);
+        let user = UserId::new(1);
         for _ in 0..10 {
             assert!(limiter.check(user).await);
         }
@@ -83,8 +107,8 @@ mod tests {
 
     #[tokio::test]
     async fn per_user_limit_is_enforced() {
-        let limiter = RateLimiter::new(2, 60);
-        let user = Id::<UserMarker>::new(42);
+        let limiter = UserRateLimiter::new(2, 60);
+        let user = UserId::new(42);
 
         assert!(limiter.check(user).await);
         assert!(limiter.check(user).await);
@@ -93,9 +117,9 @@ mod tests {
 
     #[tokio::test]
     async fn users_are_isolated() {
-        let limiter = RateLimiter::new(1, 60);
-        let user_a = Id::<UserMarker>::new(1);
-        let user_b = Id::<UserMarker>::new(2);
+        let limiter = UserRateLimiter::new(1, 60);
+        let user_a = UserId::new(1);
+        let user_b = UserId::new(2);
 
         assert!(limiter.check(user_a).await);
         assert!(limiter.check(user_b).await);

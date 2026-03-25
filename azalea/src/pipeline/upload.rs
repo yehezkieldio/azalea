@@ -8,6 +8,7 @@
 //! ## Trade-off acknowledgment
 //! We upload parts sequentially to simplify ordering and rate limit handling.
 
+use crate::ids::{ChannelId, MessageId};
 use crate::pipeline::{Error, Progress, UploadOutcome};
 use azalea_core::concurrency::Permits;
 use azalea_core::config::EngineSettings;
@@ -25,8 +26,6 @@ use twilight_http::error::Error as TwilightError;
 use twilight_http::error::ErrorType;
 use twilight_http::response::StatusCode;
 use twilight_model::http::attachment::Attachment;
-use twilight_model::id::marker::MessageMarker;
-use twilight_model::id::{Id, marker::ChannelMarker};
 
 /// Upload prepared media, chaining messages when multiple parts are required.
 ///
@@ -38,7 +37,7 @@ use twilight_model::id::{Id, marker::ChannelMarker};
 /// - Returns message ids for downstream cleanup.
 pub async fn upload(
     prepared: &PreparedUpload,
-    channel_id: Id<ChannelMarker>,
+    channel_id: ChannelId,
     tweet_id: TweetId,
     discord: &Client,
     permits: &Permits,
@@ -80,7 +79,7 @@ pub async fn upload(
 
 async fn upload_parts(
     parts: &[PreparedPart],
-    channel_id: Id<ChannelMarker>,
+    channel_id: ChannelId,
     tweet_id: TweetId,
     discord: &Client,
     config: &EngineSettings,
@@ -155,9 +154,9 @@ async fn upload_parts(
         })?;
 
         if first_message_id.is_none() {
-            first_message_id = Some(message.id);
+            first_message_id = Some(MessageId::from(message.id));
         }
-        last_message_id = Some(message.id);
+        last_message_id = Some(MessageId::from(message.id));
         tracing::info!(
             part = index + 1,
             total = total_files,
@@ -267,8 +266,8 @@ fn checked_preallocation_len(size: u64) -> std::io::Result<usize> {
 
 struct UploadRetryContext<'a> {
     discord: &'a Client,
-    channel_id: Id<ChannelMarker>,
-    reply_to: Option<Id<MessageMarker>>,
+    channel_id: ChannelId,
+    reply_to: Option<MessageId>,
     config: &'a EngineSettings,
     part: usize,
     total: usize,
@@ -296,9 +295,9 @@ async fn send_with_retry(
             "Sending upload attempt"
         );
 
-        let mut request = ctx.discord.create_message(ctx.channel_id);
+        let mut request = ctx.discord.create_message(ctx.channel_id.into());
         if let Some(reply_to) = ctx.reply_to {
-            request = request.reply(reply_to);
+            request = request.reply(reply_to.into());
         }
 
         match request.attachments(std::slice::from_ref(&attachment)).await {

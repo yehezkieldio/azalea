@@ -4,6 +4,10 @@
 //! `generate-config [output-path|-]` writes the template to a file or stdout.
 #![allow(unused_crate_dependencies)]
 
+#[path = "../ids.rs"]
+#[allow(dead_code)]
+mod ids;
+
 #[path = "../config.rs"]
 #[allow(dead_code)]
 mod config;

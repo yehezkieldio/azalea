@@ -6,6 +6,7 @@
 
 use crate::app::App;
 use crate::config::ApplicationId;
+use crate::ids::{ChannelId, InteractionId, UserId};
 use crate::pipeline::{Job, RequestId};
 use azalea_core::media;
 use azalea_core::storage::Stage;
@@ -20,8 +21,6 @@ use twilight_model::application::interaction::application_command::{
 use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::channel::message::MessageFlags;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
-use twilight_model::id::Id;
-use twilight_model::id::marker::InteractionMarker;
 use twilight_util::builder::InteractionResponseDataBuilder;
 use twilight_util::builder::command::{CommandBuilder, StringBuilder};
 
@@ -31,7 +30,7 @@ use twilight_util::builder::command::{CommandBuilder, StringBuilder};
 pub async fn register(client: &Client, application_id: ApplicationId) -> anyhow::Result<()> {
     let commands = build_commands();
     client
-        .interaction(application_id.get())
+        .interaction(application_id.into())
         .set_global_commands(&commands)
         .await?
         .model()
@@ -48,10 +47,13 @@ pub async fn handle_interaction(
     interaction: Interaction,
     job_sender: &mpsc::Sender<Job>,
 ) -> anyhow::Result<()> {
-    let interaction_id = interaction.id;
+    let interaction_id = InteractionId::from(interaction.id);
     let token = interaction.token.clone();
-    let channel_id = interaction.channel.as_ref().map(|channel| channel.id);
-    let author_id = interaction.author_id();
+    let channel_id = interaction
+        .channel
+        .as_ref()
+        .map(|channel| ChannelId::from(channel.id));
+    let author_id = interaction.author_id().map(UserId::from);
 
     let Some(data) = interaction.data else {
         return Ok(());
@@ -92,7 +94,7 @@ pub async fn handle_interaction(
 
     respond(
         &app.discord,
-        app.config.application_id.get(),
+        app.config.application_id,
         interaction_id,
         &token,
         response,
@@ -120,9 +122,9 @@ fn build_commands() -> Vec<twilight_model::application::command::Command> {
 
 async fn handle_media_command(
     app: &App,
-    channel_id: Option<Id<twilight_model::id::marker::ChannelMarker>>,
-    author_id: Option<Id<twilight_model::id::marker::UserMarker>>,
-    interaction_id: Id<InteractionMarker>,
+    channel_id: Option<ChannelId>,
+    author_id: Option<UserId>,
+    interaction_id: InteractionId,
     options: &[CommandDataOption],
     job_sender: &mpsc::Sender<Job>,
 ) -> String {
@@ -173,7 +175,7 @@ async fn handle_media_command(
     let job = Job::new(
         RequestId(app.next_request_id()),
         channel_id,
-        interaction_id.get(),
+        interaction_id,
         None,
         author_id,
         tweet_url,
@@ -198,14 +200,14 @@ async fn handle_media_command(
 /// Issue a single interaction response and propagate errors.
 async fn respond(
     client: &Client,
-    application_id: Id<twilight_model::id::marker::ApplicationMarker>,
-    interaction_id: Id<InteractionMarker>,
+    application_id: ApplicationId,
+    interaction_id: InteractionId,
     token: &str,
     response: InteractionResponse,
 ) -> anyhow::Result<()> {
     client
-        .interaction(application_id)
-        .create_response(interaction_id, token, &response)
+        .interaction(application_id.into())
+        .create_response(interaction_id.into(), token, &response)
         .await?;
     Ok(())
 }
@@ -304,11 +306,10 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
-    use crate::config::{AppConfig, ApplicationId};
+    use crate::config::AppConfig;
     use azalea_core::config::HardwareAcceleration;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use twilight_model::id::marker::{ChannelMarker, UserMarker};
 
     fn unique_temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -348,13 +349,13 @@ mod tests {
     async fn handle_media_command_rejects_missing_channel() {
         let app = test_app();
         let (job_sender, _job_receiver) = mpsc::channel(1);
-        let author_id = Some(Id::<UserMarker>::new(42));
+        let author_id = Some(UserId::new(42));
 
         let response = handle_media_command(
             &app,
             None,
             author_id,
-            Id::new(10),
+            InteractionId::new(10),
             &[url_option("https://x.com/rustlang/status/123")],
             &job_sender,
         )
@@ -367,13 +368,13 @@ mod tests {
     async fn handle_media_command_rejects_missing_author() {
         let app = test_app();
         let (job_sender, _job_receiver) = mpsc::channel(1);
-        let channel_id = Some(Id::<ChannelMarker>::new(24));
+        let channel_id = Some(ChannelId::new(24));
 
         let response = handle_media_command(
             &app,
             channel_id,
             None,
-            Id::new(11),
+            InteractionId::new(11),
             &[url_option("https://x.com/rustlang/status/123")],
             &job_sender,
         )
@@ -386,11 +387,18 @@ mod tests {
     async fn handle_media_command_rejects_missing_url() {
         let app = test_app();
         let (job_sender, _job_receiver) = mpsc::channel(1);
-        let channel_id = Some(Id::<ChannelMarker>::new(25));
-        let author_id = Some(Id::<UserMarker>::new(43));
+        let channel_id = Some(ChannelId::new(25));
+        let author_id = Some(UserId::new(43));
 
-        let response =
-            handle_media_command(&app, channel_id, author_id, Id::new(12), &[], &job_sender).await;
+        let response = handle_media_command(
+            &app,
+            channel_id,
+            author_id,
+            InteractionId::new(12),
+            &[],
+            &job_sender,
+        )
+        .await;
 
         assert_eq!(response, "missing required URL.");
     }
@@ -399,14 +407,14 @@ mod tests {
     async fn handle_media_command_rejects_invalid_url() {
         let app = test_app();
         let (job_sender, _job_receiver) = mpsc::channel(1);
-        let channel_id = Some(Id::<ChannelMarker>::new(26));
-        let author_id = Some(Id::<UserMarker>::new(44));
+        let channel_id = Some(ChannelId::new(26));
+        let author_id = Some(UserId::new(44));
 
         let response = handle_media_command(
             &app,
             channel_id,
             author_id,
-            Id::new(13),
+            InteractionId::new(13),
             &[url_option("not-a-url")],
             &job_sender,
         )
@@ -419,14 +427,14 @@ mod tests {
     async fn handle_media_command_rejects_multiple_urls() {
         let app = test_app();
         let (job_sender, _job_receiver) = mpsc::channel(1);
-        let channel_id = Some(Id::<ChannelMarker>::new(27));
-        let author_id = Some(Id::<UserMarker>::new(45));
+        let channel_id = Some(ChannelId::new(27));
+        let author_id = Some(UserId::new(45));
 
         let response = handle_media_command(
             &app,
             channel_id,
             author_id,
-            Id::new(14),
+            InteractionId::new(14),
             &[url_option(
                 "https://x.com/rustlang/status/123 https://x.com/rustlang/status/456",
             )],

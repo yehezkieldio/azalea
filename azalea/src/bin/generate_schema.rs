@@ -7,6 +7,10 @@
 //! - Taplo schema format: <https://taplo.tamasfe.dev/configuration/schema.html>
 #![allow(unused_crate_dependencies)]
 
+#[path = "../ids.rs"]
+#[allow(dead_code)]
+mod ids;
+
 #[path = "../config.rs"]
 #[allow(dead_code)]
 mod config;

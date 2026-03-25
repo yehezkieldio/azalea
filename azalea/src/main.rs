@@ -20,6 +20,7 @@ mod concurrency;
 mod config;
 mod discord;
 mod gateway;
+mod ids;
 mod pipeline;
 mod shutdown;
 
@@ -604,7 +605,7 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
             let span = tracing::info_span!(
                 "pipeline_run",
                 request_id = job.request_id.0,
-                trigger_id = job.trigger_id,
+                trigger_id = job.trigger_id.get(),
                 tweet_id = job.tweet_url.tweet_id.0,
                 channel_id = job.channel_id.get(),
                 author_id = job.author_id.get(),

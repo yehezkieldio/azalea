@@ -6,7 +6,7 @@
 //! progress/error messages during pipeline execution.
 
 pub mod commands;
-pub mod responder;
+mod responder;
 
 pub use commands::{handle_interaction, register};
 pub use responder::{

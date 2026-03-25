@@ -8,16 +8,13 @@
 //! Updates are best-effort; failures are logged but do not interrupt the
 //! pipeline to preserve throughput.
 
+use crate::ids::{ChannelId, MessageId};
 use crate::pipeline::{Error, Progress};
 use azalea_core::storage::Metrics;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use twilight_http::Client;
-use twilight_model::id::{
-    Id,
-    marker::{ChannelMarker, MessageMarker},
-};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ErrorNotificationPolicy {
@@ -39,16 +36,16 @@ fn error_notification_policy(error: &Error) -> ErrorNotificationPolicy {
 /// Returns `Some(id)` when the message was created successfully.
 pub async fn send_processing(
     client: &Client,
-    channel_id: Id<ChannelMarker>,
-    reply_to: Option<Id<MessageMarker>>,
-) -> Option<Id<MessageMarker>> {
-    let mut request = client.create_message(channel_id);
+    channel_id: ChannelId,
+    reply_to: Option<MessageId>,
+) -> Option<MessageId> {
+    let mut request = client.create_message(channel_id.into());
     if let Some(reply_to) = reply_to {
-        request = request.reply(reply_to);
+        request = request.reply(reply_to.into());
     }
 
     match request.content("Processing your tweet...").await {
-        Ok(response) => response.model().await.ok().map(|m| m.id),
+        Ok(response) => response.model().await.ok().map(|m| MessageId::from(m.id)),
         Err(e) => {
             tracing::warn!(error = %e, "Failed to send processing message");
             None
@@ -65,12 +62,12 @@ pub async fn send_processing(
 pub async fn update_progress(
     client: &Client,
     metrics: &Metrics,
-    channel_id: Id<ChannelMarker>,
-    message_id: Id<MessageMarker>,
+    channel_id: ChannelId,
+    message_id: MessageId,
     stage: &Progress,
 ) {
     if let Err(e) = client
-        .update_message(channel_id, message_id)
+        .update_message(channel_id.into(), message_id.into())
         .content(Some(&format!("Processing: {}", stage)))
         .await
     {
@@ -87,8 +84,8 @@ pub async fn update_progress(
 pub fn spawn_progress_updates(
     client: Arc<Client>,
     metrics: Metrics,
-    channel_id: Id<ChannelMarker>,
-    message_id: Id<MessageMarker>,
+    channel_id: ChannelId,
+    message_id: MessageId,
     mut progress_rx: mpsc::Receiver<Progress>,
     debounce: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -123,13 +120,15 @@ pub fn spawn_progress_updates(
 /// Callers should pass the original reply id if they want to edit-in-place.
 pub async fn send_error(
     client: &Client,
-    channel_id: Id<ChannelMarker>,
-    reply_to: Option<Id<MessageMarker>>,
+    channel_id: ChannelId,
+    reply_to: Option<MessageId>,
     error: &Error,
 ) {
     if error_notification_policy(error) == ErrorNotificationPolicy::SilentDelete {
         if let Some(msg_id) = reply_to {
-            let _ = client.delete_message(channel_id, msg_id).await;
+            let _ = client
+                .delete_message(channel_id.into(), msg_id.into())
+                .await;
         }
 
         return;
@@ -137,24 +136,23 @@ pub async fn send_error(
 
     if let Some(msg_id) = reply_to {
         let _ = client
-            .update_message(channel_id, msg_id)
+            .update_message(channel_id.into(), msg_id.into())
             .content(Some(error.user_message()))
             .await;
     } else {
         let _ = client
-            .create_message(channel_id)
+            .create_message(channel_id.into())
             .content(error.user_message())
             .await;
     }
 }
 
 /// Remove the temporary "processing" message after completion.
-pub async fn cleanup_processing(
-    client: &Client,
-    channel_id: Id<ChannelMarker>,
-    message_id: Id<MessageMarker>,
-) {
-    if let Err(e) = client.delete_message(channel_id, message_id).await {
+pub async fn cleanup_processing(client: &Client, channel_id: ChannelId, message_id: MessageId) {
+    if let Err(e) = client
+        .delete_message(channel_id.into(), message_id.into())
+        .await
+    {
         tracing::warn!(error = %e, "Failed to delete processing message");
     }
 }
@@ -165,11 +163,11 @@ pub async fn cleanup_processing(
 /// Keeps the channel tidy after successful processing.
 pub async fn delete_original(
     client: &Client,
-    channel_id: Id<ChannelMarker>,
-    message_id: Id<MessageMarker>,
+    channel_id: ChannelId,
+    message_id: MessageId,
 ) -> Result<(), Error> {
     client
-        .delete_message(channel_id, message_id)
+        .delete_message(channel_id.into(), message_id.into())
         .await
         .map_err(|e| Error::DiscordApi {
             operation: "delete_message",

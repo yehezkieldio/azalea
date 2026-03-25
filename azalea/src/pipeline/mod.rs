@@ -6,14 +6,11 @@
 
 pub mod upload;
 
+use crate::ids::{ChannelId, InteractionId, MessageId, UserId};
 use azalea_core::media::TweetLink;
 use azalea_core::pipeline::{Error as CoreError, Job as CoreJob};
 pub use azalea_core::pipeline::{Progress, RequestId};
 use std::fmt;
-use twilight_model::id::{
-    Id,
-    marker::{ChannelMarker, MessageMarker, UserMarker},
-};
 
 /// Input to the application pipeline.
 ///
@@ -22,10 +19,10 @@ use twilight_model::id::{
 #[derive(Debug, Clone)]
 pub struct Job {
     pub request_id: RequestId,
-    pub channel_id: Id<ChannelMarker>,
-    pub trigger_id: u64,
-    pub source_message_id: Option<Id<MessageMarker>>,
-    pub author_id: Id<UserMarker>,
+    pub channel_id: ChannelId,
+    pub trigger_id: InteractionId,
+    pub source_message_id: Option<MessageId>,
+    pub author_id: UserId,
     pub tweet_url: TweetLink,
 }
 
@@ -33,10 +30,10 @@ impl Job {
     /// Construct a pipeline job from gateway context and parsed tweet URL.
     pub fn new(
         request_id: RequestId,
-        channel_id: Id<ChannelMarker>,
-        trigger_id: u64,
-        source_message_id: Option<Id<MessageMarker>>,
-        author_id: Id<UserMarker>,
+        channel_id: ChannelId,
+        trigger_id: InteractionId,
+        source_message_id: Option<MessageId>,
+        author_id: UserId,
         tweet_url: TweetLink,
     ) -> Self {
         Self {
@@ -57,7 +54,7 @@ impl Job {
         CoreJob::new(
             self.request_id,
             self.channel_id.get(),
-            self.trigger_id,
+            self.trigger_id.get(),
             self.tweet_url.clone(),
         )
     }
@@ -69,7 +66,7 @@ impl Job {
 /// `first_message_id` is always set when `messages_sent > 0`.
 #[derive(Debug)]
 pub struct UploadOutcome {
-    pub first_message_id: Id<MessageMarker>,
+    pub first_message_id: MessageId,
     pub messages_sent: usize,
 }
 

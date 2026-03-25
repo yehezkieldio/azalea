@@ -11,6 +11,7 @@
 //! ## References
 //! - TOML spec: <https://toml.io/en/>
 
+pub use crate::ids::ApplicationId;
 use azalea_core::config::EngineSettings;
 use figment::{
     Figment,
@@ -20,45 +21,10 @@ use serde::Deserialize;
 use serde_json::{Map, Number, Value};
 use std::fmt;
 use std::time::Duration;
-use twilight_model::id::{Id, marker::ApplicationMarker};
 
 /// Default configuration file path.
 const CONFIG_FILE: &str = "azalea.config.toml";
 const DOTENV_FILE: &str = ".env";
-
-/// Application ID wrapper for type safety.
-///
-/// ## Invariants
-/// `0` is treated as invalid and rejected during deserialization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schemars", schemars(transparent))]
-pub struct ApplicationId(pub u64);
-
-impl ApplicationId {
-    /// Wrap a raw Discord application id.
-    pub fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// Convert to the strongly-typed Twilight id used by gateway/http clients.
-    pub fn get(self) -> Id<ApplicationMarker> {
-        Id::new(self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ApplicationId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = u64::deserialize(deserializer)?;
-        if raw == 0 {
-            return Err(serde::de::Error::custom("application_id must be non-zero"));
-        }
-        Ok(Self::new(raw))
-    }
-}
 
 /// Secret token used to authenticate with Discord.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -186,7 +152,7 @@ impl AppConfig {
     /// ## Postconditions
     /// - All runtime constraints and core engine limits are satisfied.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.application_id.0 == 0 {
+        if self.application_id.get() == 0 {
             anyhow::bail!(
                 "application_id must be set (via config, APPLICATION_ID, or AZALEA_APPLICATION_ID)"
             );
@@ -748,7 +714,7 @@ mod tests {
             ],
         })?;
 
-        assert_eq!(loaded.app.application_id.0, 33);
+        assert_eq!(loaded.app.application_id.get(), 33);
         assert_eq!(loaded.app.runtime.worker_threads, 6);
         assert_eq!(loaded.auth.discord_token.as_str(), "env-token");
         Ok(())
@@ -765,7 +731,7 @@ mod tests {
             ],
         })?;
 
-        assert_eq!(loaded.app.application_id.0, 123456789);
+        assert_eq!(loaded.app.application_id.get(), 123456789);
         assert_eq!(loaded.auth.discord_token.as_str(), "secret");
         Ok(())
     }

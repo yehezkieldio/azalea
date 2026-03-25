@@ -11,7 +11,7 @@
 //! ## Explicit non-goals
 //! This module does not implement Discord request handling; see `discord`.
 
-use crate::concurrency::RateLimiter;
+use crate::concurrency::{ChannelRateLimiter, UserRateLimiter};
 use crate::config::AppConfig;
 use azalea_core::Engine;
 use std::sync::{
@@ -30,8 +30,8 @@ pub struct App {
     pub discord: Arc<DiscordClient>,
     pub config: AppConfig,
     pub engine: Engine,
-    pub user_rate_limiter: RateLimiter,
-    pub channel_rate_limiter: RateLimiter,
+    pub user_rate_limiter: UserRateLimiter,
+    pub channel_rate_limiter: ChannelRateLimiter,
     pub queue_depth: Arc<AtomicUsize>,
     // Monotonic-ish ids for log correlation; uniqueness matters, not ordering.
     request_counter: Arc<AtomicU64>,
@@ -48,11 +48,11 @@ impl App {
     /// - `engine` subsystems are ready for pipeline execution.
     pub fn new(config: AppConfig, discord: DiscordClient) -> anyhow::Result<Self> {
         let engine = Engine::new(config.engine.clone())?;
-        let user_rate_limiter = RateLimiter::new(
+        let user_rate_limiter = UserRateLimiter::new(
             config.engine.pipeline.user_rate_limit_requests,
             config.engine.pipeline.user_rate_limit_window_secs,
         );
-        let channel_rate_limiter = RateLimiter::new(
+        let channel_rate_limiter = ChannelRateLimiter::new(
             config.engine.pipeline.channel_rate_limit_requests,
             config.engine.pipeline.channel_rate_limit_window_secs,
         );

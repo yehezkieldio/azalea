@@ -7,4 +7,4 @@
 
 pub mod ratelimit;
 
-pub use ratelimit::RateLimiter;
+pub use ratelimit::{ChannelRateLimiter, UserRateLimiter};
