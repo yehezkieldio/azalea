@@ -12,7 +12,7 @@ pub mod dedup;
 pub mod metrics;
 
 pub use dedup::Cache as DedupCache;
-pub use metrics::{Snapshot as MetricsSnapshot, Stage, Tracker as Metrics};
+pub use metrics::{ErrorCategory, Snapshot as MetricsSnapshot, Stage, Tracker as Metrics};
 
 /// Open a redb store, rotating the file aside when the on-disk contents are
 /// corrupt so startup can continue with a fresh database.

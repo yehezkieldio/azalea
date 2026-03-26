@@ -10,7 +10,7 @@
 
 use crate::ids::{ChannelId, MessageId};
 use crate::pipeline::{Error, Progress};
-use azalea_core::storage::Metrics;
+use azalea_core::storage::{ErrorCategory, Metrics};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -72,7 +72,7 @@ pub async fn update_progress(
         .await
     {
         // Metrics are best-effort; avoid surfacing Discord hiccups as failures.
-        metrics.record_error("progress_update_errors");
+        metrics.record_error(ErrorCategory::ProgressUpdateFailed);
         tracing::debug!(error = %e, "Failed to update progress");
     }
 }

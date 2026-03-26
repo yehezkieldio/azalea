@@ -28,7 +28,7 @@ use app::App;
 use azalea_core::config::{BinarySettings, HardwareAcceleration, TranscodeSettings};
 use azalea_core::media;
 use azalea_core::pipeline as core_pipeline;
-use azalea_core::storage::Stage;
+use azalea_core::storage::{ErrorCategory, Stage};
 use config::AppConfig;
 use mimalloc::MiMalloc;
 use std::{
@@ -683,7 +683,7 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             }
                             Err(error) => {
                                 // Failure paths clear inflight markers for retry.
-                                app.engine.metrics.record_error("upload_failed");
+                                app.engine.metrics.record_error(ErrorCategory::UploadFailed);
                                 app.engine.metrics.record_failure();
                                 app.engine
                                     .dedup

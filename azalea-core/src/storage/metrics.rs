@@ -7,7 +7,6 @@
 //! Metrics are best-effort; failures are logged but do not halt the pipeline.
 
 use super::{FlushWorker, open_or_rotate_corrupt_store};
-use dashmap::DashMap;
 use redb::{AccessGuard, Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::sync::{
     Arc,
@@ -16,7 +15,7 @@ use std::sync::{
 
 const METRICS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metrics");
 const ERRORS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("errors");
-const MAX_ERROR_KEYS: usize = 128;
+const ERROR_CATEGORY_COUNT: usize = 6;
 
 /// Pipeline stages tracked in metrics storage.
 ///
@@ -28,6 +27,20 @@ pub enum Stage {
     Download = 1,
     Optimize = 2,
     Upload = 3,
+}
+
+/// Error categories tracked in metrics storage.
+///
+/// The set is intentionally closed so the update path stays allocation-free
+/// and bounded under steady-state load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCategory {
+    ResolveFailed,
+    DownloadFailed,
+    SsrfBlocked,
+    OptimizeFailed,
+    UploadFailed,
+    ProgressUpdateFailed,
 }
 
 /// Snapshot of counters used for status and statistics reporting.
@@ -63,7 +76,7 @@ struct LoadState {
     total_runs: u64,
     successes: u64,
     failures: u64,
-    errors: Vec<(Box<str>, u64)>,
+    errors: [u64; ERROR_CATEGORY_COUNT],
 }
 
 impl Stage {
@@ -75,6 +88,93 @@ impl Stage {
             Self::Download => "download",
             Self::Optimize => "optimize",
             Self::Upload => "upload",
+        }
+    }
+}
+
+impl ErrorCategory {
+    pub const ALL: [Self; ERROR_CATEGORY_COUNT] = [
+        Self::ResolveFailed,
+        Self::DownloadFailed,
+        Self::SsrfBlocked,
+        Self::OptimizeFailed,
+        Self::UploadFailed,
+        Self::ProgressUpdateFailed,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResolveFailed => "resolve_failed",
+            Self::DownloadFailed => "download_failed",
+            Self::SsrfBlocked => "ssrf_blocked",
+            Self::OptimizeFailed => "optimize_failed",
+            Self::UploadFailed => "upload_failed",
+            Self::ProgressUpdateFailed => "progress_update_errors",
+        }
+    }
+
+    pub fn from_persisted_str(value: &str) -> Option<Self> {
+        match value {
+            "resolve_failed" => Some(Self::ResolveFailed),
+            "download_failed" => Some(Self::DownloadFailed),
+            "ssrf_blocked" => Some(Self::SsrfBlocked),
+            "optimize_failed" => Some(Self::OptimizeFailed),
+            "upload_failed" => Some(Self::UploadFailed),
+            "progress_update_errors" => Some(Self::ProgressUpdateFailed),
+            _ => None,
+        }
+    }
+
+    fn increment(self, counts: &[AtomicU64; ERROR_CATEGORY_COUNT]) {
+        self.atomic_slot(counts).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn load_atomic(self, counts: &[AtomicU64; ERROR_CATEGORY_COUNT]) -> u64 {
+        self.atomic_slot(counts).load(Ordering::Relaxed)
+    }
+
+    fn store_atomic(self, counts: &[AtomicU64; ERROR_CATEGORY_COUNT], value: u64) {
+        self.atomic_slot(counts).store(value, Ordering::Relaxed);
+    }
+
+    fn load_value(self, counts: &[u64; ERROR_CATEGORY_COUNT]) -> u64 {
+        *self.value_slot(counts)
+    }
+
+    fn store_value(self, counts: &mut [u64; ERROR_CATEGORY_COUNT], value: u64) {
+        *self.value_slot_mut(counts) = value;
+    }
+
+    fn atomic_slot(self, counts: &[AtomicU64; ERROR_CATEGORY_COUNT]) -> &AtomicU64 {
+        match self {
+            Self::ResolveFailed => &counts[0],
+            Self::DownloadFailed => &counts[1],
+            Self::SsrfBlocked => &counts[2],
+            Self::OptimizeFailed => &counts[3],
+            Self::UploadFailed => &counts[4],
+            Self::ProgressUpdateFailed => &counts[5],
+        }
+    }
+
+    fn value_slot(self, counts: &[u64; ERROR_CATEGORY_COUNT]) -> &u64 {
+        match self {
+            Self::ResolveFailed => &counts[0],
+            Self::DownloadFailed => &counts[1],
+            Self::SsrfBlocked => &counts[2],
+            Self::OptimizeFailed => &counts[3],
+            Self::UploadFailed => &counts[4],
+            Self::ProgressUpdateFailed => &counts[5],
+        }
+    }
+
+    fn value_slot_mut(self, counts: &mut [u64; ERROR_CATEGORY_COUNT]) -> &mut u64 {
+        match self {
+            Self::ResolveFailed => &mut counts[0],
+            Self::DownloadFailed => &mut counts[1],
+            Self::SsrfBlocked => &mut counts[2],
+            Self::OptimizeFailed => &mut counts[3],
+            Self::UploadFailed => &mut counts[4],
+            Self::ProgressUpdateFailed => &mut counts[5],
         }
     }
 }
@@ -96,7 +196,7 @@ struct Inner {
     failures: AtomicU64,
     stage_duration_sum_ms: [AtomicU64; 4],
     stage_count: [AtomicU64; 4],
-    error_counts: DashMap<Box<str>, AtomicU64>,
+    error_counts: [AtomicU64; ERROR_CATEGORY_COUNT],
     flush_worker: FlushWorker,
 }
 
@@ -168,25 +268,12 @@ impl Tracker {
         }
     }
 
-    /// Record an error kind for aggregation.
-    pub fn record_error(&self, kind: &'static str) {
+    /// Record an error category for aggregation.
+    pub fn record_error(&self, category: ErrorCategory) {
         if !self.inner.enabled {
             return;
         }
-
-        if self.inner.error_counts.len() >= MAX_ERROR_KEYS
-            && self.inner.error_counts.get(kind).is_none()
-        {
-            tracing::warn!(kind, "Skipping metrics error key; cap reached");
-            return;
-        }
-
-        self.inner
-            .error_counts
-            .entry(kind.into())
-            .or_insert_with(|| AtomicU64::new(0))
-            .value()
-            .fetch_add(1, Ordering::Relaxed);
+        category.increment(&self.inner.error_counts);
     }
 
     /// Load counters from the backing store into memory.
@@ -209,7 +296,7 @@ impl Tracker {
             let mut total_runs = 0;
             let mut successes = 0;
             let mut failures = 0;
-            let mut errors = Vec::new();
+            let mut errors = [0; ERROR_CATEGORY_COUNT];
 
             if let Ok(table) = read_txn.open_table(METRICS_TABLE) {
                 if let Ok(Some(value)) = table.get("total_runs") {
@@ -226,7 +313,9 @@ impl Tracker {
             if let Ok(table) = read_txn.open_table(ERRORS_TABLE) {
                 for entry in table.iter()? {
                     let (key, value): (AccessGuard<&str>, AccessGuard<u64>) = entry?;
-                    errors.push((key.value().into(), value.value()));
+                    if let Some(category) = ErrorCategory::from_persisted_str(key.value()) {
+                        category.store_value(&mut errors, value.value());
+                    }
                 }
             }
 
@@ -256,10 +345,11 @@ impl Tracker {
         for slot in self.inner.stage_count.iter() {
             slot.store(0, Ordering::Relaxed);
         }
-
-        self.inner.error_counts.clear();
-        for (key, value) in result.errors {
-            self.inner.error_counts.insert(key, AtomicU64::new(value));
+        for category in ErrorCategory::ALL {
+            category.store_atomic(
+                &self.inner.error_counts,
+                category.load_value(&result.errors),
+            );
         }
 
         Ok(())
@@ -318,13 +408,8 @@ impl Tracker {
         let total_runs = self.inner.total_runs.load(Ordering::Relaxed);
         let successes = self.inner.successes.load(Ordering::Relaxed);
         let failures = self.inner.failures.load(Ordering::Relaxed);
-
-        let error_counts: Vec<(Box<str>, u64)> = self
-            .inner
-            .error_counts
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
-            .collect();
+        let error_counts = ErrorCategory::ALL
+            .map(|category| (category, category.load_atomic(&self.inner.error_counts)));
 
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             // Snapshot values are written as a single transaction for consistency.
@@ -338,8 +423,9 @@ impl Tracker {
 
             {
                 let mut table = write_txn.open_table(ERRORS_TABLE)?;
-                for (key, count) in error_counts {
-                    let _ = table.insert(key.as_ref(), count);
+                table.retain(|key, _| ErrorCategory::from_persisted_str(key).is_some())?;
+                for (category, count) in error_counts {
+                    let _ = table.insert(category.as_str(), count);
                 }
             }
 
@@ -401,7 +487,7 @@ impl Inner {
             failures: AtomicU64::new(0),
             stage_duration_sum_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             stage_count: std::array::from_fn(|_| AtomicU64::new(0)),
-            error_counts: DashMap::new(),
+            error_counts: std::array::from_fn(|_| AtomicU64::new(0)),
             flush_worker: FlushWorker::new(),
         }
     }
@@ -462,7 +548,7 @@ mod tests {
         tracker.record_success();
         tracker.record_failure();
         tracker.record_stage_duration(Stage::Resolve, 123);
-        tracker.record_error("resolve_failed");
+        tracker.record_error(ErrorCategory::ResolveFailed);
 
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.totals.total_runs, 0);
@@ -521,7 +607,7 @@ mod tests {
             Tracker::new(&storage_config(true, path.clone())).expect("tracker should construct");
         tracker.record_success();
         tracker.record_stage_duration(Stage::Download, 250);
-        tracker.record_error("download_failed");
+        tracker.record_error(ErrorCategory::DownloadFailed);
         tracker.flush().await;
         drop(tracker);
 
@@ -535,6 +621,54 @@ mod tests {
         assert_eq!(snapshot.totals.failures, 0);
         assert_eq!(snapshot.stage_window.avg_ms, [0; 4]);
         assert_eq!(snapshot.stage_window.sample_count, [0; 4]);
+        assert_eq!(
+            ErrorCategory::DownloadFailed.load_atomic(&restored.inner.error_counts),
+            1
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn load_ignores_unknown_persisted_error_keys() {
+        let path = unique_metrics_path("metrics-legacy-errors");
+        let tracker =
+            Tracker::new(&storage_config(true, path.clone())).expect("tracker should construct");
+        tracker.record_error(ErrorCategory::ResolveFailed);
+        tracker.flush().await;
+
+        let db = tracker
+            .inner
+            .db
+            .as_ref()
+            .cloned()
+            .expect("enabled tracker should have a db");
+        tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(ERRORS_TABLE)?;
+                let _ = table.insert("legacy_error_key", 99);
+            }
+            write_txn.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("blocking task should join")
+        .expect("manual write should succeed");
+        drop(tracker);
+
+        let restored =
+            Tracker::new(&storage_config(true, path.clone())).expect("tracker should reconstruct");
+        restored.load_from_db().await.expect("load should succeed");
+
+        assert_eq!(
+            ErrorCategory::ResolveFailed.load_atomic(&restored.inner.error_counts),
+            1
+        );
+        assert_eq!(
+            ErrorCategory::DownloadFailed.load_atomic(&restored.inner.error_counts),
+            0
+        );
 
         let _ = std::fs::remove_file(path);
     }

@@ -28,7 +28,7 @@ pub use types::{Job, PreparedPart, PreparedUpload, Progress, RequestId};
 
 use crate::engine::Engine;
 use crate::pipeline::errors::DownloadError;
-use crate::storage::Stage;
+use crate::storage::{ErrorCategory, Stage};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
@@ -108,7 +108,7 @@ pub async fn run(
                     .await
                     .inspect_err(|_e| {
                         tracing::trace!(error = %_e, "Resolve stage failed");
-                        engine.metrics.record_error("resolve_failed");
+                        engine.metrics.record_error(ErrorCategory::ResolveFailed);
                         engine.metrics.record_failure();
                     })?;
                 let resolve_duration_ms = resolve_start.elapsed().as_millis() as u64;
@@ -156,9 +156,9 @@ pub async fn run(
                         Error::DownloadFailed {
                             source: DownloadError::SsrfBlocked(_),
                         } => {
-                            engine.metrics.record_error("ssrf_blocked");
+                            engine.metrics.record_error(ErrorCategory::SsrfBlocked);
                         }
-                        _ => engine.metrics.record_error("download_failed"),
+                        _ => engine.metrics.record_error(ErrorCategory::DownloadFailed),
                     }
                     engine.metrics.record_failure();
                 })?;
@@ -202,7 +202,7 @@ pub async fn run(
                 .await
                 .inspect_err(|_e| {
                     tracing::trace!(error = %_e, "Optimize stage failed");
-                    engine.metrics.record_error("optimize_failed");
+                    engine.metrics.record_error(ErrorCategory::OptimizeFailed);
                     engine.metrics.record_failure();
                 })?;
                 let optimize_duration_ms = optimize_start.elapsed().as_millis() as u64;
