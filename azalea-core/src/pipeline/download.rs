@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::{Arc, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::process::Command;
 use tracing::Instrument as _;
 
@@ -170,12 +170,13 @@ pub async fn download(
             tracing::trace!(path = %output_path.display(), "Preallocated download file");
         }
 
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(!preallocated)
             .open(&output_path)
             .await?;
+        let mut file = BufWriter::with_capacity(config.pipeline.download_write_buffer_bytes, file);
         let mut downloaded = 0u64;
         let mut last_log = std::time::Instant::now();
         let log_interval = Duration::from_secs(5);
@@ -237,6 +238,10 @@ pub async fn download(
         }
 
         // Explicitly set final length in case the preallocation overshot.
+        file.flush().await.map_err(|e| Error::DownloadFailed {
+            source: DownloadError::WriteFailed(e),
+        })?;
+        let mut file = file.into_inner();
         file.set_len(downloaded)
             .await
             .map_err(|e| Error::DownloadFailed {

@@ -6,15 +6,19 @@ thread_stack_size = 2097152
 [concurrency]
 download = 4
 upload = 2
-transcode = 1
-ytdlp = 1
+transcode = 2
+ytdlp = 2
 pipeline = 8
 
 [http]
-pool_max_idle_per_host = 4
+pool_max_idle_per_host = 8
 pool_idle_timeout_secs = 90
 connect_timeout_secs = 10
 timeout_secs = 60
+http2_adaptive_window = false
+http2_initial_stream_window_size_bytes = 8388608
+http2_initial_connection_window_size_bytes = 33554432
+http2_max_frame_size_bytes = 262144
 
 [storage]
 temp_dir = "/tmp/azalea"
@@ -50,6 +54,7 @@ ffmpeg_timeout_secs = 600
 [pipeline]
 queue_backpressure_timeout_ms = 1000
 download_timeout_secs = 60
+download_write_buffer_bytes = 1048576
 upload_timeout_secs = 120
 min_disk_space_bytes = 524288000
 max_download_bytes = 524288000
@@ -59,7 +64,7 @@ user_rate_limit_requests = 10
 user_rate_limit_window_secs = 60
 channel_rate_limit_requests = 20
 channel_rate_limit_window_secs = 60
-parallel_segment_threshold = 4
+parallel_segment_threshold = 2
 
 [binaries]
 ffmpeg = "ffmpeg"
@@ -82,6 +87,10 @@ ytdlp = "yt-dlp"
 # - AZALEA_POOL_IDLE_TIMEOUT_SECS -> http.pool_idle_timeout_secs
 # - AZALEA_CONNECT_TIMEOUT_SECS -> http.connect_timeout_secs
 # - AZALEA_TIMEOUT_SECS -> http.timeout_secs
+# - AZALEA_HTTP2_ADAPTIVE_WINDOW -> http.http2_adaptive_window
+# - AZALEA_HTTP2_INITIAL_STREAM_WINDOW_SIZE_BYTES -> http.http2_initial_stream_window_size_bytes
+# - AZALEA_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE_BYTES -> http.http2_initial_connection_window_size_bytes
+# - AZALEA_HTTP2_MAX_FRAME_SIZE_BYTES -> http.http2_max_frame_size_bytes
 # - AZALEA_TEMP_DIR -> storage.temp_dir
 # - AZALEA_DEDUP_TTL_HOURS -> storage.dedup_ttl_hours
 # - AZALEA_DEDUP_CACHE_SIZE -> storage.dedup_cache_size
@@ -109,6 +118,7 @@ ytdlp = "yt-dlp"
 # - AZALEA_FFMPEG_TIMEOUT_SECS -> transcode.ffmpeg_timeout_secs
 # - AZALEA_QUEUE_BACKPRESSURE_TIMEOUT_MS -> pipeline.queue_backpressure_timeout_ms
 # - AZALEA_DOWNLOAD_TIMEOUT_SECS -> pipeline.download_timeout_secs
+# - AZALEA_DOWNLOAD_WRITE_BUFFER_BYTES -> pipeline.download_write_buffer_bytes
 # - AZALEA_UPLOAD_TIMEOUT_SECS -> pipeline.upload_timeout_secs
 # - AZALEA_MIN_DISK_SPACE_BYTES -> pipeline.min_disk_space_bytes
 # - AZALEA_MAX_DOWNLOAD_BYTES -> pipeline.max_download_bytes

@@ -164,7 +164,7 @@ impl Engine {
 /// Enforces timeouts and idle pool sizing to avoid resource exhaustion under
 /// untrusted input loads.
 fn build_http_client(config: &EngineSettings) -> anyhow::Result<reqwest::Client> {
-    let http = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(config.http.timeout_secs))
         .pool_max_idle_per_host(config.http.pool_max_idle_per_host)
@@ -172,14 +172,23 @@ fn build_http_client(config: &EngineSettings) -> anyhow::Result<reqwest::Client>
         .connect_timeout(Duration::from_secs(config.http.connect_timeout_secs))
         .tcp_keepalive(Duration::from_secs(30))
         .tcp_nodelay(true)
-        .http2_adaptive_window(true)
-        .http2_initial_stream_window_size(2 * 1024 * 1024)
-        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        .http2_max_frame_size(config.http.http2_max_frame_size_bytes)
         .deflate(true)
         .gzip(true)
         .brotli(true)
-        .user_agent(USER_AGENT)
-        .build()?;
+        .user_agent(USER_AGENT);
+
+    builder = if config.http.http2_adaptive_window {
+        builder.http2_adaptive_window(true)
+    } else {
+        builder
+            .http2_initial_stream_window_size(config.http.http2_initial_stream_window_size_bytes)
+            .http2_initial_connection_window_size(
+                config.http.http2_initial_connection_window_size_bytes,
+            )
+    };
+
+    let http = builder.build()?;
 
     Ok(http)
 }

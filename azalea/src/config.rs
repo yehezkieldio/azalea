@@ -270,6 +270,26 @@ const ENV_BINDINGS: &[EnvBinding] = &[
         path: &["http", "timeout_secs"],
     },
     EnvBinding {
+        key: "HTTP2_ADAPTIVE_WINDOW",
+        aliases: &[],
+        path: &["http", "http2_adaptive_window"],
+    },
+    EnvBinding {
+        key: "HTTP2_INITIAL_STREAM_WINDOW_SIZE_BYTES",
+        aliases: &[],
+        path: &["http", "http2_initial_stream_window_size_bytes"],
+    },
+    EnvBinding {
+        key: "HTTP2_INITIAL_CONNECTION_WINDOW_SIZE_BYTES",
+        aliases: &[],
+        path: &["http", "http2_initial_connection_window_size_bytes"],
+    },
+    EnvBinding {
+        key: "HTTP2_MAX_FRAME_SIZE_BYTES",
+        aliases: &[],
+        path: &["http", "http2_max_frame_size_bytes"],
+    },
+    EnvBinding {
         key: "TEMP_DIR",
         aliases: &[],
         path: &["storage", "temp_dir"],
@@ -403,6 +423,11 @@ const ENV_BINDINGS: &[EnvBinding] = &[
         key: "DOWNLOAD_TIMEOUT_SECS",
         aliases: &[],
         path: &["pipeline", "download_timeout_secs"],
+    },
+    EnvBinding {
+        key: "DOWNLOAD_WRITE_BUFFER_BYTES",
+        aliases: &[],
+        path: &["pipeline", "download_write_buffer_bytes"],
     },
     EnvBinding {
         key: "UPLOAD_TIMEOUT_SECS",

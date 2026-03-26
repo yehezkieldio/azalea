@@ -178,15 +178,23 @@ pub struct HttpSettings {
     pub pool_idle_timeout_secs: u64,
     pub connect_timeout_secs: u64,
     pub timeout_secs: u64,
+    pub http2_adaptive_window: bool,
+    pub http2_initial_stream_window_size_bytes: u32,
+    pub http2_initial_connection_window_size_bytes: u32,
+    pub http2_max_frame_size_bytes: u32,
 }
 
 impl Default for HttpSettings {
     fn default() -> Self {
         Self {
-            pool_max_idle_per_host: 4,
+            pool_max_idle_per_host: 8,
             pool_idle_timeout_secs: 90,
             connect_timeout_secs: 10,
             timeout_secs: 60,
+            http2_adaptive_window: false,
+            http2_initial_stream_window_size_bytes: 8 * 1024 * 1024,
+            http2_initial_connection_window_size_bytes: 32 * 1024 * 1024,
+            http2_max_frame_size_bytes: 256 * 1024,
         }
     }
 }
@@ -306,6 +314,7 @@ impl TranscodeSettings {
 pub struct PipelineSettings {
     pub queue_backpressure_timeout_ms: u64,
     pub download_timeout_secs: u64,
+    pub download_write_buffer_bytes: usize,
     pub upload_timeout_secs: u64,
     pub min_disk_space_bytes: u64,
     pub max_download_bytes: u64,
@@ -323,6 +332,7 @@ impl Default for PipelineSettings {
         Self {
             queue_backpressure_timeout_ms: 1_000,
             download_timeout_secs: 60,
+            download_write_buffer_bytes: 1024 * 1024,
             upload_timeout_secs: 120,
             min_disk_space_bytes: 500 * 1024 * 1024,
             max_download_bytes: 500 * 1024 * 1024,
@@ -437,10 +447,46 @@ impl EngineSettings {
 
         validate_timeout("http.connect_timeout_secs", self.http.connect_timeout_secs)?;
         validate_timeout("http.timeout_secs", self.http.timeout_secs)?;
+
+        if self.http.pool_max_idle_per_host == 0 {
+            anyhow::bail!("http.pool_max_idle_per_host must be at least 1");
+        }
+
+        if self.http.http2_initial_stream_window_size_bytes == 0 {
+            anyhow::bail!("http.http2_initial_stream_window_size_bytes must be greater than 0");
+        }
+
+        if self.http.http2_initial_connection_window_size_bytes == 0 {
+            anyhow::bail!("http.http2_initial_connection_window_size_bytes must be greater than 0");
+        }
+
+        if self.http.http2_initial_connection_window_size_bytes
+            < self.http.http2_initial_stream_window_size_bytes
+        {
+            anyhow::bail!(
+                "http.http2_initial_connection_window_size_bytes must be at least the stream window"
+            );
+        }
+
+        const HTTP2_MIN_FRAME_SIZE_BYTES: u32 = 16_384;
+        const HTTP2_MAX_FRAME_SIZE_BYTES: u32 = 16_777_215;
+        if !(HTTP2_MIN_FRAME_SIZE_BYTES..=HTTP2_MAX_FRAME_SIZE_BYTES)
+            .contains(&self.http.http2_max_frame_size_bytes)
+        {
+            anyhow::bail!(
+                "http.http2_max_frame_size_bytes must be between {} and {}",
+                HTTP2_MIN_FRAME_SIZE_BYTES,
+                HTTP2_MAX_FRAME_SIZE_BYTES
+            );
+        }
+
         validate_timeout(
             "pipeline.download_timeout_secs",
             self.pipeline.download_timeout_secs,
         )?;
+        if self.pipeline.download_write_buffer_bytes == 0 {
+            anyhow::bail!("pipeline.download_write_buffer_bytes must be at least 1");
+        }
         validate_timeout(
             "pipeline.upload_timeout_secs",
             self.pipeline.upload_timeout_secs,
@@ -560,6 +606,32 @@ mod tests {
         config.pipeline.upload_timeout_secs = 3601;
         let err = config.validate().expect_err("timeout above max must fail");
         assert!(err.to_string().contains("upload_timeout_secs"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_http2_settings() {
+        let mut config = EngineSettings::default();
+        config.http.http2_initial_connection_window_size_bytes = 1024;
+        config.http.http2_initial_stream_window_size_bytes = 2048;
+        let err = config
+            .validate()
+            .expect_err("connection window smaller than stream window must fail");
+        assert!(err.to_string().contains("connection_window"));
+
+        let mut config = EngineSettings::default();
+        config.http.http2_max_frame_size_bytes = 1;
+        let err = config.validate().expect_err("invalid frame size must fail");
+        assert!(err.to_string().contains("http2_max_frame_size_bytes"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_download_write_buffer() {
+        let mut config = EngineSettings::default();
+        config.pipeline.download_write_buffer_bytes = 0;
+        let err = config
+            .validate()
+            .expect_err("zero write buffer must be invalid");
+        assert!(err.to_string().contains("download_write_buffer_bytes"));
     }
 
     #[test]

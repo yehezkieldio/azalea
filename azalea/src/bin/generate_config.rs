@@ -30,6 +30,22 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
     ("POOL_IDLE_TIMEOUT_SECS", &[], "http.pool_idle_timeout_secs"),
     ("CONNECT_TIMEOUT_SECS", &[], "http.connect_timeout_secs"),
     ("TIMEOUT_SECS", &[], "http.timeout_secs"),
+    ("HTTP2_ADAPTIVE_WINDOW", &[], "http.http2_adaptive_window"),
+    (
+        "HTTP2_INITIAL_STREAM_WINDOW_SIZE_BYTES",
+        &[],
+        "http.http2_initial_stream_window_size_bytes",
+    ),
+    (
+        "HTTP2_INITIAL_CONNECTION_WINDOW_SIZE_BYTES",
+        &[],
+        "http.http2_initial_connection_window_size_bytes",
+    ),
+    (
+        "HTTP2_MAX_FRAME_SIZE_BYTES",
+        &[],
+        "http.http2_max_frame_size_bytes",
+    ),
     ("TEMP_DIR", &[], "storage.temp_dir"),
     ("DEDUP_TTL_HOURS", &[], "storage.dedup_ttl_hours"),
     ("DEDUP_CACHE_SIZE", &[], "storage.dedup_cache_size"),
@@ -96,6 +112,11 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
         "DOWNLOAD_TIMEOUT_SECS",
         &[],
         "pipeline.download_timeout_secs",
+    ),
+    (
+        "DOWNLOAD_WRITE_BUFFER_BYTES",
+        &[],
+        "pipeline.download_write_buffer_bytes",
     ),
     ("UPLOAD_TIMEOUT_SECS", &[], "pipeline.upload_timeout_secs"),
     ("MIN_DISK_SPACE_BYTES", &[], "pipeline.min_disk_space_bytes"),
@@ -237,6 +258,34 @@ fn render_template() -> String {
     line(
         &mut out,
         &format!("timeout_secs = {}", engine.http.timeout_secs),
+    );
+    line(
+        &mut out,
+        &format!(
+            "http2_adaptive_window = {}",
+            engine.http.http2_adaptive_window
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "http2_initial_stream_window_size_bytes = {}",
+            engine.http.http2_initial_stream_window_size_bytes
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "http2_initial_connection_window_size_bytes = {}",
+            engine.http.http2_initial_connection_window_size_bytes
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "http2_max_frame_size_bytes = {}",
+            engine.http.http2_max_frame_size_bytes
+        ),
     );
     line(&mut out, "");
 
@@ -414,6 +463,13 @@ fn render_template() -> String {
         &format!(
             "download_timeout_secs = {}",
             engine.pipeline.download_timeout_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "download_write_buffer_bytes = {}",
+            engine.pipeline.download_write_buffer_bytes
         ),
     );
     line(
