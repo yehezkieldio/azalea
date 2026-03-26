@@ -239,12 +239,16 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
         })
         .await
         {
-            Ok(removed_paths) if !removed_paths.is_empty() => {
-                for path in removed_paths {
-                    tracing::warn!(path = %path.display(), "Removed stale temp entry on startup");
+            Ok(cleanup) => {
+                tracing::info!(
+                    scanned_entries = cleanup.scanned_entries,
+                    removed_entries = cleanup.removed_entries(),
+                    "Startup stale temp cleanup completed"
+                );
+                for path in cleanup.removed_paths {
+                    tracing::debug!(path = %path.display(), "Removed stale temp entry on startup");
                 }
             }
-            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to prune temp entries on startup");
             }

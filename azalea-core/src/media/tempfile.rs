@@ -17,6 +17,18 @@ use tokio::sync::{Mutex, mpsc, watch};
 const CLEANUP_CHANNEL_CAPACITY: usize = 10_000;
 const CLEANUP_DRAIN_TIMEOUT_SECS: u64 = 5;
 
+#[derive(Debug, Default)]
+pub struct StaleTempCleanup {
+    pub scanned_entries: usize,
+    pub removed_paths: Vec<PathBuf>,
+}
+
+impl StaleTempCleanup {
+    pub fn removed_entries(&self) -> usize {
+        self.removed_paths.len()
+    }
+}
+
 /// Async temp file cleanup manager.
 ///
 /// ## Invariants
@@ -180,15 +192,16 @@ pub fn cleanup_temp_dir_sync(temp_dir: &Path) {
 ///
 /// ## Trade-off acknowledgment
 /// Best-effort cleanup; failures are logged and ignored.
-pub fn cleanup_stale_temp_entries(temp_dir: &Path, max_age: Duration) -> Vec<PathBuf> {
+pub fn cleanup_stale_temp_entries(temp_dir: &Path, max_age: Duration) -> StaleTempCleanup {
     let now = std::time::SystemTime::now();
-    let mut removed = Vec::new();
+    let mut cleanup = StaleTempCleanup::default();
 
     let Ok(entries) = std::fs::read_dir(temp_dir) else {
-        return removed;
+        return cleanup;
     };
 
     for entry in entries.flatten() {
+        cleanup.scanned_entries += 1;
         let path = entry.path();
         let metadata = match entry.metadata() {
             Ok(meta) => meta,
@@ -216,7 +229,7 @@ pub fn cleanup_stale_temp_entries(temp_dir: &Path, max_age: Duration) -> Vec<Pat
 
         match result {
             Ok(()) => {
-                removed.push(path);
+                cleanup.removed_paths.push(path);
             }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "Failed to remove stale temp entry");
@@ -224,7 +237,7 @@ pub fn cleanup_stale_temp_entries(temp_dir: &Path, max_age: Duration) -> Vec<Pat
         }
     }
 
-    removed
+    cleanup
 }
 
 /// Remove temp entries older than the supplied age threshold.
@@ -232,7 +245,7 @@ pub fn cleanup_stale_temp_entries(temp_dir: &Path, max_age: Duration) -> Vec<Pat
 /// ## Trade-off acknowledgment
 /// Best-effort cleanup; failures are logged and ignored.
 pub fn cleanup_temp_dir_older_than(temp_dir: &Path, max_age: Duration) -> usize {
-    cleanup_stale_temp_entries(temp_dir, max_age).len()
+    cleanup_stale_temp_entries(temp_dir, max_age).removed_entries()
 }
 
 async fn remove_path_async(path: &Path) {
@@ -321,8 +334,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         std::fs::write(&new_file, b"new").expect("write new file");
 
-        let removed = cleanup_stale_temp_entries(&dir, Duration::from_millis(20));
-        assert_eq!(removed, vec![old_file.clone()]);
+        let cleanup = cleanup_stale_temp_entries(&dir, Duration::from_millis(20));
+        assert_eq!(cleanup.scanned_entries, 2);
+        assert_eq!(cleanup.removed_paths, vec![old_file.clone()]);
         assert!(!old_file.exists());
         assert!(new_file.exists());
         let _ = std::fs::remove_dir_all(&dir);
