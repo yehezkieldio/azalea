@@ -489,26 +489,27 @@ fn select_best_format(output: &YtDlpOutput) -> Result<(Box<str>, Box<str>, bool)
         return Ok((url.clone(), ext, is_image));
     }
 
-    let mut best_any = None;
-    let mut best_compatible = None;
+    let mut ranked_formats = output
+        .formats
+        .iter()
+        .enumerate()
+        .filter_map(|(index, format)| {
+            score_format(format).map(|score| RankedFormat {
+                format,
+                score,
+                index,
+            })
+        })
+        .collect::<Vec<_>>();
+    ranked_formats.sort_by(rank_formats);
 
-    for format in &output.formats {
-        if format.url.is_none() || format.vcodec.as_deref() == Some("none") {
-            continue;
-        }
-
-        choose_higher_tbr(&mut best_any, format);
-        if is_upload_compatible(format) {
-            choose_higher_tbr(&mut best_compatible, format);
-        }
-    }
-
-    if let Some(best) = best_compatible.or(best_any) {
+    if let Some(best) = ranked_formats.first() {
         let url = best
+            .format
             .url
             .clone()
             .ok_or_else(|| ResolveError::ParseFailed("format missing url".to_string()))?;
-        let ext = best.ext.clone().unwrap_or_else(|| "mp4".into());
+        let ext = best.format.ext.clone().unwrap_or_else(|| "mp4".into());
         return Ok((url, ext, false));
     }
 
@@ -529,21 +530,37 @@ fn is_upload_compatible(format: &YtDlpFormat) -> bool {
     is_h264 && is_aac
 }
 
-fn choose_higher_tbr<'a>(current: &mut Option<&'a YtDlpFormat>, candidate: &'a YtDlpFormat) {
-    let Some(best) = current else {
-        *current = Some(candidate);
-        return;
-    };
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FormatScore {
+    upload_compatible: bool,
+    tbr: f64,
+}
 
-    let candidate_tbr = candidate.tbr.unwrap_or(0.0);
-    let best_tbr = best.tbr.unwrap_or(0.0);
-    if candidate_tbr
-        .partial_cmp(&best_tbr)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        != std::cmp::Ordering::Less
-    {
-        *current = Some(candidate);
+#[derive(Clone, Copy, Debug)]
+struct RankedFormat<'a> {
+    format: &'a YtDlpFormat,
+    score: FormatScore,
+    index: usize,
+}
+
+fn score_format(format: &YtDlpFormat) -> Option<FormatScore> {
+    if format.url.is_none() || format.vcodec.as_deref() == Some("none") {
+        return None;
     }
+
+    Some(FormatScore {
+        upload_compatible: is_upload_compatible(format),
+        tbr: format.tbr.unwrap_or(0.0),
+    })
+}
+
+fn rank_formats(left: &RankedFormat<'_>, right: &RankedFormat<'_>) -> std::cmp::Ordering {
+    right
+        .score
+        .upload_compatible
+        .cmp(&left.score.upload_compatible)
+        .then_with(|| right.score.tbr.total_cmp(&left.score.tbr))
+        .then_with(|| right.index.cmp(&left.index))
 }
 
 fn is_image_extension(ext: &str) -> bool {
@@ -752,6 +769,41 @@ mod tests {
         let (url, ext, is_image) = select_best_format(&output)?;
 
         assert_eq!(url.as_ref(), "https://example.invalid/vp9.webm");
+        assert_eq!(ext.as_ref(), "webm");
+        assert!(!is_image);
+        Ok(())
+    }
+
+    #[test]
+    fn select_best_format_uses_latest_format_on_equal_score() -> Result<(), ResolveError> {
+        let output = YtDlpOutput {
+            url: None,
+            formats: vec![
+                format(
+                    "https://example.invalid/first.webm",
+                    "webm",
+                    Some("vp9"),
+                    Some("opus"),
+                    Some(9.0),
+                ),
+                format(
+                    "https://example.invalid/second.webm",
+                    "webm",
+                    Some("vp9"),
+                    Some("opus"),
+                    Some(9.0),
+                ),
+            ],
+            duration: None,
+            width: None,
+            height: None,
+            ext: None,
+            thumbnail: Some("https://example.invalid/thumb.jpg".into()),
+        };
+
+        let (url, ext, is_image) = select_best_format(&output)?;
+
+        assert_eq!(url.as_ref(), "https://example.invalid/second.webm");
         assert_eq!(ext.as_ref(), "webm");
         assert!(!is_image);
         Ok(())
