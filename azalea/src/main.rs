@@ -421,6 +421,13 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
         let _ = pipeline_worker.await;
     }
 
+    tracing::info!(
+        forced_shutdown,
+        queue_depth = app.queue_depth.load(Ordering::Relaxed),
+        peak_queue_depth = app.queue_peak_depth(),
+        "Shutdown diagnostics"
+    );
+
     if forced_shutdown {
         // Bound shutdown steps to avoid hanging indefinitely.
         let timeout = Duration::from_secs(SHUTDOWN_STEP_TIMEOUT_SECS);
@@ -778,6 +785,8 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
         failed_jobs = diagnostics.failed_jobs.load(Ordering::Relaxed),
         timeout_jobs = diagnostics.timeout_jobs.load(Ordering::Relaxed),
         hwacc_failures = diagnostics.hwacc_failures.load(Ordering::Relaxed),
+        queue_depth = app.queue_depth.load(Ordering::Relaxed),
+        peak_queue_depth = app.queue_peak_depth(),
         "Pipeline worker shutting down"
     );
 }

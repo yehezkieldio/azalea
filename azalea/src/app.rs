@@ -33,6 +33,7 @@ pub struct App {
     pub user_rate_limiter: UserRateLimiter,
     pub channel_rate_limiter: ChannelRateLimiter,
     pub queue_depth: Arc<AtomicUsize>,
+    pub queue_peak_depth: Arc<AtomicUsize>,
     // Monotonic-ish ids for log correlation; uniqueness matters, not ordering.
     request_counter: Arc<AtomicU64>,
     pub start_time: std::time::Instant,
@@ -64,6 +65,7 @@ impl App {
             user_rate_limiter,
             channel_rate_limiter,
             queue_depth: Arc::new(AtomicUsize::new(0)),
+            queue_peak_depth: Arc::new(AtomicUsize::new(0)),
             request_counter: Arc::new(AtomicU64::new(1)),
             start_time: std::time::Instant::now(),
         })
@@ -78,5 +80,16 @@ impl App {
         // Relaxed is sufficient: we only require uniqueness across threads.
         // NOTE: this counter wraps on u64::MAX.
         self.request_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record a newly queued job and return the updated outstanding depth.
+    pub fn record_queued_job(&self) -> usize {
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        self.queue_peak_depth.fetch_max(depth, Ordering::Relaxed);
+        depth
+    }
+
+    pub fn queue_peak_depth(&self) -> usize {
+        self.queue_peak_depth.load(Ordering::Relaxed)
     }
 }

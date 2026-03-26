@@ -189,7 +189,7 @@ async fn handle_media_command(
 
     match enqueue {
         Ok(Ok(())) => {
-            app.queue_depth.fetch_add(1, Ordering::Relaxed);
+            app.record_queued_job();
             "Queued for processing.".to_string()
         }
         Ok(Err(_)) => "job queue is unavailable right now. please try again later.".to_string(),
@@ -253,9 +253,12 @@ fn format_stats(app: &App) -> String {
     let snapshot = app.engine.metrics.snapshot();
     let totals = snapshot.totals;
     let stage_window = snapshot.stage_window;
+    let queue_depth = app.queue_depth.load(Ordering::Relaxed);
+    let queue_peak_depth = app.queue_peak_depth();
 
     let mut lines = vec![
         "Pipeline stats:".to_string(),
+        format!("Queue depth: {queue_depth} current / {queue_peak_depth} peak"),
         format!(
             "Lifetime totals: {} runs ({} ok / {} failed)",
             totals.total_runs, totals.successes, totals.failures
@@ -456,5 +459,17 @@ mod tests {
         let status = format_status(&app).await;
 
         assert!(status.contains("Transcode backend: libx264 (runtime fallback from vaapi)"));
+    }
+
+    #[test]
+    fn stats_reports_queue_peak_depth() {
+        let app = test_app();
+        app.record_queued_job();
+        app.record_queued_job();
+        app.queue_depth.fetch_sub(1, Ordering::Relaxed);
+
+        let stats = format_stats(&app);
+
+        assert!(stats.contains("Queue depth: 1 current / 2 peak"));
     }
 }
