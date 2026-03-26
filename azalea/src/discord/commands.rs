@@ -461,8 +461,8 @@ mod tests {
         assert!(status.contains("Transcode backend: libx264 (runtime fallback from vaapi)"));
     }
 
-    #[test]
-    fn stats_reports_queue_peak_depth() {
+    #[tokio::test]
+    async fn stats_reports_queue_peak_depth() {
         let app = test_app();
         app.record_queued_job();
         app.record_queued_job();
