@@ -77,9 +77,12 @@ fn now_secs() -> u64 {
     let last = LAST_KNOWN_SECS.load(Ordering::Relaxed);
 
     if now + CLOCK_SKEW_THRESHOLD_SECS < last {
+        let observed_delta_secs = last.saturating_sub(now);
         tracing::warn!(
             now,
             last,
+            observed_delta_secs,
+            threshold_secs = CLOCK_SKEW_THRESHOLD_SECS,
             "System clock moved backwards; using last known time"
         );
         return last;

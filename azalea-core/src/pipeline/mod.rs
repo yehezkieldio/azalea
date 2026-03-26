@@ -86,8 +86,9 @@ pub async fn run(
             .reserve_inflight(job.scope_id, job.tweet_url.tweet_id)
             .await
         {
-            // Another identical request is already being processed or recently completed.
-            tracing::info!("Duplicate request detected");
+            // The queue-level admission check is intentionally best-effort; the
+            // pipeline still rechecks here so queued duplicates cannot do work.
+            tracing::info!("Dedup fallback activated; duplicate request detected");
             return Err(Error::Duplicate);
         }
 
