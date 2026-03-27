@@ -7,7 +7,58 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.4.0 (March 27, 2026)
+
+### <!-- 10 -->🧪 Test
+- [`374eb07`](https://github.com/yehezkieldio/azalea/commit/374eb070adb485bdcc248917b0b1dd2056a586d4) **discord**: Convert stats_reports_queue_peak_depth to tokio test
+
+### <!-- 16 -->🤖 CI/CD
+- [`9567107`](https://github.com/yehezkieldio/azalea/commit/9567107d1f5742914cdfe75f754172f17c5d4c7a) **ci**: Add merge_group path to ci workflow
+
+### <!-- 2 -->🧩 Dependencies Updates
+- [`70fe56f`](https://github.com/yehezkieldio/azalea/commit/70fe56ff3e623923e5438a0f1d6921741388040a) **deps**: Update actions/attest-build-provenance action to v4 by [@yehezkieldio](https://github.com/yehezkieldio) ([#8](https://github.com/yehezkieldio/azalea/issues/8))
+- [`211853a`](https://github.com/yehezkieldio/azalea/commit/211853a8baa616f0d70ea28b7c86a419180a366c) **deps**: Update actions/attest-build-provenance action to v4
+- [`272fc7e`](https://github.com/yehezkieldio/azalea/commit/272fc7e9e71bf2d77908a957e28fc32de1dd1c35) **deps**: Update docker/build-push-action action to v7 by [@yehezkieldio](https://github.com/yehezkieldio) ([#9](https://github.com/yehezkieldio/azalea/issues/9))
+- [`0c52718`](https://github.com/yehezkieldio/azalea/commit/0c5271863cf71125975738226b7eafaaa9d1f268) **deps**: Update docker/metadata-action action to v6 by [@yehezkieldio](https://github.com/yehezkieldio) ([#11](https://github.com/yehezkieldio/azalea/issues/11))
+- [`534ca17`](https://github.com/yehezkieldio/azalea/commit/534ca17ae4e134b8b272a6307e80328553e4b904) **deps**: Update docker/login-action action to v4 by [@yehezkieldio](https://github.com/yehezkieldio) ([#10](https://github.com/yehezkieldio/azalea/issues/10))
+- [`184b2aa`](https://github.com/yehezkieldio/azalea/commit/184b2aa34f90b0da87432308114b718bfe349909) **deps**: Update docker/login-action action to v4
+- [`ccddb28`](https://github.com/yehezkieldio/azalea/commit/ccddb28d4cadf205469cfdaf66e315c83697797e) **deps**: Update docker/setup-buildx-action action to v4 by [@yehezkieldio](https://github.com/yehezkieldio) ([#12](https://github.com/yehezkieldio/azalea/issues/12))
+- [`bea57d3`](https://github.com/yehezkieldio/azalea/commit/bea57d3e5f1600066471d87b5a0b9191556619d3) **deps**: Update docker/setup-buildx-action action to v4
+- [`8ff5709`](https://github.com/yehezkieldio/azalea/commit/8ff57092da15d7c3534244672c74e8a9f0fe147d) **deps**: Update docker/metadata-action action to v6
+- [`f28e421`](https://github.com/yehezkieldio/azalea/commit/f28e42195cd371c0cf1f1e0827e635fe7a7d842a) **deps**: Update docker/build-push-action action to v7
+- [`2acb151`](https://github.com/yehezkieldio/azalea/commit/2acb1512d79b529ed757721d836ee333471ea3e2) **deps**: Update rust crate proptest to v1.11.0 by renovate[bot] ([#7](https://github.com/yehezkieldio/azalea/issues/7))
+
+### <!-- 3 -->🚀 New Features
+- [`c115f0c`](https://github.com/yehezkieldio/azalea/commit/c115f0cbd8f11eaea7abada256432baa61d956e6) **app**: Add queue peak depth tracking and reporting
+- [`18cdf3a`](https://github.com/yehezkieldio/azalea/commit/18cdf3acae15798b1234011eaf72880777953bfd) **core**: Add http2 settings and download write buffer
+- [`f29b3bd`](https://github.com/yehezkieldio/azalea/commit/f29b3bdad7325fc93119bf4b7cd96fdd01d71ad2) **startup**: Add startup config sanity warnings and logging
+- [`f807232`](https://github.com/yehezkieldio/azalea/commit/f807232629e7f1346a71edbe0e061c74ba89ad5c) **shutdown**: Add unified shutdown signal handling
+- [`5b60bde`](https://github.com/yehezkieldio/azalea/commit/5b60bdea8040797d02375c3a2bf5b0dd5edbebcb) **disk**: Add collective download reservation using atomic counter
+- [`7ff426b`](https://github.com/yehezkieldio/azalea/commit/7ff426b4a57a810ee70f5a78a6a3890f5f66c9b4) **core**: Add transcode runtime with hardware fallback
+- [`2cfbc57`](https://github.com/yehezkieldio/azalea/commit/2cfbc57ef42180fc4593fa9d5d68276941c45cf4) **storage**: Introduce rotation for corrupt redb stores
+- [`7fab23f`](https://github.com/yehezkieldio/azalea/commit/7fab23f37f48c3b7faf7a7eb45812ec682b5d16c) **pipeline**: Add media probing and split-copy strategy plan
+
+### <!-- 4 -->🐛 Bug Fixes
+- [`cfd3a11`](https://github.com/yehezkieldio/azalea/commit/cfd3a1148231dae12cdde083d5dece2d389f1490) **storage**: Handle invalid data io error as corruption
+- [`18b5b15`](https://github.com/yehezkieldio/azalea/commit/18b5b154a51eef3bc13bb94ccac239572553dfec) **main**: Add probe write and sync in temp dir check
+- [`968f3fe`](https://github.com/yehezkieldio/azalea/commit/968f3fec652f0e1c45abd356c9c4ce12848f2fc2) **pipeline**: Replace re-read per retry with single attachment
+
+### <!-- 7 -->🚜 Refactor
+- [`1bfa131`](https://github.com/yehezkieldio/azalea/commit/1bfa13197a854b2a9631e2a48f64c78ae2891216) **tempfile**: Introduce StaleTempCleanup and return it
+- [`6af14f0`](https://github.com/yehezkieldio/azalea/commit/6af14f0abdb4e64df6f454ff2798d2d819737d8f) **core**: Introduce observed_delta_secs and clarify dedup logging
+- [`1a6dcb9`](https://github.com/yehezkieldio/azalea/commit/1a6dcb9bb6ab75bebeaf34c3d8942f2516ada6c1) **metrics**: Replace string error keys with ErrorCategory enum
+- [`59a3eb8`](https://github.com/yehezkieldio/azalea/commit/59a3eb8ef3e898c96284586efcedbe5f3bc73111) **pipeline**: Replace format selection with ranked scoring
+- [`61dfa0a`](https://github.com/yehezkieldio/azalea/commit/61dfa0a9f8faab953d093baec67e49fd055c7494) **ids**: Introduce strongly-typed Discord id wrappers
+- [`db77866`](https://github.com/yehezkieldio/azalea/commit/db778661eb7058f417f51916ea0302c656e18ac7) **pipeline**: Extract stderr tail formatting into helper
+- [`9522652`](https://github.com/yehezkieldio/azalea/commit/9522652a410c81f39552cc5888d877e33308bab4) **download**: Extract fetch_with_redirects_inner and add tests
+- [`c84b412`](https://github.com/yehezkieldio/azalea/commit/c84b4127a6788099522a2cd84296e772509264d5) **storage**: Introduce flush-worker and restructure metrics snapshot
+- [`5df04cc`](https://github.com/yehezkieldio/azalea/commit/5df04cc35648d65150c901ed9a747e8edd3186f7) **pipeline**: Replace prepared upload paths with prepared parts
+- [`f924b91`](https://github.com/yehezkieldio/azalea/commit/f924b91c43b32c5fb2a67d1d5a26950009395cc5) **pipeline**: Extract run_json_subprocess and stderr tail reader
+
 ## 0.3.2 (March 23, 2026)
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`236b83a`](https://github.com/yehezkieldio/azalea/commit/236b83a1559f5714699ded91bb23b9145124d070) **release**: 0.3.2
 
 ### <!-- 5 -->📚 Documentation
 - [`e61db50`](https://github.com/yehezkieldio/azalea/commit/e61db50cf9cc7092b1109424fddb6b2b2bc6788a) **legal**: Remove repository license section
