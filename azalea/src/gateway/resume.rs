@@ -10,16 +10,45 @@
 //! reconnect.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use twilight_gateway::{Config, ConfigBuilder, Session, Shard, ShardId};
 
 const INFO_FILE: &str = "azalea-resume-info.json";
 const BACKUP_FILE: &str = "azalea-resume-info.json.bak";
+const RENAME_RETRY_ATTEMPTS: u32 = 5;
+const RENAME_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 fn temp_file_name() -> String {
     // Include PID to avoid collisions when multiple instances overlap.
     format!("{}.{}.tmp", INFO_FILE, std::process::id())
+}
+
+async fn rename_with_retry(from: &str, to: &str) -> std::io::Result<()> {
+    for attempt in 1..=RENAME_RETRY_ATTEMPTS {
+        match fs::rename(from, to).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::debug!(
+                    attempt,
+                    max_attempts = RENAME_RETRY_ATTEMPTS,
+                    error = %error,
+                    "Could not replace resume info file"
+                );
+
+                if attempt == RENAME_RETRY_ATTEMPTS {
+                    return Err(error);
+                }
+
+                if attempt != RENAME_RETRY_ATTEMPTS {
+                    tokio::time::sleep(RENAME_RETRY_DELAY * attempt).await;
+                }
+            }
+        }
+    }
+
+    unreachable!("rename retry loop returns on success or the final failure")
 }
 
 pub trait ConfigBuilderExt {
@@ -81,7 +110,7 @@ impl From<&Shard> for SessionInfo {
 /// Persist resume metadata for fast reconnects on the next startup.
 ///
 /// ## Postconditions
-/// Writes are atomic via a temp file + rename sequence.
+/// Writes replace the destination via a temp file and bounded rename retries.
 pub async fn save(info: &[SessionInfo]) -> anyhow::Result<()> {
     // Avoid creating empty files when resumption isn't possible.
     if info.iter().any(|resume| !resume.is_none()) {
@@ -120,7 +149,7 @@ pub async fn save(info: &[SessionInfo]) -> anyhow::Result<()> {
         let mut file = fs::File::create(&temp_file).await?;
         file.write_all(&contents).await?;
         file.sync_all().await?;
-        fs::rename(&temp_file, INFO_FILE).await?;
+        rename_with_retry(&temp_file, INFO_FILE).await?;
         let parent = std::path::Path::new(INFO_FILE)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
