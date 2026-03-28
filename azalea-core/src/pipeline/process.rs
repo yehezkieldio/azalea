@@ -7,13 +7,14 @@
 //! ## Hot-path markers
 //! `read_bounded` is on the output processing path for ffmpeg and yt-dlp.
 
-use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
+
+const MAX_STDERR_LINE_BYTES: usize = 4096;
 
 pub(crate) struct BoundedRead {
     pub(crate) data: Vec<u8>,
@@ -270,12 +271,39 @@ pub(crate) async fn kill_process_group(child: &mut Child) {
     let _ = child.kill().await;
 }
 
-async fn read_stderr_tail(
-    stderr: tokio::process::ChildStderr,
+fn push_stderr_tail_line(
+    tail: &mut Vec<u8>,
+    line: &[u8],
+    line_count: &mut usize,
+    max_lines: usize,
+) {
+    tail.extend_from_slice(line);
+    tail.push(b'\n');
+    *line_count += 1;
+
+    if max_lines == 0 {
+        tail.clear();
+        *line_count = 0;
+        return;
+    }
+
+    if *line_count <= max_lines {
+        return;
+    }
+
+    if let Some(first_newline) = tail.iter().position(|&byte| byte == b'\n') {
+        tail.drain(..=first_newline);
+        *line_count -= 1;
+    } else {
+        tail.clear();
+        *line_count = 0;
+    }
+}
+
+async fn read_stderr_tail<R: AsyncRead + Unpin>(
+    stderr: R,
     max_lines: usize,
 ) -> Result<Box<str>, std::io::Error> {
-    const MAX_LINE_BYTES: usize = 4096;
-
     if max_lines == 0 {
         let mut reader = BufReader::new(stderr);
         let mut sink = Vec::with_capacity(256);
@@ -286,7 +314,8 @@ async fn read_stderr_tail(
     }
 
     let mut reader = BufReader::new(stderr);
-    let mut lines = VecDeque::with_capacity(max_lines);
+    let mut tail = Vec::with_capacity(max_lines.saturating_mul(256));
+    let mut line_count = 0;
     let mut buffer = Vec::with_capacity(256);
 
     loop {
@@ -296,26 +325,22 @@ async fn read_stderr_tail(
             break;
         }
 
-        if buffer.len() > MAX_LINE_BYTES {
-            buffer.truncate(MAX_LINE_BYTES);
+        if buffer.len() > MAX_STDERR_LINE_BYTES {
+            buffer.truncate(MAX_STDERR_LINE_BYTES);
         }
 
         if buffer.last() == Some(&b'\n') {
             buffer.pop();
         }
 
-        let line = String::from_utf8_lossy(&buffer).to_string();
-        if lines.len() >= max_lines {
-            lines.pop_front();
-        }
-        lines.push_back(line);
+        push_stderr_tail_line(&mut tail, &buffer, &mut line_count, max_lines);
     }
 
-    Ok(lines
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .into_boxed_str())
+    if tail.last() == Some(&b'\n') {
+        tail.pop();
+    }
+
+    Ok(String::from_utf8_lossy(&tail).into_owned().into_boxed_str())
 }
 
 #[cfg(test)]
@@ -356,6 +381,37 @@ mod tests {
         assert_eq!(result.data.len(), 16);
         assert!(result.exceeded);
         assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_stderr_tail_keeps_last_lines_with_empty_entries() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            let _ = writer.write_all(b"first\n\nthird\n").await;
+        });
+
+        let tail = read_stderr_tail(reader, 2)
+            .await
+            .expect("stderr tail read should succeed");
+
+        assert_eq!(tail.as_ref(), "\nthird");
+    }
+
+    #[tokio::test]
+    async fn read_stderr_tail_truncates_long_lines_before_joining() {
+        let (mut writer, reader) = tokio::io::duplex(MAX_STDERR_LINE_BYTES * 2);
+        tokio::spawn(async move {
+            let long_line = vec![b'x'; MAX_STDERR_LINE_BYTES + 32];
+            let _ = writer.write_all(&long_line).await;
+            let _ = writer.write_all(b"\n").await;
+        });
+
+        let tail = read_stderr_tail(reader, 1)
+            .await
+            .expect("stderr tail read should succeed");
+
+        assert_eq!(tail.len(), MAX_STDERR_LINE_BYTES);
+        assert!(tail.as_bytes().iter().all(|&byte| byte == b'x'));
     }
 
     #[cfg(unix)]
