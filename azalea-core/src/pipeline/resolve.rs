@@ -612,8 +612,9 @@ async fn infer_extension(
 ) -> Box<str> {
     if let Some(ext) = url.split('.').next_back() {
         let ext = ext.split('?').next().unwrap_or(ext);
-        if ["mp4", "webm", "gif", "jpg", "jpeg", "png", "webp"].contains(&ext) {
-            return ext.into();
+        match ext {
+            "mp4" | "webm" | "gif" | "jpg" | "jpeg" | "png" | "webp" => return ext.into(),
+            _ => {}
         }
     }
 
