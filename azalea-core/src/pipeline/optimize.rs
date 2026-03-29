@@ -134,7 +134,7 @@ pub async fn optimize(
     );
     let split_copy_plan = strategy_plan.split_copy;
 
-    for strategy in strategy_plan.strategies {
+    for strategy in strategy_plan.strategies.into_iter().flatten() {
         tracing::info!(strategy = %strategy, "Using transcode strategy");
         match strategy {
             TranscodeStrategy::Remux => {
@@ -290,9 +290,11 @@ impl std::fmt::Display for TranscodeStrategy {
     }
 }
 
+const STRATEGY_PLAN_CAPACITY: usize = 6;
+
 #[derive(Debug, Clone)]
 struct StrategyPlan {
-    strategies: Vec<TranscodeStrategy>,
+    strategies: [Option<TranscodeStrategy>; STRATEGY_PLAN_CAPACITY],
     split_copy: Option<SplitCopyPlan>,
 }
 
@@ -313,10 +315,8 @@ fn build_strategy_plan(
     let single_transcode_viable = single_transcode_is_plausible(duration, config);
     let split_copy = split_copy_is_plausible(downloaded, duration, config);
 
-    let mut strategies = Vec::with_capacity(5);
-
-    if remux_viable {
-        strategies.push(TranscodeStrategy::Remux);
+    let remux = if remux_viable {
+        Some(TranscodeStrategy::Remux)
     } else {
         tracing::trace!(
             container = ?downloaded.facts.container,
@@ -324,36 +324,54 @@ fn build_strategy_plan(
             audio_codec = ?downloaded.facts.audio_codec,
             "Skipping remux preflight"
         );
-    }
+        None
+    };
 
-    if single_transcode_viable {
-        strategies.push(TranscodeStrategy::TranscodeBalanced);
-        if aggressive_height != balanced_height {
-            strategies.push(TranscodeStrategy::TranscodeAggressive);
-        }
+    let (transcode_balanced, transcode_aggressive) = if single_transcode_viable {
+        (
+            Some(TranscodeStrategy::TranscodeBalanced),
+            (aggressive_height != balanced_height)
+                .then_some(TranscodeStrategy::TranscodeAggressive),
+        )
     } else {
         tracing::trace!(
             duration_secs = duration,
             "Skipping full-file transcode preflight"
         );
-    }
+        (None, None)
+    };
 
-    if let Some(plan) = split_copy {
+    let split_copy_strategy = if let Some(plan) = split_copy {
         tracing::trace!(
             segment_duration_secs = plan.segment_duration,
             estimated_segments = plan.estimated_segments,
             "Split-copy preflight succeeded"
         );
-        strategies.push(TranscodeStrategy::SplitCopy);
+        Some(TranscodeStrategy::SplitCopy)
     } else {
         tracing::trace!(
             bitrate_kbps = downloaded.facts.bitrate_kbps,
             duration_secs = duration,
             "Skipping split-copy preflight"
         );
-    }
+        None
+    };
 
-    strategies.push(TranscodeStrategy::SplitTranscode);
+    let strategy_candidates = [
+        remux,
+        transcode_balanced,
+        transcode_aggressive,
+        split_copy_strategy,
+        Some(TranscodeStrategy::SplitTranscode),
+        None,
+    ];
+    let mut strategies = [None; STRATEGY_PLAN_CAPACITY];
+    for (slot, strategy) in strategies
+        .iter_mut()
+        .zip(strategy_candidates.into_iter().flatten())
+    {
+        *slot = Some(strategy);
+    }
 
     StrategyPlan {
         strategies,
@@ -1209,11 +1227,13 @@ mod tests {
 
         assert_eq!(
             plan.strategies,
-            vec![
-                TranscodeStrategy::TranscodeBalanced,
-                TranscodeStrategy::TranscodeAggressive,
-                TranscodeStrategy::SplitCopy,
-                TranscodeStrategy::SplitTranscode,
+            [
+                Some(TranscodeStrategy::TranscodeBalanced),
+                Some(TranscodeStrategy::TranscodeAggressive),
+                Some(TranscodeStrategy::SplitCopy),
+                Some(TranscodeStrategy::SplitTranscode),
+                None,
+                None,
             ]
         );
         assert!(plan.split_copy.is_some());
@@ -1238,10 +1258,13 @@ mod tests {
 
         assert_eq!(
             plan.strategies,
-            vec![
-                TranscodeStrategy::TranscodeBalanced,
-                TranscodeStrategy::TranscodeAggressive,
-                TranscodeStrategy::SplitTranscode,
+            [
+                Some(TranscodeStrategy::TranscodeBalanced),
+                Some(TranscodeStrategy::TranscodeAggressive),
+                Some(TranscodeStrategy::SplitTranscode),
+                None,
+                None,
+                None,
             ]
         );
         assert!(plan.split_copy.is_none());
@@ -1266,9 +1289,13 @@ mod tests {
 
         assert_eq!(
             plan.strategies,
-            vec![
-                TranscodeStrategy::SplitCopy,
-                TranscodeStrategy::SplitTranscode
+            [
+                Some(TranscodeStrategy::SplitCopy),
+                Some(TranscodeStrategy::SplitTranscode),
+                None,
+                None,
+                None,
+                None,
             ]
         );
         assert!(plan.split_copy.is_some());
