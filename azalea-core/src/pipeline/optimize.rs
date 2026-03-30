@@ -402,6 +402,16 @@ fn split_copy_is_plausible(
     copy_segment_plan(downloaded, duration, config)
 }
 
+fn split_parallel_is_plausible(
+    downloaded: &DownloadedFile,
+    num_segments: u32,
+    config: &EngineSettings,
+) -> bool {
+    ffmpeg::mp4_stream_copy_viable(downloaded.facts)
+        && config.concurrency.transcode > 1
+        && num_segments >= config.pipeline.parallel_segment_threshold
+}
+
 async fn optimize_image(
     mut downloaded: DownloadedFile,
     permits: &Permits,
@@ -659,11 +669,13 @@ async fn split_video(
         .min(ctx.config.transcode.max_single_video_duration_secs as f64);
 
     let num_segments = (duration / segment_duration).ceil() as u32;
-    let use_parallel = num_segments >= ctx.config.pipeline.parallel_segment_threshold;
+    let use_parallel = split_parallel_is_plausible(&downloaded, num_segments, ctx.config);
 
     tracing::info!(
         segment_duration_secs = segment_duration,
         num_segments,
+        raw_split_copy_viable = ffmpeg::mp4_stream_copy_viable(downloaded.facts),
+        transcode_concurrency = ctx.config.concurrency.transcode,
         parallel = use_parallel,
         "Splitting media"
     );
@@ -1173,7 +1185,7 @@ mod tests {
 
     use super::{
         TranscodeStrategy, build_strategy_plan, execute_with_hwacc_fallback,
-        split_copy_is_plausible,
+        split_copy_is_plausible, split_parallel_is_plausible,
     };
     use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings};
     use crate::engine::TranscodeRuntime;
@@ -1317,6 +1329,66 @@ mod tests {
         );
 
         assert!(split_copy_is_plausible(&downloaded, 20.0, &config).is_none());
+    }
+
+    #[test]
+    fn split_parallel_preflight_rejects_non_mp4_stream_copy_input() {
+        let mut config = EngineSettings::default();
+        config.concurrency.transcode = 4;
+
+        let downloaded = downloaded_file(
+            "long.webm",
+            120 * 1024 * 1024,
+            720.0,
+            MediaFacts {
+                container: MediaContainer::Webm,
+                video_codec: VideoCodec::Vp9,
+                audio_codec: AudioCodec::Opus,
+                bitrate_kbps: Some(1_400),
+            },
+        );
+
+        assert!(!split_parallel_is_plausible(&downloaded, 6, &config));
+    }
+
+    #[test]
+    fn split_parallel_preflight_rejects_single_transcode_permit() {
+        let mut config = EngineSettings::default();
+        config.concurrency.transcode = 1;
+
+        let downloaded = downloaded_file(
+            "long.mp4",
+            120 * 1024 * 1024,
+            720.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+        );
+
+        assert!(!split_parallel_is_plausible(&downloaded, 6, &config));
+    }
+
+    #[test]
+    fn split_parallel_preflight_accepts_copyable_input_with_parallel_capacity() {
+        let mut config = EngineSettings::default();
+        config.concurrency.transcode = 4;
+
+        let downloaded = downloaded_file(
+            "long.mp4",
+            120 * 1024 * 1024,
+            720.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+        );
+
+        assert!(split_parallel_is_plausible(&downloaded, 6, &config));
     }
 
     #[tokio::test]

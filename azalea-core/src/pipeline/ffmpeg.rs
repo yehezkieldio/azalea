@@ -566,5 +566,10 @@ mod tests {
             audio_codec: AudioCodec::Opus,
             ..MediaFacts::default()
         }));
+        assert!(!mp4_stream_copy_viable(MediaFacts {
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Opus,
+            ..MediaFacts::default()
+        }));
     }
 }
