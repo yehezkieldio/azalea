@@ -23,6 +23,7 @@ use crate::pipeline::quality::{BitrateParams, Ladder, SplitTranscodePlan};
 use crate::pipeline::types::{
     DownloadedFile, MediaType, PreparedPart, PreparedUpload, Progress, ResolvedMedia,
 };
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -904,20 +905,14 @@ async fn split_parallel(
         });
     }
 
-    tracing::info!(segments = raw_segments.len(), "Raw segments created");
-
-    let output_segments: Vec<PathBuf> = (0..raw_segments.len())
-        .map(|idx| {
-            downloaded
-                .path
-                .with_file_name(format!("{}_seg{:03}.mp4", stem, idx))
-        })
-        .collect();
-
     let total_segments = raw_segments.len();
+    tracing::info!(segments = total_segments, "Raw segments created");
+
+    let output_prefix = format!("{}_seg", stem);
     send_progress_best_effort(&progress_tx, Progress::Transcoding(0, total_segments));
 
     let mut join_set = tokio::task::JoinSet::new();
+    let mut pending_segments: VecDeque<_> = raw_segments.into_iter().enumerate().collect();
 
     let ffmpeg_path = ctx.config.binaries.ffmpeg.clone();
     let transcode_settings = ctx.config.transcode.clone();
@@ -925,62 +920,24 @@ async fn split_parallel(
     let transcode_concurrency = ctx.config.concurrency.transcode;
     let segment_video_kbps = segment_params.video_bitrate_kbps;
     let segment_audio_kbps = segment_params.audio_bitrate_kbps;
-    for (idx, raw_segment) in raw_segments.iter().enumerate() {
-        let out_path = output_segments.get(idx).cloned().unwrap_or_else(|| {
-            downloaded
-                .path
-                .with_file_name(format!("{}_seg{:03}.mp4", stem, idx))
-        });
-
-        let permit = Arc::clone(&ctx.permits.transcode);
-        let timeout = Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs);
-        let raw_path_clone = raw_segment.path.clone();
-        let input_path = raw_segment.path.clone();
-        let output_path = out_path.clone();
-        let transcode_settings = transcode_settings.clone();
-        let transcode_runtime = transcode_runtime.clone();
-
-        let ffmpeg_path = ffmpeg_path.clone();
-        join_set.spawn(async move {
-            // Segment transcodes run independently under the shared permit pool.
-            let _permit = permit
-                .acquire()
-                .await
-                .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
-            let result = execute_with_hwacc_fallback(
-                &ffmpeg_path,
-                timeout,
-                TranscodeStage::Split,
-                &transcode_settings,
-                &transcode_runtime,
-                |active_settings| {
-                    ffmpeg::transcode_args(
-                        &input_path,
-                        &output_path,
-                        segment_video_kbps,
-                        segment_audio_kbps,
-                        None,
-                        active_settings,
-                        transcode_concurrency,
-                    )
-                },
-            )
-            .await;
-            let _ = fs::remove_file(&raw_path_clone).await;
-            result?;
-            let size = fs::metadata(&out_path).await?.len();
-            Ok((
-                idx,
-                SegmentOutput {
-                    path: out_path,
-                    size,
-                },
-            ))
-        });
-    }
 
     let mut final_segments = vec![None; total_segments];
     let mut finished = 0;
+
+    spawn_parallel_segment_tasks(
+        &mut join_set,
+        &mut pending_segments,
+        &stem,
+        Arc::clone(&ctx.permits.transcode),
+        Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
+        &ffmpeg_path,
+        &transcode_settings,
+        &transcode_runtime,
+        transcode_concurrency,
+        segment_video_kbps,
+        segment_audio_kbps,
+    )
+    .await?;
 
     while let Some(res) = join_set.join_next().await {
         match res {
@@ -998,19 +955,33 @@ async fn split_parallel(
                     &progress_tx,
                     Progress::Transcoding(finished, total_segments),
                 );
+                spawn_parallel_segment_tasks(
+                    &mut join_set,
+                    &mut pending_segments,
+                    &stem,
+                    Arc::clone(&ctx.permits.transcode),
+                    Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
+                    &ffmpeg_path,
+                    &transcode_settings,
+                    &transcode_runtime,
+                    transcode_concurrency,
+                    segment_video_kbps,
+                    segment_audio_kbps,
+                )
+                .await?;
             }
             Ok(Err(e)) => {
                 join_set.abort_all();
                 while join_set.join_next().await.is_some() {}
-                cleanup_segment_outputs(&raw_segments).await;
-                cleanup_segments(&output_segments).await;
+                cleanup_segment_prefix(&downloaded.path, &raw_prefix).await;
+                cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
                 return Err(e);
             }
             Err(e) => {
                 join_set.abort_all();
                 while join_set.join_next().await.is_some() {}
-                cleanup_segment_outputs(&raw_segments).await;
-                cleanup_segments(&output_segments).await;
+                cleanup_segment_prefix(&downloaded.path, &raw_prefix).await;
+                cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
                 return Err(Error::TranscodeFailed {
                     stage: TranscodeStage::Split,
                     exit_code: None,
@@ -1035,6 +1006,120 @@ async fn split_parallel(
 
     tracing::info!(segments = parts.len(), "Parallel split completed");
     Ok(PreparedUpload::split(parts, dir_guard))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_parallel_segment_tasks(
+    join_set: &mut tokio::task::JoinSet<Result<(usize, SegmentOutput), Error>>,
+    pending_segments: &mut VecDeque<(usize, SegmentOutput)>,
+    stem: &str,
+    permit: Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+    ffmpeg_path: &Path,
+    transcode_settings: &TranscodeSettings,
+    transcode_runtime: &TranscodeRuntime,
+    transcode_concurrency: u32,
+    segment_video_kbps: u32,
+    segment_audio_kbps: u32,
+) -> Result<(), Error> {
+    while let Ok(permit) = Arc::clone(&permit).try_acquire_owned() {
+        let Some((idx, raw_segment)) = pending_segments.pop_front() else {
+            return Ok(());
+        };
+        spawn_parallel_segment_task(
+            join_set,
+            idx,
+            raw_segment,
+            stem,
+            permit,
+            timeout,
+            ffmpeg_path,
+            transcode_settings,
+            transcode_runtime,
+            transcode_concurrency,
+            segment_video_kbps,
+            segment_audio_kbps,
+        );
+    }
+
+    if join_set.is_empty()
+        && let Some((idx, raw_segment)) = pending_segments.pop_front()
+    {
+        let permit = Arc::clone(&permit)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
+        spawn_parallel_segment_task(
+            join_set,
+            idx,
+            raw_segment,
+            stem,
+            permit,
+            timeout,
+            ffmpeg_path,
+            transcode_settings,
+            transcode_runtime,
+            transcode_concurrency,
+            segment_video_kbps,
+            segment_audio_kbps,
+        );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_parallel_segment_task(
+    join_set: &mut tokio::task::JoinSet<Result<(usize, SegmentOutput), Error>>,
+    idx: usize,
+    raw_segment: SegmentOutput,
+    stem: &str,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    timeout: Duration,
+    ffmpeg_path: &Path,
+    transcode_settings: &TranscodeSettings,
+    transcode_runtime: &TranscodeRuntime,
+    transcode_concurrency: u32,
+    segment_video_kbps: u32,
+    segment_audio_kbps: u32,
+) {
+    let ffmpeg_path = ffmpeg_path.to_path_buf();
+    let input_path = raw_segment.path;
+    let output_path = input_path.with_file_name(format!("{}_seg{:03}.mp4", stem, idx));
+    let transcode_settings = transcode_settings.clone();
+    let transcode_runtime = transcode_runtime.clone();
+    join_set.spawn(async move {
+        let result = execute_with_hwacc_fallback(
+            &ffmpeg_path,
+            timeout,
+            TranscodeStage::Split,
+            &transcode_settings,
+            &transcode_runtime,
+            |active_settings| {
+                ffmpeg::transcode_args(
+                    &input_path,
+                    &output_path,
+                    segment_video_kbps,
+                    segment_audio_kbps,
+                    None,
+                    active_settings,
+                    transcode_concurrency,
+                )
+            },
+        )
+        .await;
+        drop(permit);
+        let _ = fs::remove_file(&input_path).await;
+        result?;
+        let size = fs::metadata(&output_path).await?.len();
+        Ok((
+            idx,
+            SegmentOutput {
+                path: output_path,
+                size,
+            },
+        ))
+    });
 }
 
 async fn execute_with_hwacc_fallback<F>(
@@ -1252,15 +1337,26 @@ async fn ensure_split_segments_fit_limit(
     })
 }
 
-async fn cleanup_segments(segments: &[PathBuf]) {
-    for path in segments {
-        let _ = fs::remove_file(path).await;
-    }
-}
-
 async fn cleanup_segment_outputs(segments: &[SegmentOutput]) {
     for segment in segments {
         let _ = fs::remove_file(&segment.path).await;
+    }
+}
+
+async fn cleanup_segment_prefix(path: &Path, prefix: &str) {
+    let parent_dir = path.parent().unwrap_or(Path::new("."));
+    let Ok(mut entries) = fs::read_dir(parent_dir).await else {
+        return;
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let candidate = entry.path();
+        if let Some(name) = candidate.file_name().and_then(|name| name.to_str())
+            && name.starts_with(prefix)
+            && name.ends_with(".mp4")
+        {
+            let _ = fs::remove_file(candidate).await;
+        }
     }
 }
 
