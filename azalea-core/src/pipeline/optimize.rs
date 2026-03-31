@@ -19,7 +19,7 @@ use crate::media::{TempFileCleanup, TempFileGuard};
 use crate::pipeline::disk::ensure_disk_space;
 use crate::pipeline::errors::{Error, TranscodeStage};
 use crate::pipeline::ffmpeg;
-use crate::pipeline::quality::{BitrateParams, Ladder};
+use crate::pipeline::quality::{BitrateParams, Ladder, SplitTranscodePlan};
 use crate::pipeline::types::{
     DownloadedFile, MediaType, PreparedPart, PreparedUpload, Progress, ResolvedMedia,
 };
@@ -241,12 +241,23 @@ pub async fn optimize(
                 downloaded._dir_guard = dir_guard;
             }
             TranscodeStrategy::SplitTranscode => {
-                return split_video(downloaded, duration, temp_files, &transcode, progress_tx)
-                    .instrument(tracing::info_span!(
-                        "optimize.strategy.split_transcode",
-                        duration_secs = duration
-                    ))
-                    .await;
+                let split_transcode_plan = strategy_plan.split_transcode.ok_or_else(|| {
+                    Error::Io(std::io::Error::other("missing split-transcode plan"))
+                })?;
+                return split_video(
+                    downloaded,
+                    split_transcode_plan,
+                    temp_files,
+                    &transcode,
+                    progress_tx,
+                )
+                .instrument(tracing::info_span!(
+                    "optimize.strategy.split_transcode",
+                    duration_secs = duration,
+                    segment_duration_secs = split_transcode_plan.segment_duration,
+                    estimated_segments = split_transcode_plan.estimated_segments
+                ))
+                .await;
             }
             TranscodeStrategy::PassThrough | TranscodeStrategy::ImageCompress => {}
         }
@@ -296,6 +307,7 @@ const STRATEGY_PLAN_CAPACITY: usize = 6;
 struct StrategyPlan {
     strategies: [Option<TranscodeStrategy>; STRATEGY_PLAN_CAPACITY],
     split_copy: Option<SplitCopyPlan>,
+    split_transcode: Option<SplitTranscodePlan>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -314,6 +326,7 @@ fn build_strategy_plan(
     let remux_viable = remux_is_plausible(downloaded);
     let single_transcode_viable = single_transcode_is_plausible(duration, config);
     let split_copy = split_copy_is_plausible(downloaded, duration, config);
+    let split_transcode = SplitTranscodePlan::compute(&config.transcode, duration).ok();
 
     let remux = if remux_viable {
         Some(TranscodeStrategy::Remux)
@@ -357,12 +370,29 @@ fn build_strategy_plan(
         None
     };
 
+    let split_transcode_strategy = if let Some(plan) = split_transcode {
+        tracing::trace!(
+            segment_duration_secs = plan.segment_duration,
+            estimated_segments = plan.estimated_segments,
+            video_bitrate_kbps = plan.bitrate.video_bitrate_kbps,
+            audio_bitrate_kbps = plan.bitrate.audio_bitrate_kbps,
+            "Split-transcode plan computed"
+        );
+        Some(TranscodeStrategy::SplitTranscode)
+    } else {
+        tracing::trace!(
+            duration_secs = duration,
+            "Skipping split-transcode preflight"
+        );
+        None
+    };
+
     let strategy_candidates = [
         remux,
         transcode_balanced,
         transcode_aggressive,
         split_copy_strategy,
-        Some(TranscodeStrategy::SplitTranscode),
+        split_transcode_strategy,
         None,
     ];
     let mut strategies = [None; STRATEGY_PLAN_CAPACITY];
@@ -376,6 +406,7 @@ fn build_strategy_plan(
     StrategyPlan {
         strategies,
         split_copy,
+        split_transcode,
     }
 }
 
@@ -643,7 +674,7 @@ async fn transcode(
 
 async fn split_video(
     mut downloaded: DownloadedFile,
-    duration: f64,
+    plan: SplitTranscodePlan,
     temp_files: &TempFileCleanup,
     ctx: &TranscodeContext<'_>,
     progress_tx: Option<mpsc::Sender<Progress>>,
@@ -652,28 +683,14 @@ async fn split_video(
         ._dir_guard
         .take()
         .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
-    let target_segment_size = (ctx.config.transcode.max_upload_bytes as f64
-        * ctx.config.transcode.split_target_ratio) as u64;
-
-    let segment_params = BitrateParams::compute_for_split(
-        &ctx.config.transcode,
-        ctx.config.transcode.max_single_video_duration_secs as f64,
-    )?;
-
-    let target_kbps = segment_params.video_bitrate_kbps + segment_params.audio_bitrate_kbps;
-    let target_bps = target_kbps as f64 * 1000.0;
-
-    // Estimate a segment duration that keeps each piece within upload size.
-    let segment_duration = (target_segment_size as f64 * 8.0 / target_bps)
-        .max(10.0)
-        .min(ctx.config.transcode.max_single_video_duration_secs as f64);
-
-    let num_segments = (duration / segment_duration).ceil() as u32;
-    let use_parallel = split_parallel_is_plausible(&downloaded, num_segments, ctx.config);
+    let use_parallel =
+        split_parallel_is_plausible(&downloaded, plan.estimated_segments, ctx.config);
 
     tracing::info!(
-        segment_duration_secs = segment_duration,
-        num_segments,
+        segment_duration_secs = plan.segment_duration,
+        num_segments = plan.estimated_segments,
+        video_bitrate_kbps = plan.bitrate.video_bitrate_kbps,
+        audio_bitrate_kbps = plan.bitrate.audio_bitrate_kbps,
         raw_split_copy_viable = ffmpeg::mp4_stream_copy_viable(downloaded.facts),
         transcode_concurrency = ctx.config.concurrency.transcode,
         parallel = use_parallel,
@@ -684,8 +701,8 @@ async fn split_video(
         // Parallel path: split quickly, then transcode segments concurrently.
         split_parallel(
             downloaded,
-            segment_duration,
-            &segment_params,
+            plan.segment_duration,
+            &plan.bitrate,
             temp_files,
             ctx,
             progress_tx,
@@ -695,8 +712,8 @@ async fn split_video(
     } else {
         split_serial(
             downloaded,
-            segment_duration,
-            &segment_params,
+            plan.segment_duration,
+            &plan.bitrate,
             temp_files,
             ctx,
             dir_guard,
@@ -1249,6 +1266,11 @@ mod tests {
             ]
         );
         assert!(plan.split_copy.is_some());
+        let split_transcode = plan
+            .split_transcode
+            .expect("split-transcode plan should be computed");
+        assert_eq!(split_transcode.segment_duration, 60.0);
+        assert_eq!(split_transcode.estimated_segments, 1);
     }
 
     #[test]
@@ -1311,6 +1333,11 @@ mod tests {
             ]
         );
         assert!(plan.split_copy.is_some());
+        let split_transcode = plan
+            .split_transcode
+            .expect("split-transcode plan should be computed");
+        assert_eq!(split_transcode.segment_duration, 120.0);
+        assert_eq!(split_transcode.estimated_segments, 6);
     }
 
     #[test]
