@@ -1201,33 +1201,74 @@ async fn try_split_copy(
         .await
         .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
 
-    if ffmpeg::execute(
+    if let Err(error) = ffmpeg::execute(
         &config.binaries.ffmpeg,
         &args,
         Duration::from_secs(config.transcode.ffmpeg_timeout_secs),
         TranscodeStage::Split,
     )
     .await
-    .is_err()
     {
+        abandon_split_copy(&downloaded.path, &prefix, format!("ffmpeg failed: {error}")).await;
         return Ok(None);
     }
 
-    let segments = collect_segments(&downloaded.path, &prefix).await?;
+    let segments = match collect_segments(&downloaded.path, &prefix).await {
+        Ok(segments) => segments,
+        Err(error) => {
+            let cleaned_outputs = cleanup_segment_prefix(&downloaded.path, &prefix).await;
+            tracing::warn!(
+                error = %error,
+                cleaned_outputs,
+                prefix = %prefix,
+                "Split-copy strategy scan failed after ffmpeg completed"
+            );
+            return Err(error);
+        }
+    };
     if segments.is_empty() {
+        abandon_split_copy(
+            &downloaded.path,
+            &prefix,
+            "produced no usable segments".to_string(),
+        )
+        .await;
         return Ok(None);
     }
 
     if !segments_fit_limit(&segments, config) {
-        cleanup_segment_outputs(&segments).await;
+        abandon_split_copy(
+            &downloaded.path,
+            &prefix,
+            format!(
+                "produced {} segment(s) exceeding the {} byte upload limit",
+                segments.len(),
+                config.transcode.max_upload_bytes
+            ),
+        )
+        .await;
         return Ok(None);
     }
 
-    let dir_guard = dir_guard
-        .take()
-        .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
+    let dir_guard = match dir_guard.take() {
+        Some(dir_guard) => dir_guard,
+        None => {
+            cleanup_segment_outputs(&segments).await;
+            return Err(Error::Io(std::io::Error::other("missing temp dir guard")));
+        }
+    };
     let parts = into_prepared_parts(segments, temp_files);
     Ok(Some(PreparedUpload::split(parts, dir_guard)))
+}
+
+async fn abandon_split_copy(path: &Path, prefix: &str, reason: String) {
+    let cleaned_outputs = cleanup_segment_prefix(path, prefix).await;
+    tracing::info!(
+        reason,
+        cleaned_outputs,
+        prefix = %prefix,
+        "Abandoning split-copy strategy"
+    );
 }
 
 fn copy_segment_plan(
@@ -1343,21 +1384,25 @@ async fn cleanup_segment_outputs(segments: &[SegmentOutput]) {
     }
 }
 
-async fn cleanup_segment_prefix(path: &Path, prefix: &str) {
+async fn cleanup_segment_prefix(path: &Path, prefix: &str) -> usize {
     let parent_dir = path.parent().unwrap_or(Path::new("."));
     let Ok(mut entries) = fs::read_dir(parent_dir).await else {
-        return;
+        return 0;
     };
+    let mut removed = 0;
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let candidate = entry.path();
         if let Some(name) = candidate.file_name().and_then(|name| name.to_str())
             && name.starts_with(prefix)
             && name.ends_with(".mp4")
+            && fs::remove_file(candidate).await.is_ok()
         {
-            let _ = fs::remove_file(candidate).await;
+            removed += 1;
         }
     }
+
+    removed
 }
 
 fn remux_path(input: &Path) -> PathBuf {
@@ -1375,9 +1420,10 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic)]
 
     use super::{
-        BitrateParams, SplitTranscodeProgress, TranscodeContext, TranscodeStrategy,
+        BitrateParams, SplitCopyPlan, SplitTranscodeProgress, TranscodeContext, TranscodeStrategy,
         build_strategy_plan, execute_with_hwacc_fallback, send_progress_best_effort,
         split_copy_is_plausible, split_parallel, split_parallel_is_plausible, split_serial,
+        try_split_copy,
     };
     use crate::concurrency::Permits;
     use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings};
@@ -1442,6 +1488,14 @@ mod tests {
 
     fn split_oversize_script() -> String {
         "#!/bin/sh\ncopy_mode=0\npattern=''\nlast_mp4=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n    *.mp4)\n      last_mp4=\"$arg\"\n      ;;\n  esac\ndone\nif [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  if [ \"$copy_mode\" -eq 1 ]; then\n    printf 'raw0' > \"${prefix}000.mp4\"\n    printf 'raw1' > \"${prefix}001.mp4\"\n  else\n    printf 'ok' > \"${prefix}000.mp4\"\n    printf '0123456789ABCDEF' > \"${prefix}001.mp4\"\n  fi\n  exit 0\nfi\nif [ -n \"$last_mp4\" ]; then\n  case \"$last_mp4\" in\n    *seg000.mp4)\n      printf 'ok' > \"$last_mp4\"\n      ;;\n    *)\n      printf '0123456789ABCDEF' > \"$last_mp4\"\n      ;;\n  esac\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 1\n".to_string()
+    }
+
+    fn split_copy_partial_failure_script() -> String {
+        "#!/bin/sh\ncopy_mode=0\npattern=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n  esac\ndone\nif [ \"$copy_mode\" -eq 1 ] && [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  printf 'partial' > \"${prefix}000.mp4\"\n  printf 'copy split failed\\n' >&2\n  exit 1\nfi\nprintf 'unexpected args\\n' >&2\nexit 2\n".to_string()
+    }
+
+    fn split_copy_zero_byte_script() -> String {
+        "#!/bin/sh\ncopy_mode=0\npattern=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n  esac\ndone\nif [ \"$copy_mode\" -eq 1 ] && [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  : > \"${prefix}000.mp4\"\n  : > \"${prefix}001.mp4\"\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 2\n".to_string()
     }
 
     fn assert_split_oversize(err: Error) {
@@ -1759,6 +1813,115 @@ mod tests {
         assert!(!temp_dir.join("input_raw001.mp4").exists());
         assert!(!temp_dir.join("input_seg000.mp4").exists());
         assert!(!temp_dir.join("input_seg001.mp4").exists());
+
+        temp_files.shutdown().await;
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn try_split_copy_cleans_partial_outputs_after_ffmpeg_failure() {
+        let temp_files = TempFileCleanup::new();
+        let temp_dir = unique_temp_path("split-copy-partial-dir");
+        let script_path = unique_temp_path("split-copy-partial-ffmpeg.sh");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        write_executable(&script_path, &split_copy_partial_failure_script());
+
+        let input_path = temp_dir.join("input.mp4");
+        fs::write(&input_path, b"input").expect("write input");
+
+        let mut config = EngineSettings::default();
+        config.binaries.ffmpeg = script_path.clone();
+        config.storage.temp_dir = temp_dir.clone();
+        config.transcode.ffmpeg_timeout_secs = 1;
+
+        let permits = Permits::new(&config.concurrency);
+        let downloaded = downloaded_file_at(
+            input_path.clone(),
+            32,
+            30.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+            &temp_files,
+        );
+        let mut dir_guard = Some(temp_files.guard(temp_dir.clone()));
+
+        let result = try_split_copy(
+            &downloaded,
+            SplitCopyPlan {
+                segment_duration: 10.0,
+                estimated_segments: 2,
+            },
+            &permits,
+            &temp_files,
+            &config,
+            &mut dir_guard,
+        )
+        .await
+        .expect("split-copy failure should fall back cleanly");
+
+        assert!(result.is_none());
+        assert!(dir_guard.is_some());
+        assert!(!temp_dir.join("input_copy000.mp4").exists());
+
+        temp_files.shutdown().await;
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn try_split_copy_cleans_zero_byte_outputs_when_no_segments_are_usable() {
+        let temp_files = TempFileCleanup::new();
+        let temp_dir = unique_temp_path("split-copy-empty-dir");
+        let script_path = unique_temp_path("split-copy-empty-ffmpeg.sh");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        write_executable(&script_path, &split_copy_zero_byte_script());
+
+        let input_path = temp_dir.join("input.mp4");
+        fs::write(&input_path, b"input").expect("write input");
+
+        let mut config = EngineSettings::default();
+        config.binaries.ffmpeg = script_path.clone();
+        config.storage.temp_dir = temp_dir.clone();
+        config.transcode.ffmpeg_timeout_secs = 1;
+
+        let permits = Permits::new(&config.concurrency);
+        let downloaded = downloaded_file_at(
+            input_path.clone(),
+            32,
+            30.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+            &temp_files,
+        );
+        let mut dir_guard = Some(temp_files.guard(temp_dir.clone()));
+
+        let result = try_split_copy(
+            &downloaded,
+            SplitCopyPlan {
+                segment_duration: 10.0,
+                estimated_segments: 2,
+            },
+            &permits,
+            &temp_files,
+            &config,
+            &mut dir_guard,
+        )
+        .await
+        .expect("split-copy should fall back when scan finds no usable segments");
+
+        assert!(result.is_none());
+        assert!(dir_guard.is_some());
+        assert!(!temp_dir.join("input_copy000.mp4").exists());
+        assert!(!temp_dir.join("input_copy001.mp4").exists());
 
         temp_files.shutdown().await;
         let _ = fs::remove_file(script_path);
