@@ -284,6 +284,8 @@ pub fn split_args(
     args.push(format!("{}k", audio_kbps).into());
     args.push("-ac".into());
     args.push("2".into());
+    args.push("-force_key_frames".into());
+    args.push(format!("expr:gte(t,n_forced*{segment_duration:.1})").into());
 
     args.extend([
         "-f".into(),
@@ -522,6 +524,26 @@ mod tests {
         let as_text = to_strings(&args);
         assert!(as_text.windows(2).any(|w| w == ["-f", "segment"]));
         assert!(as_text.windows(2).any(|w| w == ["-segment_time", "11.5"]));
+    }
+
+    #[test]
+    fn split_args_force_keyframes_at_segment_boundaries() {
+        let args = split_args(
+            Path::new("input.mp4"),
+            Path::new("seg%03d.mp4"),
+            11.5,
+            900,
+            128,
+            &TranscodeSettings::default(),
+            2,
+        );
+        let as_text = to_strings(&args);
+
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-force_key_frames", "expr:gte(t,n_forced*11.5)"])
+        );
     }
 
     #[test]

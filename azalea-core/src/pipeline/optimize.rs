@@ -781,6 +781,7 @@ async fn split_serial(
         });
     }
 
+    let segments = ensure_split_segments_fit_limit(segments, ctx.config).await?;
     let segments_len = segments.len();
     let parts = into_prepared_parts(segments, temp_files);
     tracing::info!(segments = segments_len, "Serial split completed");
@@ -969,6 +970,7 @@ async fn split_parallel(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let final_segments = ensure_split_segments_fit_limit(final_segments, ctx.config).await?;
     let parts = into_prepared_parts(final_segments, temp_files);
 
     tracing::info!(segments = parts.len(), "Parallel split completed");
@@ -1174,6 +1176,22 @@ fn segments_fit_limit(segments: &[SegmentOutput], config: &EngineSettings) -> bo
     true
 }
 
+async fn ensure_split_segments_fit_limit(
+    segments: Vec<SegmentOutput>,
+    config: &EngineSettings,
+) -> Result<Vec<SegmentOutput>, Error> {
+    if segments_fit_limit(&segments, config) {
+        return Ok(segments);
+    }
+
+    cleanup_segment_outputs(&segments).await;
+    Err(Error::TranscodeFailed {
+        stage: TranscodeStage::Split,
+        exit_code: None,
+        stderr_tail: "split segment exceeded upload limit".to_string(),
+    })
+}
+
 async fn cleanup_segments(segments: &[PathBuf]) {
     for path in segments {
         let _ = fs::remove_file(path).await;
@@ -1198,22 +1216,25 @@ fn transcode_path(input: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::panic)]
 
     use super::{
-        TranscodeStrategy, build_strategy_plan, execute_with_hwacc_fallback,
-        split_copy_is_plausible, split_parallel_is_plausible,
+        BitrateParams, TranscodeContext, TranscodeStrategy, build_strategy_plan,
+        execute_with_hwacc_fallback, split_copy_is_plausible, split_parallel,
+        split_parallel_is_plausible, split_serial,
     };
+    use crate::concurrency::Permits;
     use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings};
     use crate::engine::TranscodeRuntime;
     use crate::media::TempFileCleanup;
+    use crate::pipeline::errors::Error;
     use crate::pipeline::types::{
         AudioCodec, DownloadedFile, MediaContainer, MediaFacts, VideoCodec,
     };
     use crate::pipeline::{self, errors::TranscodeStage};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn downloaded_file(path: &str, size: u64, duration: f64, facts: MediaFacts) -> DownloadedFile {
@@ -1229,12 +1250,52 @@ mod tests {
         }
     }
 
+    fn downloaded_file_at(
+        path: PathBuf,
+        size: u64,
+        duration: f64,
+        facts: MediaFacts,
+        temp_files: &TempFileCleanup,
+    ) -> DownloadedFile {
+        DownloadedFile {
+            path: path.clone(),
+            size,
+            duration: Some(duration),
+            resolution: Some((1920, 1080)),
+            facts,
+            _guard: temp_files.guard(path),
+            _dir_guard: None,
+        }
+    }
+
     fn unique_temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("azalea-{name}-{nanos}"))
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write script");
+        let mut permissions = fs::metadata(path).expect("stat script").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
+    fn split_oversize_script() -> String {
+        "#!/bin/sh\ncopy_mode=0\npattern=''\nlast_mp4=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n    *.mp4)\n      last_mp4=\"$arg\"\n      ;;\n  esac\ndone\nif [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  if [ \"$copy_mode\" -eq 1 ]; then\n    printf 'raw0' > \"${prefix}000.mp4\"\n    printf 'raw1' > \"${prefix}001.mp4\"\n  else\n    printf 'ok' > \"${prefix}000.mp4\"\n    printf '0123456789ABCDEF' > \"${prefix}001.mp4\"\n  fi\n  exit 0\nfi\nif [ -n \"$last_mp4\" ]; then\n  case \"$last_mp4\" in\n    *seg000.mp4)\n      printf 'ok' > \"$last_mp4\"\n      ;;\n    *)\n      printf '0123456789ABCDEF' > \"$last_mp4\"\n      ;;\n  esac\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 1\n".to_string()
+    }
+
+    fn assert_split_oversize(err: Error) {
+        match err {
+            Error::TranscodeFailed {
+                stage: TranscodeStage::Split,
+                stderr_tail,
+                ..
+            } => assert_eq!(stderr_tail, "split segment exceeded upload limit"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -1416,6 +1477,134 @@ mod tests {
         );
 
         assert!(split_parallel_is_plausible(&downloaded, 6, &config));
+    }
+
+    #[tokio::test]
+    async fn split_serial_rejects_oversize_segments_and_cleans_up() {
+        let temp_files = TempFileCleanup::new();
+        let temp_dir = unique_temp_path("split-serial-dir");
+        let script_path = unique_temp_path("split-serial-ffmpeg.sh");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        write_executable(&script_path, &split_oversize_script());
+
+        let input_path = temp_dir.join("input.mp4");
+        fs::write(&input_path, b"input").expect("write input");
+
+        let mut config = EngineSettings::default();
+        config.binaries.ffmpeg = script_path.clone();
+        config.storage.temp_dir = temp_dir.clone();
+        config.transcode.max_upload_bytes = 8;
+        config.transcode.ffmpeg_timeout_secs = 1;
+
+        let permits = Permits::new(&config.concurrency);
+        let runtime = TranscodeRuntime::new(HardwareAcceleration::None);
+        let ctx = TranscodeContext {
+            permits: &permits,
+            config: &config,
+            runtime: &runtime,
+        };
+        let downloaded = downloaded_file_at(
+            input_path.clone(),
+            32,
+            30.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+            &temp_files,
+        );
+        let dir_guard = temp_files.guard(temp_dir.clone());
+        let segment_params = BitrateParams {
+            video_bitrate_kbps: 500,
+            audio_bitrate_kbps: 128,
+        };
+
+        let err = split_serial(
+            downloaded,
+            10.0,
+            &segment_params,
+            &temp_files,
+            &ctx,
+            dir_guard,
+        )
+        .await
+        .expect_err("oversize split segment must fail");
+
+        assert_split_oversize(err);
+        assert!(!temp_dir.join("input_seg000.mp4").exists());
+        assert!(!temp_dir.join("input_seg001.mp4").exists());
+
+        temp_files.shutdown().await;
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn split_parallel_rejects_oversize_segments_and_cleans_up() {
+        let temp_files = TempFileCleanup::new();
+        let temp_dir = unique_temp_path("split-parallel-dir");
+        let script_path = unique_temp_path("split-parallel-ffmpeg.sh");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        write_executable(&script_path, &split_oversize_script());
+
+        let input_path = temp_dir.join("input.mp4");
+        fs::write(&input_path, b"input").expect("write input");
+
+        let mut config = EngineSettings::default();
+        config.binaries.ffmpeg = script_path.clone();
+        config.storage.temp_dir = temp_dir.clone();
+        config.transcode.max_upload_bytes = 8;
+        config.transcode.ffmpeg_timeout_secs = 1;
+        config.concurrency.transcode = 2;
+
+        let permits = Permits::new(&config.concurrency);
+        let runtime = TranscodeRuntime::new(HardwareAcceleration::None);
+        let ctx = TranscodeContext {
+            permits: &permits,
+            config: &config,
+            runtime: &runtime,
+        };
+        let downloaded = downloaded_file_at(
+            input_path.clone(),
+            32,
+            30.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+            &temp_files,
+        );
+        let dir_guard = temp_files.guard(temp_dir.clone());
+        let segment_params = BitrateParams {
+            video_bitrate_kbps: 500,
+            audio_bitrate_kbps: 128,
+        };
+
+        let err = split_parallel(
+            downloaded,
+            10.0,
+            &segment_params,
+            &temp_files,
+            &ctx,
+            None,
+            dir_guard,
+        )
+        .await
+        .expect_err("oversize split segment must fail");
+
+        assert_split_oversize(err);
+        assert!(!temp_dir.join("input_raw000.mp4").exists());
+        assert!(!temp_dir.join("input_raw001.mp4").exists());
+        assert!(!temp_dir.join("input_seg000.mp4").exists());
+        assert!(!temp_dir.join("input_seg001.mp4").exists());
+
+        temp_files.shutdown().await;
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]
