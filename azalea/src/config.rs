@@ -480,6 +480,11 @@ const ENV_BINDINGS: &[EnvBinding] = &[
         path: &["pipeline", "parallel_segment_threshold"],
     },
     EnvBinding {
+        key: "BATCH_UPLOAD_MULTIPLE_MEDIA",
+        aliases: &[],
+        path: &["pipeline", "batch_upload_multiple_media"],
+    },
+    EnvBinding {
         key: "FFMPEG",
         aliases: &["FFMPEG_PATH"],
         path: &["binaries", "ffmpeg"],
@@ -793,11 +798,16 @@ mod tests {
             process_env: vec![
                 ("APPLICATION_ID".to_string(), "123456789".to_string()),
                 ("AZALEA_MAX_DOWNLOAD_BYTES".to_string(), "700".to_string()),
+                (
+                    "AZALEA_BATCH_UPLOAD_MULTIPLE_MEDIA".to_string(),
+                    "true".to_string(),
+                ),
                 ("DISCORD_TOKEN".to_string(), "secret".to_string()),
             ],
         })?;
 
         assert_eq!(loaded.app.engine.pipeline.max_download_bytes, 700);
+        assert!(loaded.app.engine.pipeline.batch_upload_multiple_media);
         Ok(())
     }
 
@@ -834,6 +844,13 @@ mod tests {
             Some(vec![
                 "pipeline".to_string(),
                 "max_download_bytes".to_string()
+            ])
+        );
+        assert_eq!(
+            config_path_from_env_key("AZALEA_BATCH_UPLOAD_MULTIPLE_MEDIA"),
+            Some(vec![
+                "pipeline".to_string(),
+                "batch_upload_multiple_media".to_string()
             ])
         );
         assert_eq!(

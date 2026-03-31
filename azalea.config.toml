@@ -1,3 +1,5 @@
+#:schema ./azalea.schema.json
+
 [runtime]
 worker_threads = 4
 max_blocking_threads = 16
@@ -65,70 +67,9 @@ user_rate_limit_window_secs = 60
 channel_rate_limit_requests = 20
 channel_rate_limit_window_secs = 60
 parallel_segment_threshold = 2
+batch_upload_multiple_media = true
 
 [binaries]
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 ytdlp = "yt-dlp"
-
-# Environment variable reference
-# - DISCORD_TOKEN (required; only read from env or .env, not TOML)
-# - APPLICATION_ID maps to application_id (same target as AZALEA_APPLICATION_ID)
-# - AZALEA_APPLICATION_ID -> application_id
-# - AZALEA_WORKER_THREADS -> runtime.worker_threads
-# - AZALEA_MAX_BLOCKING_THREADS -> runtime.max_blocking_threads
-# - AZALEA_THREAD_STACK_SIZE -> runtime.thread_stack_size
-# - AZALEA_DOWNLOAD -> concurrency.download
-# - AZALEA_UPLOAD -> concurrency.upload
-# - AZALEA_TRANSCODE -> concurrency.transcode
-# - AZALEA_YTDLP -> concurrency.ytdlp
-# - AZALEA_PIPELINE -> concurrency.pipeline
-# - AZALEA_POOL_MAX_IDLE_PER_HOST -> http.pool_max_idle_per_host
-# - AZALEA_POOL_IDLE_TIMEOUT_SECS -> http.pool_idle_timeout_secs
-# - AZALEA_CONNECT_TIMEOUT_SECS -> http.connect_timeout_secs
-# - AZALEA_TIMEOUT_SECS -> http.timeout_secs
-# - AZALEA_HTTP2_ADAPTIVE_WINDOW -> http.http2_adaptive_window
-# - AZALEA_HTTP2_INITIAL_STREAM_WINDOW_SIZE_BYTES -> http.http2_initial_stream_window_size_bytes
-# - AZALEA_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE_BYTES -> http.http2_initial_connection_window_size_bytes
-# - AZALEA_HTTP2_MAX_FRAME_SIZE_BYTES -> http.http2_max_frame_size_bytes
-# - AZALEA_TEMP_DIR -> storage.temp_dir
-# - AZALEA_DEDUP_TTL_HOURS -> storage.dedup_ttl_hours
-# - AZALEA_DEDUP_CACHE_SIZE -> storage.dedup_cache_size
-# - AZALEA_DEDUP_PERSISTENT -> storage.dedup_persistent
-# - AZALEA_DEDUP_DB_PATH -> storage.dedup_db_path
-# - AZALEA_DEDUP_FLUSH_INTERVAL_SECS -> storage.dedup_flush_interval_secs
-# - AZALEA_METRICS_DB_PATH -> storage.metrics_db_path
-# - AZALEA_METRICS_ENABLED -> storage.metrics_enabled
-# - AZALEA_RESOLVER_CACHE_TTL_SECS -> storage.resolver_cache_ttl_secs
-# - AZALEA_RESOLVER_CACHE_SIZE -> storage.resolver_cache_size
-# - AZALEA_RESOLVER_NEGATIVE_TTL_SECS -> storage.resolver_negative_ttl_secs
-# - AZALEA_QUALITY_PRESET -> transcode.quality_preset
-# - AZALEA_HARDWARE_ACCELERATION -> transcode.hardware_acceleration
-# - AZALEA_FFMPEG_THREADS -> transcode.ffmpeg_threads
-# - AZALEA_VAAPI_DEVICE -> transcode.vaapi_device
-# - AZALEA_MAX_UPLOAD_BYTES -> transcode.max_upload_bytes
-# - AZALEA_CONTAINER_OVERHEAD_RATIO -> transcode.container_overhead_ratio
-# - AZALEA_VBR_SAFETY_MARGIN -> transcode.vbr_safety_margin
-# - AZALEA_TRANSCODE_TARGET_RATIO -> transcode.transcode_target_ratio
-# - AZALEA_SPLIT_TARGET_RATIO -> transcode.split_target_ratio
-# - AZALEA_AUDIO_VBR_PADDING -> transcode.audio_vbr_padding
-# - AZALEA_MIN_BITRATE_KBPS -> transcode.min_bitrate_kbps
-# - AZALEA_MAX_SINGLE_VIDEO_DURATION_SECS -> transcode.max_single_video_duration_secs
-# - AZALEA_FFPROBE_TIMEOUT_SECS -> transcode.ffprobe_timeout_secs
-# - AZALEA_FFMPEG_TIMEOUT_SECS -> transcode.ffmpeg_timeout_secs
-# - AZALEA_QUEUE_BACKPRESSURE_TIMEOUT_MS -> pipeline.queue_backpressure_timeout_ms
-# - AZALEA_DOWNLOAD_TIMEOUT_SECS -> pipeline.download_timeout_secs
-# - AZALEA_DOWNLOAD_WRITE_BUFFER_BYTES -> pipeline.download_write_buffer_bytes
-# - AZALEA_UPLOAD_TIMEOUT_SECS -> pipeline.upload_timeout_secs
-# - AZALEA_MIN_DISK_SPACE_BYTES -> pipeline.min_disk_space_bytes
-# - AZALEA_MAX_DOWNLOAD_BYTES -> pipeline.max_download_bytes
-# - AZALEA_RESOLVER_TIMEOUT_SECS -> pipeline.resolver_timeout_secs
-# - AZALEA_YTDLP_TIMEOUT_SECS -> pipeline.ytdlp_timeout_secs
-# - AZALEA_USER_RATE_LIMIT_REQUESTS -> pipeline.user_rate_limit_requests
-# - AZALEA_USER_RATE_LIMIT_WINDOW_SECS -> pipeline.user_rate_limit_window_secs
-# - AZALEA_CHANNEL_RATE_LIMIT_REQUESTS -> pipeline.channel_rate_limit_requests
-# - AZALEA_CHANNEL_RATE_LIMIT_WINDOW_SECS -> pipeline.channel_rate_limit_window_secs
-# - AZALEA_PARALLEL_SEGMENT_THRESHOLD -> pipeline.parallel_segment_threshold
-# - AZALEA_FFMPEG, AZALEA_FFMPEG_PATH -> binaries.ffmpeg
-# - AZALEA_FFPROBE, AZALEA_FFPROBE_PATH -> binaries.ffprobe
-# - AZALEA_YTDLP_PATH -> binaries.ytdlp

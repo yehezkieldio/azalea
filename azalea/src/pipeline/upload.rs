@@ -2,11 +2,12 @@
 //! Upload stage for sending prepared media to Discord.
 //!
 //! ## Algorithm overview
-//! Iterates over prepared files, uploads sequentially, and threads replies so
-//! multi-part uploads are chained in a single conversation.
+//! Uploads prepared files either sequentially or as a single batched message,
+//! depending on configuration.
 //!
 //! ## Trade-off acknowledgment
-//! We upload parts sequentially to simplify ordering and rate limit handling.
+//! Sequential uploads preserve explicit per-segment ordering; batched uploads
+//! reduce Discord requests at the cost of reply threading.
 
 use crate::ids::{ChannelId, MessageId};
 use crate::pipeline::{Error, Progress, UploadOutcome};
@@ -96,6 +97,26 @@ async fn upload_parts(
         });
     }
 
+    if should_batch_upload(parts, config) {
+        return upload_parts_batched(parts, channel_id, tweet_id, discord, config, progress_tx)
+            .await;
+    }
+
+    upload_parts_sequential(parts, channel_id, tweet_id, discord, config, progress_tx).await
+}
+
+fn should_batch_upload(parts: &[PreparedPart], config: &EngineSettings) -> bool {
+    parts.len() > 1 && config.pipeline.batch_upload_multiple_media
+}
+
+async fn upload_parts_sequential(
+    parts: &[PreparedPart],
+    channel_id: ChannelId,
+    tweet_id: TweetId,
+    discord: &Client,
+    config: &EngineSettings,
+    progress_tx: Option<&mpsc::Sender<Progress>>,
+) -> Result<UploadOutcome, Error> {
     let total_files = parts.len();
     let mut first_message_id = None;
     let mut last_message_id = None;
@@ -110,40 +131,23 @@ async fn upload_parts(
             let _ = tx.send(stage).await;
         }
 
-        let file_path = part.path();
-        let file_size = file_size_checked(part, config, index + 1, total_files)?;
-        tracing::trace!(
-            part = index + 1,
-            total = total_files,
-            path = %file_path.display(),
-            size_bytes = file_size,
-            "Prepared upload payload"
-        );
-        let extension = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mp4");
-        let filename = if total_files > 1 {
-            format!("tweet_{}_part{}.{}", tweet_id.0, index + 1, extension)
-        } else {
-            format!("tweet_{}.{}", tweet_id.0, extension)
-        };
+        let attachment =
+            build_attachment(part, config, tweet_id, index + 1, total_files, 0).await?;
 
         let ctx = UploadRetryContext {
             discord,
             channel_id,
             reply_to: last_message_id,
-            config,
             part: index + 1,
             total: total_files,
         };
 
-        let response = send_with_retry(&ctx, part, filename)
+        let response = send_with_retry(&ctx, std::slice::from_ref(&attachment))
             .instrument(tracing::info_span!(
                 "upload.part",
                 part = index + 1,
                 total = total_files,
-                path = %file_path.display()
+                path = %part.path().display()
             ))
             .await?;
 
@@ -175,6 +179,45 @@ async fn upload_parts(
             )),
         })?,
         messages_sent: total_files,
+    })
+}
+
+async fn upload_parts_batched(
+    parts: &[PreparedPart],
+    channel_id: ChannelId,
+    tweet_id: TweetId,
+    discord: &Client,
+    config: &EngineSettings,
+    progress_tx: Option<&mpsc::Sender<Progress>>,
+) -> Result<UploadOutcome, Error> {
+    let total_files = parts.len();
+    let attachments = build_attachments(parts, config, tweet_id, progress_tx).await?;
+    let ctx = UploadRetryContext {
+        discord,
+        channel_id,
+        reply_to: None,
+        part: total_files,
+        total: total_files,
+    };
+
+    let response = send_with_retry(&ctx, &attachments)
+        .instrument(tracing::info_span!("upload.batch", total = total_files))
+        .await?;
+    let message = response.model().await.map_err(|e| Error::UploadFailed {
+        part: total_files,
+        total: total_files,
+        source: Box::new(e),
+    })?;
+
+    tracing::info!(
+        total = total_files,
+        message_id = message.id.get(),
+        "Batch upload complete"
+    );
+
+    Ok(UploadOutcome {
+        first_message_id: MessageId::from(message.id),
+        messages_sent: 1,
     })
 }
 
@@ -217,6 +260,7 @@ fn file_size_checked(
     Ok(file_size)
 }
 
+#[cfg(test)]
 async fn read_file_with_limit(
     part: &PreparedPart,
     config: &EngineSettings,
@@ -224,14 +268,79 @@ async fn read_file_with_limit(
     total: usize,
 ) -> Result<Vec<u8>, Error> {
     let size = file_size_checked(part, config, part_number, total)?;
+    read_file(part.path().to_path_buf(), size).await
+}
 
-    let path = part.path().to_path_buf();
+async fn read_file(path: std::path::PathBuf, size: u64) -> Result<Vec<u8>, Error> {
     // Use a blocking task for file IO to avoid starving async tasks.
     let data = tokio::task::spawn_blocking(move || read_file_preallocated(&path, size))
         .await
         .map_err(|e| Error::Core(azalea_core::pipeline::Error::Io(std::io::Error::other(e))))?
         .map_err(|e| Error::Core(azalea_core::pipeline::Error::Io(e)))?;
     Ok(data)
+}
+
+fn attachment_filename(path: &Path, tweet_id: TweetId, part_number: usize, total: usize) -> String {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4");
+
+    if total > 1 {
+        format!("tweet_{}_part{}.{}", tweet_id.0, part_number, extension)
+    } else {
+        format!("tweet_{}.{}", tweet_id.0, extension)
+    }
+}
+
+async fn build_attachment(
+    part: &PreparedPart,
+    config: &EngineSettings,
+    tweet_id: TweetId,
+    part_number: usize,
+    total: usize,
+    attachment_id: u64,
+) -> Result<Attachment, Error> {
+    let file_path = part.path();
+    let file_size = file_size_checked(part, config, part_number, total)?;
+    tracing::trace!(
+        part = part_number,
+        total,
+        path = %file_path.display(),
+        size_bytes = file_size,
+        "Prepared upload payload"
+    );
+
+    let data = read_file(file_path.to_path_buf(), file_size).await?;
+    Ok(Attachment::from_bytes(
+        attachment_filename(file_path, tweet_id, part_number, total),
+        data,
+        attachment_id,
+    ))
+}
+
+async fn build_attachments(
+    parts: &[PreparedPart],
+    config: &EngineSettings,
+    tweet_id: TweetId,
+    progress_tx: Option<&mpsc::Sender<Progress>>,
+) -> Result<Vec<Attachment>, Error> {
+    let total_files = parts.len();
+    let mut attachments = Vec::with_capacity(total_files);
+
+    for (index, part) in parts.iter().enumerate() {
+        if let Some(tx) = progress_tx {
+            let _ = tx
+                .send(Progress::UploadingSegment(index + 1, total_files))
+                .await;
+        }
+
+        attachments.push(
+            build_attachment(part, config, tweet_id, index + 1, total_files, index as u64).await?,
+        );
+    }
+
+    Ok(attachments)
 }
 
 /// Read the file into a preallocated buffer to minimize reallocations.
@@ -268,30 +377,23 @@ struct UploadRetryContext<'a> {
     discord: &'a Client,
     channel_id: ChannelId,
     reply_to: Option<MessageId>,
-    config: &'a EngineSettings,
     part: usize,
     total: usize,
 }
 
 async fn send_with_retry(
     ctx: &UploadRetryContext<'_>,
-    part: &PreparedPart,
-    filename: String,
+    attachments: &[Attachment],
 ) -> Result<twilight_http::Response<twilight_model::channel::Message>, Error> {
     const MAX_RETRIES: usize = 3;
 
-    let attachment = Attachment::from_bytes(
-        filename,
-        read_file_with_limit(part, ctx.config, ctx.part, ctx.total).await?,
-        0,
-    );
     let mut attempt = 0usize;
     loop {
         tracing::trace!(
             part = ctx.part,
             total = ctx.total,
             attempt = attempt + 1,
-            path = %part.path().display(),
+            attachments = attachments.len(),
             "Sending upload attempt"
         );
 
@@ -300,12 +402,13 @@ async fn send_with_retry(
             request = request.reply(reply_to.into());
         }
 
-        match request.attachments(std::slice::from_ref(&attachment)).await {
+        match request.attachments(attachments).await {
             Ok(response) => {
                 tracing::info!(
                     part = ctx.part,
                     total = ctx.total,
                     attempt = attempt + 1,
+                    attachments = attachments.len(),
                     "Upload request succeeded"
                 );
                 return Ok(response);
@@ -415,6 +518,8 @@ fn jitter_millis(max_ms: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic)]
+
     use super::*;
     use azalea_core::config::EngineSettings;
     use azalea_core::media::TempFileCleanup;
@@ -606,5 +711,55 @@ mod tests {
         cleanup_file(&path);
 
         assert_eq!(result.ok().as_deref(), Some(payload.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn build_attachments_assigns_split_filenames_and_unique_ids() {
+        let first_payload = b"part-one";
+        let second_payload = b"part-two";
+        let first_path = write_temp_file("batch-1", first_payload);
+        let second_path = write_temp_file("batch-2", second_payload);
+        let mut config = EngineSettings::default();
+        config.transcode.max_upload_bytes = 1024;
+
+        let parts = vec![
+            prepared_part(&first_path, first_payload.len() as u64),
+            prepared_part(&second_path, second_payload.len() as u64),
+        ];
+
+        let attachments = match build_attachments(&parts, &config, TweetId(42), None).await {
+            Ok(attachments) => attachments,
+            Err(error) => panic!("attachments should build: {error}"),
+        };
+        cleanup_file(&first_path);
+        cleanup_file(&second_path);
+
+        assert_eq!(attachments.len(), 2);
+        let [first, second] = attachments.as_slice() else {
+            panic!("expected exactly two attachments");
+        };
+        assert_eq!(first.filename, "tweet_42_part1.mp4");
+        assert_eq!(second.filename, "tweet_42_part2.mp4");
+        assert_eq!(first.id, 0);
+        assert_eq!(second.id, 1);
+        assert_eq!(first.file, first_payload);
+        assert_eq!(second.file, second_payload);
+    }
+
+    #[test]
+    fn batch_upload_only_applies_to_multi_part_uploads() {
+        let first_path = write_temp_file("batch-toggle-1", b"x");
+        let second_path = write_temp_file("batch-toggle-2", b"y");
+        let mut config = EngineSettings::default();
+        config.pipeline.batch_upload_multiple_media = true;
+
+        let first = prepared_part(&first_path, 1);
+        let second = prepared_part(&second_path, 1);
+
+        assert!(!should_batch_upload(std::slice::from_ref(&first), &config));
+        assert!(should_batch_upload(&[first, second], &config));
+
+        cleanup_file(&first_path);
+        cleanup_file(&second_path);
     }
 }

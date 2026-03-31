@@ -325,6 +325,7 @@ pub struct PipelineSettings {
     pub channel_rate_limit_requests: u32,
     pub channel_rate_limit_window_secs: u64,
     pub parallel_segment_threshold: u32,
+    pub batch_upload_multiple_media: bool,
 }
 
 impl Default for PipelineSettings {
@@ -343,6 +344,7 @@ impl Default for PipelineSettings {
             channel_rate_limit_requests: 20,
             channel_rate_limit_window_secs: 60,
             parallel_segment_threshold: 4,
+            batch_upload_multiple_media: false,
         }
     }
 }
@@ -639,5 +641,10 @@ mod tests {
         let mut config = EngineSettings::default();
         config.pipeline.upload_timeout_secs = 321;
         assert_eq!(config.upload_timeout(), Duration::from_secs(321));
+    }
+
+    #[test]
+    fn pipeline_batch_upload_multiple_media_defaults_to_false() {
+        assert!(!PipelineSettings::default().batch_upload_multiple_media);
     }
 }

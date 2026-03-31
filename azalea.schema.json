@@ -167,6 +167,10 @@
       "description": "Pipeline configuration.",
       "type": "object",
       "properties": {
+        "batch_upload_multiple_media": {
+          "type": "boolean",
+          "default": false
+        },
         "channel_rate_limit_requests": {
           "type": "integer",
           "format": "uint32",

@@ -35,7 +35,7 @@ Each `/media` invocation runs through a fixed sequence of stages:
 1. **Resolve**: The URL is submitted to the cached resolver chain. VxTwitter is tried first; yt-dlp is invoked as a fallback if that fails or returns incomplete metadata. Results are cached with a configurable TTL to avoid redundant outbound requests.
 2. **Download**: The resolved media URL is SSRF-validated, checked against the allowlist, and streamed to a temporary file under a configured size cap. Disk space is verified before writing begins.
 3. **Optimize**: A strategy ladder selects the cheapest path to meet Discord's upload limit: pass-through (already fits) → remux (container swap only) → transcode (re-encode with H.264) → segment split (sequential chunks). Hardware acceleration is applied at the transcode step when configured.
-4. **Upload**: Prepared files are uploaded to Discord as native attachments. Segments are posted sequentially to preserve order. A progress message is updated during long operations and cleaned up on completion.
+4. **Upload**: Prepared files are uploaded to Discord as native attachments. Segments are posted sequentially by default to preserve order, or can be batched into a single message. A progress message is updated during long operations and cleaned up on completion.
 5. **Persistence**: Deduplication entries and pipeline metrics are flushed to Redb in background tasks. Temp files are removed by RAII guards regardless of outcome.
 
 ## Building from Source

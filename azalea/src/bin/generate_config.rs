@@ -152,6 +152,11 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
         &[],
         "pipeline.parallel_segment_threshold",
     ),
+    (
+        "BATCH_UPLOAD_MULTIPLE_MEDIA",
+        &[],
+        "pipeline.batch_upload_multiple_media",
+    ),
     ("FFMPEG", &["FFMPEG_PATH"], "binaries.ffmpeg"),
     ("FFPROBE", &["FFPROBE_PATH"], "binaries.ffprobe"),
     ("YTDLP_PATH", &[], "binaries.ytdlp"),
@@ -540,6 +545,13 @@ fn render_template() -> String {
         &format!(
             "parallel_segment_threshold = {}",
             engine.pipeline.parallel_segment_threshold
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "batch_upload_multiple_media = {}",
+            engine.pipeline.batch_upload_multiple_media
         ),
     );
     line(&mut out, "");
