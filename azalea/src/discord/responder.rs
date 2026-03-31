@@ -77,6 +77,14 @@ pub async fn update_progress(
     }
 }
 
+fn should_send_progress(
+    stage: &Progress,
+    last_sent_at: std::time::Instant,
+    debounce: Duration,
+) -> bool {
+    !stage.is_inflight_transcoding() || last_sent_at.elapsed() >= debounce
+}
+
 /// Spawn a progress updater task with a debounce interval.
 ///
 /// ## Concurrency assumptions
@@ -92,24 +100,23 @@ pub fn spawn_progress_updates(
     tokio::spawn(async move {
         let mut last_sent_at = std::time::Instant::now() - debounce;
         let mut last_sent_stage: Option<Progress> = None;
+        let mut pending_stage: Option<Progress> = None;
         while let Some(stage) = progress_rx.recv().await {
-            // Avoid spamming Discord with tiny incremental updates.
-            let should_send = match stage {
-                Progress::Transcoding(done, total) => {
-                    // Only send periodic progress updates for long transcodes.
-                    done == total || last_sent_at.elapsed() >= debounce
-                }
-                _ => true,
-            };
-
-            if should_send {
+            if should_send_progress(&stage, last_sent_at, debounce) {
                 update_progress(&client, &metrics, channel_id, message_id, &stage).await;
                 last_sent_at = std::time::Instant::now();
                 last_sent_stage = Some(stage.clone());
-            } else if last_sent_stage.as_ref() != Some(&stage) {
-                // Track latest stage so the next update is accurate.
-                last_sent_stage = Some(stage);
+                pending_stage = None;
+            } else if pending_stage.as_ref() != Some(&stage) {
+                // Keep only the most recent deferred stage so shutdown can flush it.
+                pending_stage = Some(stage);
             }
+        }
+
+        if let Some(stage) = pending_stage
+            && last_sent_stage.as_ref() != Some(&stage)
+        {
+            update_progress(&client, &metrics, channel_id, message_id, &stage).await;
         }
     })
 }
@@ -201,5 +208,27 @@ mod tests {
             error_notification_policy(&error),
             ErrorNotificationPolicy::VisibleError
         );
+    }
+
+    #[test]
+    fn inflight_transcoding_updates_respect_debounce() {
+        let debounce = Duration::from_secs(5);
+        let last_sent_at = std::time::Instant::now();
+
+        assert!(!should_send_progress(
+            &Progress::Transcoding(1, 3),
+            last_sent_at,
+            debounce
+        ));
+        assert!(should_send_progress(
+            &Progress::Transcoding(3, 3),
+            last_sent_at,
+            debounce
+        ));
+        assert!(should_send_progress(
+            &Progress::Uploading,
+            last_sent_at,
+            debounce
+        ));
     }
 }

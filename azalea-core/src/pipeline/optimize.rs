@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::Instrument as _;
 
 const MIN_PLAUSIBLE_SPLIT_COPY_SEGMENT_SECS: f64 = 10.0;
@@ -716,9 +717,67 @@ async fn split_video(
             &plan.bitrate,
             temp_files,
             ctx,
+            SplitTranscodeProgress::new(progress_tx, plan.estimated_segments as usize),
             dir_guard,
         )
         .await
+    }
+}
+
+fn send_progress_best_effort(progress_tx: &Option<mpsc::Sender<Progress>>, stage: Progress) {
+    let Some(tx) = progress_tx.as_ref() else {
+        return;
+    };
+
+    match tx.try_send(stage.clone()) {
+        Ok(()) => {}
+        Err(TrySendError::Closed(_)) => {
+            tracing::debug!(stage = %stage, "Progress channel closed before stage update");
+        }
+        Err(TrySendError::Full(stage)) if stage.is_terminal_transcoding() => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if tx.send(stage).await.is_err() {
+                    tracing::debug!("Progress channel closed before terminal transcode update");
+                }
+            });
+        }
+        Err(TrySendError::Full(stage)) => {
+            tracing::debug!(stage = %stage, "Progress channel full; dropping stage update");
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SplitTranscodeProgress {
+    total_segments: usize,
+    progress_tx: Option<mpsc::Sender<Progress>>,
+}
+
+impl SplitTranscodeProgress {
+    fn new(progress_tx: Option<mpsc::Sender<Progress>>, total_segments: usize) -> Self {
+        Self {
+            total_segments: total_segments.max(1),
+            progress_tx,
+        }
+    }
+
+    fn start(&self) {
+        send_progress_best_effort(
+            &self.progress_tx,
+            Progress::Transcoding(0, self.total_segments),
+        );
+    }
+
+    fn advance(&self, done: usize) {
+        send_progress_best_effort(
+            &self.progress_tx,
+            Progress::Transcoding(done, self.total_segments),
+        );
+    }
+
+    fn finish(&self) {
+        self.advance(self.total_segments);
     }
 }
 
@@ -728,6 +787,7 @@ async fn split_serial(
     segment_params: &BitrateParams,
     temp_files: &TempFileCleanup,
     ctx: &TranscodeContext<'_>,
+    progress: SplitTranscodeProgress,
     dir_guard: TempFileGuard,
 ) -> Result<PreparedUpload, Error> {
     tracing::trace!(
@@ -740,6 +800,8 @@ async fn split_serial(
         .acquire()
         .await
         .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
+
+    progress.start();
 
     let stem = downloaded
         .path
@@ -783,6 +845,7 @@ async fn split_serial(
 
     let segments = ensure_split_segments_fit_limit(segments, ctx.config).await?;
     let segments_len = segments.len();
+    progress.finish();
     let parts = into_prepared_parts(segments, temp_files);
     tracing::info!(segments = segments_len, "Serial split completed");
     Ok(PreparedUpload::split(parts, dir_guard))
@@ -852,9 +915,7 @@ async fn split_parallel(
         .collect();
 
     let total_segments = raw_segments.len();
-    if let Some(tx) = &progress_tx {
-        let _ = tx.send(Progress::Transcoding(0, total_segments)).await;
-    }
+    send_progress_best_effort(&progress_tx, Progress::Transcoding(0, total_segments));
 
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -933,11 +994,10 @@ async fn split_parallel(
                     })?;
                 *slot = Some(segment);
                 finished += 1;
-                if let Some(tx) = &progress_tx {
-                    let _ = tx
-                        .send(Progress::Transcoding(finished, total_segments))
-                        .await;
-                }
+                send_progress_best_effort(
+                    &progress_tx,
+                    Progress::Transcoding(finished, total_segments),
+                );
             }
             Ok(Err(e)) => {
                 join_set.abort_all();
@@ -1219,9 +1279,9 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic)]
 
     use super::{
-        BitrateParams, TranscodeContext, TranscodeStrategy, build_strategy_plan,
-        execute_with_hwacc_fallback, split_copy_is_plausible, split_parallel,
-        split_parallel_is_plausible, split_serial,
+        BitrateParams, SplitTranscodeProgress, TranscodeContext, TranscodeStrategy,
+        build_strategy_plan, execute_with_hwacc_fallback, send_progress_best_effort,
+        split_copy_is_plausible, split_parallel, split_parallel_is_plausible, split_serial,
     };
     use crate::concurrency::Permits;
     use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings};
@@ -1229,13 +1289,14 @@ mod tests {
     use crate::media::TempFileCleanup;
     use crate::pipeline::errors::Error;
     use crate::pipeline::types::{
-        AudioCodec, DownloadedFile, MediaContainer, MediaFacts, VideoCodec,
+        AudioCodec, DownloadedFile, MediaContainer, MediaFacts, Progress, VideoCodec,
     };
     use crate::pipeline::{self, errors::TranscodeStage};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
 
     fn downloaded_file(path: &str, size: u64, duration: f64, facts: MediaFacts) -> DownloadedFile {
         let temp_files = TempFileCleanup::new();
@@ -1527,6 +1588,7 @@ mod tests {
             &segment_params,
             &temp_files,
             &ctx,
+            SplitTranscodeProgress::new(None, 2),
             dir_guard,
         )
         .await
@@ -1605,6 +1667,32 @@ mod tests {
         temp_files.shutdown().await;
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn non_terminal_transcode_progress_is_dropped_when_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(Progress::Optimizing)
+            .expect("initial progress update should fit");
+        let progress_tx = Some(tx.clone());
+
+        send_progress_best_effort(&progress_tx, Progress::Transcoding(1, 3));
+
+        assert_eq!(rx.recv().await, Some(Progress::Optimizing));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_transcode_progress_is_queued_even_when_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(Progress::Optimizing)
+            .expect("initial progress update should fit");
+        let progress_tx = Some(tx.clone());
+
+        send_progress_best_effort(&progress_tx, Progress::Transcoding(3, 3));
+
+        assert_eq!(rx.recv().await, Some(Progress::Optimizing));
+        assert_eq!(rx.recv().await, Some(Progress::Transcoding(3, 3)));
     }
 
     #[tokio::test]

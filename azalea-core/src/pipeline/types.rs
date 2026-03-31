@@ -281,6 +281,16 @@ pub enum Progress {
     UploadingSegment(usize, usize),
 }
 
+impl Progress {
+    pub fn is_terminal_transcoding(&self) -> bool {
+        matches!(self, Self::Transcoding(done, total) if done == total)
+    }
+
+    pub fn is_inflight_transcoding(&self) -> bool {
+        matches!(self, Self::Transcoding(done, total) if done < total)
+    }
+}
+
 /// Normalize and restrict extensions to a known-safe allowlist.
 ///
 /// ## Security-sensitive paths
@@ -390,6 +400,15 @@ mod tests {
             Progress::UploadingSegment(1, 4).to_string(),
             "Uploading segment 1/4..."
         );
+    }
+
+    #[test]
+    fn progress_transcoding_helpers_distinguish_terminal_updates() {
+        assert!(Progress::Transcoding(3, 3).is_terminal_transcoding());
+        assert!(!Progress::Transcoding(2, 3).is_terminal_transcoding());
+        assert!(Progress::Transcoding(2, 3).is_inflight_transcoding());
+        assert!(!Progress::Transcoding(3, 3).is_inflight_transcoding());
+        assert!(!Progress::Uploading.is_inflight_transcoding());
     }
 
     proptest! {
