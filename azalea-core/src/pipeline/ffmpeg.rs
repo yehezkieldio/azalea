@@ -50,12 +50,16 @@ fn arg_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
 }
 
 fn format_stderr_tail(stderr: &[u8], max_lines: usize, truncated: bool) -> String {
-    let text = String::from_utf8_lossy(stderr);
-    let mut lines: Vec<&str> = text.lines().collect();
-    if lines.len() > max_lines {
-        lines = lines.split_off(lines.len() - max_lines);
-    }
-    let mut joined = lines.join("\n");
+    let stderr = match stderr.strip_suffix(b"\n") {
+        Some(stderr) => stderr.strip_suffix(b"\r").unwrap_or(stderr),
+        None => stderr,
+    };
+
+    let tail_start = stderr_tail_start(stderr, max_lines);
+    let tail = stderr.get(tail_start..).unwrap_or_default();
+    let mut joined = String::new();
+    push_stderr_tail(&mut joined, tail);
+
     if truncated {
         if !joined.is_empty() {
             joined.push('\n');
@@ -63,6 +67,49 @@ fn format_stderr_tail(stderr: &[u8], max_lines: usize, truncated: bool) -> Strin
         joined.push_str("[stderr truncated]");
     }
     joined
+}
+
+fn stderr_tail_start(stderr: &[u8], max_lines: usize) -> usize {
+    if max_lines == 0 {
+        return stderr.len();
+    }
+
+    let mut tail_len = 0usize;
+    let mut kept_lines = 0usize;
+    let mut segments = stderr.rsplitn(max_lines + 1, |byte| *byte == b'\n');
+
+    while kept_lines < max_lines {
+        let Some(segment) = segments.next() else {
+            return 0;
+        };
+
+        tail_len += segment.len();
+        if kept_lines > 0 {
+            tail_len += 1;
+        }
+        kept_lines += 1;
+    }
+
+    if segments.next().is_some() {
+        stderr.len().saturating_sub(tail_len)
+    } else {
+        0
+    }
+}
+
+fn push_stderr_tail(output: &mut String, stderr_tail: &[u8]) {
+    let tail = String::from_utf8_lossy(stderr_tail);
+    if !tail.contains('\r') {
+        output.push_str(&tail);
+        return;
+    }
+
+    for line in tail.split('\n') {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(line.strip_suffix('\r').unwrap_or(line));
+    }
 }
 
 /// Stream-copy paths write MP4 outputs, so only MP4-friendly codecs qualify.
@@ -569,6 +616,17 @@ mod tests {
         let tail = format_stderr_tail(b"speed=8.2x\n", FFMPEG_SUCCESS_STDERR_TAIL_LINES, true);
 
         assert_eq!(tail, "speed=8.2x\n[stderr truncated]");
+    }
+
+    #[test]
+    fn format_stderr_tail_normalizes_crlf_line_endings() {
+        let tail = format_stderr_tail(
+            b"frame=1\r\nfps=30\r\n",
+            FFMPEG_SUCCESS_STDERR_TAIL_LINES,
+            false,
+        );
+
+        assert_eq!(tail, "frame=1\nfps=30");
     }
 
     #[test]
