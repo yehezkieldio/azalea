@@ -64,7 +64,7 @@ impl BitrateParams {
             ((usable_video_bits / duration / 1000.0) * (1.0 - config.vbr_safety_margin)) as u32;
 
         Ok(Self {
-            video_bitrate_kbps: video_bitrate_kbps.max(50),
+            video_bitrate_kbps: video_bitrate_kbps.max(150),
             audio_bitrate_kbps,
         })
     }
