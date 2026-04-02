@@ -268,16 +268,16 @@ cargo run -p azalea --bin generate-config
 Hardware acceleration offloads H.264 encoding to a dedicated hardware encoder via FFmpeg.
 Only transcode steps are affected; pass-through or remux paths remain CPU-bound.
 
-| Backend      | Config value   | Where it works                                   | Status         |
-| ------------ | -------------- | ------------------------------------------------ | -------------- |
-| Software     | `none`         | Any CPU (default)                                | Tested         |
-| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU                           | Tested         |
-| NVENC        | `nvenc`        | Windows/Linux + NVIDIA GPU                       | Untested       |
-| VideoToolbox | `videotoolbox` | macOS (Apple Silicon or Intel)                   | Untested       |
-| QSV          | `qsv`          | Windows/Linux + Intel iGPU/dGPU                  | New, untested  |
-| AMF          | `amf`          | Windows + AMD GPU                                | New, untested  |
+| Backend      | Config value   | Where it works                                   | Status        |
+| ------------ | -------------- | ------------------------------------------------ | ------------- |
+| Software     | `none`         | Any CPU (default)                                | Tested        |
+| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU                           | Tested        |
+| NVENC        | `nvenc`        | Windows/Linux + NVIDIA GPU                       | Untested      |
+| VideoToolbox | `videotoolbox` | macOS (Apple Silicon or Intel)                   | Untested      |
+| QSV          | `qsv`          | Windows/Linux + Intel iGPU/dGPU                  | New, untested |
+| AMF          | `amf`          | Windows + AMD GPU                                | Tested        |
 
-> NVENC, VideoToolbox, QSV, and AMF support follow FFmpeg’s documented encoder integrations, but the non-Linux backends have not been validated against real hardware in this repository yet.
+> AMF has been validated on Windows hardware. NVENC, VideoToolbox, and QSV still depend on host FFmpeg and device support; this Linux dev host exposes `qsv` in FFmpeg but cannot initialize a usable QSV device.
 
 Example config for a Windows 11 local run with an AMD GPU:
 
