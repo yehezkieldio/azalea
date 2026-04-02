@@ -173,13 +173,52 @@ async fn available_disk_bytes(path: &Path) -> Option<u64> {
                 .ok()
                 .map(|stat| stat.blocks_available().saturating_mul(stat.fragment_size()))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            available_disk_bytes_windows(&path)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             None
         }
     })
     .await
     .unwrap_or(None)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn available_disk_bytes_windows(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let query_path = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let mut free_bytes = 0_u64;
+    let wide = query_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    // Safety: `wide` is NUL-terminated and remains alive for the duration of
+    // the call, and the output pointers refer to initialized local storage.
+    let success = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_bytes,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        return None;
+    }
+
+    Some(free_bytes)
 }
 
 #[cfg(test)]
@@ -198,7 +237,7 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let available = available_disk_bytes(temp_dir.as_path())
             .await
-            .expect("unix tests should report available disk space");
+            .expect("supported platforms should report available disk space");
         let reserved_download_bytes = Arc::new(AtomicU64::new(0));
         let min_free_bytes = available.saturating_sub(1);
 

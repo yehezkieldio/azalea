@@ -561,6 +561,10 @@ fn raise_fd_limit() {
             tracing::info!(rlimit_nofile = target, "Raised file descriptor limit");
         }
     }
+    #[cfg(windows)]
+    {
+        tracing::debug!("Windows does not use RLIMIT_NOFILE; skipping fd-limit adjustment");
+    }
 }
 
 /// Run the pipeline worker loop and execute jobs with bounded concurrency.
@@ -960,15 +964,21 @@ async fn log_hardware_acceleration_diagnostics(
         return Ok(());
     }
 
-    if configured_backend == HardwareAcceleration::Vaapi {
-        let vaapi_device = Path::new(transcode.vaapi_device.as_ref());
-        if vaapi_device.exists() {
-            tracing::info!(vaapi_device = %vaapi_device.display(), "Configured VAAPI device exists");
-        } else {
-            tracing::warn!(
-                vaapi_device = %vaapi_device.display(),
-                "Configured VAAPI device not found; ffmpeg may fail"
-            );
+    #[cfg(unix)]
+    {
+        if configured_backend == HardwareAcceleration::Vaapi {
+            let vaapi_device = Path::new(transcode.vaapi_device.as_ref());
+            if vaapi_device.exists() {
+                tracing::info!(
+                    vaapi_device = %vaapi_device.display(),
+                    "Configured VAAPI device exists"
+                );
+            } else {
+                tracing::warn!(
+                    vaapi_device = %vaapi_device.display(),
+                    "Configured VAAPI device not found; ffmpeg may fail"
+                );
+            }
         }
     }
 
@@ -992,6 +1002,8 @@ async fn log_hardware_acceleration_diagnostics(
         HardwareAcceleration::Nvenc => Some("cuda"),
         HardwareAcceleration::Vaapi => Some("vaapi"),
         HardwareAcceleration::VideoToolbox => Some("videotoolbox"),
+        HardwareAcceleration::Qsv => Some("qsv"),
+        HardwareAcceleration::Amf => Some("amf"),
     };
     if let Some(hwaccel_backend) = hwaccel_backend {
         let hwaccel_available = ffmpeg_supports_hwaccel(&binaries.ffmpeg, hwaccel_backend).await?;
@@ -1234,6 +1246,8 @@ fn is_hwacc_error(error: &pipeline::Error) -> bool {
             HardwareAcceleration::Vaapi,
             HardwareAcceleration::Nvenc,
             HardwareAcceleration::VideoToolbox,
+            HardwareAcceleration::Qsv,
+            HardwareAcceleration::Amf,
         ]
         .into_iter()
         .any(|backend| backend.matches_failure_output(stderr_tail)),

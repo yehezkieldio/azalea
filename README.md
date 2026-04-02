@@ -24,7 +24,7 @@ Azalea is a Discord bot that fetches X (formerly Twitter) media directly into yo
 
 - **Dual Resolver with Automatic Fallback**: Resolves media via the VxTwitter API first; falls back to yt-dlp automatically if that request fails or returns incomplete data. Maximizes reliability and compatibility with various X content and account types.
 - **Size-Aware Transcoding**: Applies the cheapest viable strategy to bring a file under Discord's upload limit: pass-through, remux, transcode, or segment split. Re-encoding is performed only when strictly necessary. Performance-optimized presets balance speed and quality for typical X video content.
-- **Hardware-Accelerated Encoding**: Offloads H.264 encoding to VAAPI (Intel/AMD iGPUs on Linux), NVENC (NVIDIA GPUs), or VideoToolbox (Apple Silicon and macOS) when available on the host / with a compatible FFmpeg build, with libx264 as a software fallback.
+- **Hardware-Accelerated Encoding**: Offloads H.264 encoding to VAAPI, NVENC, VideoToolbox, QSV, or AMF when available on the host with a compatible FFmpeg build, with libx264 as a software fallback.
 - **Persistent Deduplication**: Tracks processed media URLs across restarts using a Redb-backed cache. Identical requests within the configured TTL window are served immediately without re-downloading or re-transcoding.
 - **Rate Limiting**: Per-user and per-channel sliding-window rate limits prevent abuse and protect Discord API quotas. Limits and window durations are configurable independently for users and channels.
 
@@ -86,7 +86,7 @@ pipeline = 8
 
 [transcode]
 quality_preset = "fast"        # fast | balanced | quality | size
-hardware_acceleration = "none" # none | vaapi | nvenc | videotoolbox
+hardware_acceleration = "none" # none | vaapi | nvenc | videotoolbox | qsv | amf
 max_upload_bytes = 8388608     # 8 MiB (Discord free tier default)
 
 [pipeline]
@@ -157,13 +157,15 @@ Notes:
 
 ### NVENC (NVIDIA GPU)
 
-Using NVIDIA acceleration requires three things:
+For local runs, NVENC works on both Linux and Windows with NVIDIA drivers and an FFmpeg build that includes `h264_nvenc`.
+
+Docker remains Linux-only. If you want NVENC inside a container, you still need:
 
 1. Linux host with an NVIDIA GPU and NVENC-capable driver.
 2. GPU passthrough: install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host and run with `--gpus all`.
 3. An FFmpeg build compiled with NVENC/NVDEC support. GPU passthrough alone does not enable NVENC in a CPU-only FFmpeg binary.
 
-Azalea’s `latest` image is CPU-only. To enable NVENC:
+Azalea’s `latest` image is CPU-only. To enable NVENC in Docker:
 
 #### Bring Your Own FFmpeg
 
@@ -188,6 +190,12 @@ docker run -d \
 
 VideoToolbox is macOS-only. Run Azalea natively on macOS to leverage Apple hardware acceleration and use the `videotoolbox` config option.
 
+### QSV and AMF
+
+- `qsv` targets Intel Quick Sync Video on Windows and Linux.
+- `amf` targets AMD GPUs on Windows.
+- These backends are intended for native local runs, not Docker images.
+
 ## Configuration
 
 By default, Azalea only requires `APPLICATION_ID` and `DISCORD_TOKEN` to run, with sensible defaults for all other settings.
@@ -210,8 +218,8 @@ Selected environment variables:
 | `AZALEA_HARDWARE_ACCELERATION`             | `transcode.hardware_acceleration`         | `none`                |
 | `AZALEA_MAX_UPLOAD_BYTES`                  | `transcode.max_upload_bytes`              | `8388608`             |
 | `AZALEA_QUALITY_PRESET`                    | `transcode.quality_preset`                | `fast`                |
-| `AZALEA_VAAPI_DEVICE`                      | `transcode.vaapi_device`                  | `/dev/dri/renderD128` |
-| `AZALEA_TEMP_DIR`                          | `storage.temp_dir`                        | `/tmp/azalea`         |
+| `AZALEA_VAAPI_DEVICE`                      | `transcode.vaapi_device`                  | `/dev/dri/renderD128` on Unix, empty on non-Unix |
+| `AZALEA_TEMP_DIR`                          | `storage.temp_dir`                        | system temp dir + `azalea` |
 | `AZALEA_DEDUP_PERSISTENT`                  | `storage.dedup_persistent`                | `true`                |
 | `AZALEA_DEDUP_TTL_HOURS`                   | `storage.dedup_ttl_hours`                 | `24`                  |
 | `AZALEA_USER_RATE_LIMIT_REQUESTS`          | `pipeline.user_rate_limit_requests`       | `10`                  |
@@ -260,29 +268,31 @@ cargo run -p azalea --bin generate-config
 Hardware acceleration offloads H.264 encoding to a dedicated hardware encoder via FFmpeg.
 Only transcode steps are affected; pass-through or remux paths remain CPU-bound.
 
-| Backend      | Config value   | Where it works                                                          | Status             |
-| ------------ | -------------- | ----------------------------------------------------------------------- | ------------------ |
-| Software     | `none`         | Any CPU (default, most compatible).                                     | Tested             |
-| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU with `/dev/dri/renderD128`.                      | Tested             |
-| NVENC        | `nvenc`        | Linux + NVIDIA GPU with NVENC-enabled FFmpeg. Requires GPU passthrough. | Untested, see note |
-| VideoToolbox | `videotoolbox` | macOS only (Apple Silicon or Intel).                                    | Untested, see note |
+| Backend      | Config value   | Where it works                                   | Status         |
+| ------------ | -------------- | ------------------------------------------------ | -------------- |
+| Software     | `none`         | Any CPU (default)                                | Tested         |
+| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU                           | Tested         |
+| NVENC        | `nvenc`        | Windows/Linux + NVIDIA GPU                       | Untested       |
+| VideoToolbox | `videotoolbox` | macOS (Apple Silicon or Intel)                   | Untested       |
+| QSV          | `qsv`          | Windows/Linux + Intel iGPU/dGPU                  | New, untested  |
+| AMF          | `amf`          | Windows + AMD GPU                                | New, untested  |
 
-> NVENC and VideoToolbox support is implemented based on FFmpeg documentation and standard integration patterns, but has not been verified against real hardware. The code paths exist and should work in principle, but may require adjustments. Reports and fixes from users with access to this hardware are welcome.
+> NVENC, VideoToolbox, QSV, and AMF support follow FFmpeg’s documented encoder integrations, but the non-Linux backends have not been validated against real hardware in this repository yet.
 
-Example config:
+Example config for a Windows 11 local run with an AMD GPU:
 
 ```toml
 [transcode]
-hardware_acceleration = "vaapi"
-vaapi_device = "/dev/dri/renderD128"
+hardware_acceleration = "amf"
 ```
 
 Or via environment:
 
 ```sh
-AZALEA_HARDWARE_ACCELERATION=vaapi
-AZALEA_VAAPI_DEVICE=/dev/dri/renderD128
+AZALEA_HARDWARE_ACCELERATION=amf
 ```
+
+Use `AZALEA_VAAPI_DEVICE` only with the `vaapi` backend.
 
 ## Development
 

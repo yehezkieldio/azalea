@@ -373,7 +373,7 @@ fn render_template() -> String {
     );
     line(
         &mut out,
-        "# possible values: none, nvenc, vaapi, videotoolbox",
+        "# possible values: none, nvenc, vaapi, videotoolbox, qsv, amf",
     );
     line(
         &mut out,
@@ -613,6 +613,8 @@ fn hardware_acceleration_name(value: HardwareAcceleration) -> &'static str {
         HardwareAcceleration::Nvenc => "nvenc",
         HardwareAcceleration::Vaapi => "vaapi",
         HardwareAcceleration::VideoToolbox => "videotoolbox",
+        HardwareAcceleration::Qsv => "qsv",
+        HardwareAcceleration::Amf => "amf",
     }
 }
 
