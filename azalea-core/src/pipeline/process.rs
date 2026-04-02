@@ -122,7 +122,7 @@ pub(crate) async fn read_bounded<R: AsyncRead + Unpin>(
 ) -> std::io::Result<BoundedRead> {
     // Invariant: `data.len()` never exceeds `limit` by construction.
     trace!(limit, "Starting bounded read");
-    let mut data = Vec::new();
+    let mut data = Vec::with_capacity(limit.min(4096));
     let mut exceeded = false;
     let mut buffer = [0u8; 8192];
 
