@@ -135,10 +135,22 @@ fn push_hw_device_input_args(args: &mut Args, config: &TranscodeSettings, split:
         HardwareAcceleration::Qsv => {
             let operation = if split { "split" } else { "transcode" };
             debug!(operation, "Applying QSV hardware acceleration args");
-            args.push("-init_hw_device".into());
-            args.push("qsv=qsv:MFX_IMPL_hw_any".into());
-            args.push("-filter_hw_device".into());
-            args.push("qsv".into());
+            #[cfg(unix)]
+            {
+                args.push("-init_hw_device".into());
+                args.push(format!("vaapi=va:{}", config.vaapi_device).into());
+                args.push("-init_hw_device".into());
+                args.push("qsv=qsv@va".into());
+                args.push("-filter_hw_device".into());
+                args.push("qsv".into());
+            }
+            #[cfg(not(unix))]
+            {
+                args.push("-init_hw_device".into());
+                args.push("qsv=qsv:MFX_IMPL_hw_any".into());
+                args.push("-filter_hw_device".into());
+                args.push("qsv".into());
+            }
         }
         HardwareAcceleration::None
         | HardwareAcceleration::Nvenc
@@ -652,6 +664,19 @@ mod tests {
         );
         let as_text = to_strings(&args);
 
+        #[cfg(unix)]
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-init_hw_device", "vaapi=va:/dev/dri/renderD128"])
+        );
+        #[cfg(unix)]
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-init_hw_device", "qsv=qsv@va"])
+        );
+        #[cfg(not(unix))]
         assert!(
             as_text
                 .windows(2)

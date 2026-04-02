@@ -268,16 +268,16 @@ cargo run -p azalea --bin generate-config
 Hardware acceleration offloads H.264 encoding to a dedicated hardware encoder via FFmpeg.
 Only transcode steps are affected; pass-through or remux paths remain CPU-bound.
 
-| Backend      | Config value   | Where it works                                   | Status        |
-| ------------ | -------------- | ------------------------------------------------ | ------------- |
-| Software     | `none`         | Any CPU (default)                                | Tested        |
-| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU                           | Tested        |
-| NVENC        | `nvenc`        | Windows/Linux + NVIDIA GPU                       | Untested      |
-| VideoToolbox | `videotoolbox` | macOS (Apple Silicon or Intel)                   | Untested      |
-| QSV          | `qsv`          | Windows/Linux + Intel iGPU/dGPU                  | New, untested |
-| AMF          | `amf`          | Windows + AMD GPU                                | Tested        |
+| Backend      | Config value   | Where it works                                   | Status   |
+| ------------ | -------------- | ------------------------------------------------ | -------- |
+| Software     | `none`         | Any CPU (default)                                | Tested   |
+| VAAPI        | `vaapi`        | Linux + Intel/AMD iGPU                           | Tested   |
+| NVENC        | `nvenc`        | Windows/Linux + NVIDIA GPU                       | Untested |
+| VideoToolbox | `videotoolbox` | macOS (Apple Silicon or Intel)                   | Untested |
+| QSV          | `qsv`          | Windows/Linux + Intel iGPU/dGPU                  | Tested   |
+| AMF          | `amf`          | Windows + AMD GPU                                | Tested   |
 
-> AMF has been validated on Windows hardware. NVENC, VideoToolbox, and QSV still depend on host FFmpeg and device support; this Linux dev host exposes `qsv` in FFmpeg but cannot initialize a usable QSV device.
+> AMF has been validated on Windows hardware. QSV has been validated on Linux with an Intel HD 620 iGPU using the VAAPI-derived device path. NVENC and VideoToolbox still depend on host FFmpeg and device support.
 
 Example config for a Windows 11 local run with an AMD GPU:
 
@@ -293,6 +293,8 @@ AZALEA_HARDWARE_ACCELERATION=amf
 ```
 
 Use `AZALEA_VAAPI_DEVICE` only with the `vaapi` backend.
+
+On Linux, `qsv` also depends on the Intel render node referenced by `vaapi_device`; Azalea derives the QSV device from that VAAPI device to match FFmpeg's recommended Linux setup.
 
 ## Development
 
