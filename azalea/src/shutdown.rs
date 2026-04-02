@@ -9,6 +9,7 @@ use tokio::signal;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ShutdownSignal {
     CtrlC,
+    #[cfg(unix)]
     Sigterm,
 }
 
@@ -16,6 +17,7 @@ impl ShutdownSignal {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::CtrlC => "ctrl_c",
+            #[cfg(unix)]
             Self::Sigterm => "sigterm",
         }
     }
