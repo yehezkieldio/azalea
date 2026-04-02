@@ -108,6 +108,16 @@
           "description": "VideoToolbox (Apple Silicon/macOS).",
           "type": "string",
           "const": "videotoolbox"
+        },
+        {
+          "description": "Intel Quick Sync Video.",
+          "type": "string",
+          "const": "qsv"
+        },
+        {
+          "description": "AMD Advanced Media Framework.",
+          "type": "string",
+          "const": "amf"
         }
       ]
     },
