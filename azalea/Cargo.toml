@@ -60,8 +60,10 @@ twilight-model = { version = "0.17", default-features = false }
 twilight-util = { version = "0.17", default-features = false, features = [
     "builder",
 ] }
-nix = { version = "0.31.0", default-features = false, features = ["resource"] }
 which = "8.0.0"
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.0", default-features = false, features = ["resource"] }

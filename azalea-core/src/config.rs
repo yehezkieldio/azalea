@@ -548,8 +548,29 @@ impl EngineSettings {
     }
 }
 
+/// External binary paths used by the pipeline.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct BinarySettings {
+    pub ffmpeg: PathBuf,
+    pub ffprobe: PathBuf,
+    pub ytdlp: PathBuf,
+}
+
+impl Default for BinarySettings {
+    fn default() -> Self {
+        Self {
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+            ytdlp: PathBuf::from("yt-dlp"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     #[test]
@@ -583,32 +604,6 @@ mod tests {
         #[cfg(not(unix))]
         assert!(defaults.vaapi_device.is_empty());
     }
-}
-
-/// External binary paths used by the pipeline.
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(default)]
-pub struct BinarySettings {
-    pub ffmpeg: PathBuf,
-    pub ffprobe: PathBuf,
-    pub ytdlp: PathBuf,
-}
-
-impl Default for BinarySettings {
-    fn default() -> Self {
-        Self {
-            ffmpeg: PathBuf::from("ffmpeg"),
-            ffprobe: PathBuf::from("ffprobe"),
-            ytdlp: PathBuf::from("yt-dlp"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used)]
-    use super::*;
 
     #[test]
     fn test_default_config_validates() {

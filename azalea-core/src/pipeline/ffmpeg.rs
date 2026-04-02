@@ -147,11 +147,14 @@ fn push_hw_device_input_args(args: &mut Args, config: &TranscodeSettings, split:
     }
 }
 
-fn video_filter(height: Option<u32>, hardware_acceleration: HardwareAcceleration) -> Option<String> {
+fn video_filter(
+    height: Option<u32>,
+    hardware_acceleration: HardwareAcceleration,
+) -> Option<String> {
     match (hardware_acceleration, height) {
-        (HardwareAcceleration::Vaapi, Some(height)) => {
-            Some(format!("format=nv12|vaapi,hwupload,scale_vaapi=-2:{height}"))
-        }
+        (HardwareAcceleration::Vaapi, Some(height)) => Some(format!(
+            "format=nv12|vaapi,hwupload,scale_vaapi=-2:{height}"
+        )),
         (HardwareAcceleration::Vaapi, None) => Some("format=nv12|vaapi,hwupload".into()),
         (HardwareAcceleration::Qsv, Some(height)) => Some(format!(
             "format=nv12,hwupload=extra_hw_frames=64,scale_qsv=-2:{height}"
@@ -649,8 +652,16 @@ mod tests {
         );
         let as_text = to_strings(&args);
 
-        assert!(as_text.windows(2).any(|w| w == ["-init_hw_device", "qsv=qsv:MFX_IMPL_hw_any"]));
-        assert!(as_text.windows(2).any(|w| w == ["-filter_hw_device", "qsv"]));
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-init_hw_device", "qsv=qsv:MFX_IMPL_hw_any"])
+        );
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-filter_hw_device", "qsv"])
+        );
         assert!(as_text.windows(2).any(|w| w == ["-c:v", "h264_qsv"]));
         assert!(as_text.windows(2).any(|w| {
             w.first() == Some(&"-vf".to_string())

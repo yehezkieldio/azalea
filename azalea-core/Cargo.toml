@@ -38,14 +38,16 @@ tokio = { workspace = true, features = [
 ] }
 moka = { workspace = true }
 redb = "3.1.0"
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.0", default-features = false, features = [
     "fs",
     "signal",
     "process",
 ] }
-
-[dev-dependencies]
-proptest = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

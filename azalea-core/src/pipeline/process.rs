@@ -365,6 +365,7 @@ impl WindowsJob {
 
     #[allow(unsafe_code)]
     fn assign_child(&self, child: &Child) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 
@@ -375,10 +376,7 @@ impl WindowsJob {
         // Safety: both handles are live OS handles borrowed for the duration of
         // the call only; ownership remains with `OwnedHandle`/`Child`.
         let assigned = unsafe {
-            AssignProcessToJobObject(
-                self.handle.as_raw_handle() as HANDLE,
-                raw_handle as HANDLE,
-            )
+            AssignProcessToJobObject(self.handle.as_raw_handle() as HANDLE, raw_handle as HANDLE)
         };
         if assigned == 0 {
             return Err(std::io::Error::last_os_error());
@@ -388,6 +386,7 @@ impl WindowsJob {
 
     #[allow(unsafe_code)]
     fn terminate(&self) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
         // Safety: the job handle is owned by `self`; terminating it is the
