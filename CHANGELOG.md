@@ -7,10 +7,34 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.4.1 (April 2, 2026)
+
+### <!-- 3 -->🚀 New Features
+- [`92494c8`](https://github.com/yehezkieldio/azalea/commit/92494c83680ffa40cdc0c58a02e59ff0b3766e95) **pipeline**: Add best-effort split transcode progress reporting
+- [`5b87875`](https://github.com/yehezkieldio/azalea/commit/5b878755ad36d7129e55a4831598cadd47284775) **pipeline**: Add batch upload for multiple media
+- [`323846d`](https://github.com/yehezkieldio/azalea/commit/323846d31dcd96272b6bc3a5e6d7b421c6d39ee1) **pipeline**: Add split-transcode plan and integrate into pipeline
+- [`7e5da61`](https://github.com/yehezkieldio/azalea/commit/7e5da610a06db5a507db3b407b6a0476c3b6dc4a) **pipeline**: Add split_parallel_is_plausible to gate parallel splitting
+
+### <!-- 4 -->🐛 Bug Fixes
+- [`8069ade`](https://github.com/yehezkieldio/azalea/commit/8069ade8c3e0f37cc88f85f8ba600ce3af2d8330) **pipeline**: Normalize crlf line endings in ffmpeg stderr tail
+- [`acaa46e`](https://github.com/yehezkieldio/azalea/commit/acaa46e883b5e552589464100047d62dcaa3b956) **pipeline**: Enforce minimum video bitrate 150 kbps
+- [`73697bb`](https://github.com/yehezkieldio/azalea/commit/73697bb90c54d173e5a453fb678e9df1b4976867) **pipeline**: Abandon split-copy outputs on ffmpeg failure
+- [`8c2aad0`](https://github.com/yehezkieldio/azalea/commit/8c2aad00262f1d5f7da07511b159aa53136bec0d) **pipeline**: Reject oversize split segments and clean up
+- [`00fa902`](https://github.com/yehezkieldio/azalea/commit/00fa9023d48a5cdfd9230bc2dd454999966d876c) **resume**: Add rename_with_retry to retry replacing resume info
+
+### <!-- 7 -->🚜 Refactor
+- [`87cad93`](https://github.com/yehezkieldio/azalea/commit/87cad93bb101960f45c05b9cf6517d9e297c6202) **pipeline**: Extract parallel segment spawn helpers
+- [`174df24`](https://github.com/yehezkieldio/azalea/commit/174df24ed48a3abfdf4eb8ea0b61fae5f71561fc) **pipeline**: Replace vec with fixed-size option array
+- [`3a1a537`](https://github.com/yehezkieldio/azalea/commit/3a1a537b213fef4da76d371e50c2977297cdf926) **pipeline**: Replace extension contains check with match
+- [`21c2e4f`](https://github.com/yehezkieldio/azalea/commit/21c2e4f3c10037b5853fee31f1def3c5a797dfdd) **pipeline**: Extract stderr tail handling
+
 ## 0.4.0 (March 27, 2026)
 
 ### <!-- 10 -->🧪 Test
 - [`374eb07`](https://github.com/yehezkieldio/azalea/commit/374eb070adb485bdcc248917b0b1dd2056a586d4) **discord**: Convert stats_reports_queue_peak_depth to tokio test
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`5c1581e`](https://github.com/yehezkieldio/azalea/commit/5c1581e5eae1854851641e69792c61346d0779a4) **release**: 0.4.0
 
 ### <!-- 16 -->🤖 CI/CD
 - [`9567107`](https://github.com/yehezkieldio/azalea/commit/9567107d1f5742914cdfe75f754172f17c5d4c7a) **ci**: Add merge_group path to ci workflow
