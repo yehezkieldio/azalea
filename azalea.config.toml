@@ -39,7 +39,7 @@ resolver_negative_ttl_secs = 60
 # possible values: fast, balanced, quality, size
 quality_preset = "fast"
 # possible values: none, nvenc, vaapi, videotoolbox, qsv, amf
-hardware_acceleration = "none"
+hardware_acceleration = "qsv"
 ffmpeg_threads = 0
 vaapi_device = "/dev/dri/renderD128"
 max_upload_bytes = 8388608
