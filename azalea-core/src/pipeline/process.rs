@@ -26,6 +26,8 @@ pub(crate) struct SubprocessGuard {
     pid: Option<i32>,
     // Armed until a successful wait; ensures drop kills orphaned children.
     armed: bool,
+    #[cfg(windows)]
+    job: Option<WindowsJob>,
 }
 
 #[derive(Debug)]
@@ -58,10 +60,23 @@ impl SubprocessGuard {
         let child = command.spawn()?;
         let pid = child.id().map(|id| id as i32);
         debug!(pid = pid.unwrap_or_default(), "Spawned subprocess");
+        #[cfg(windows)]
+        let job = attach_child_to_job(&child).map_or_else(
+            |error| {
+                warn!(
+                    error = %error,
+                    "Failed to attach subprocess to a Windows Job Object; cleanup is best-effort"
+                );
+                None
+            },
+            Some,
+        );
         Ok(Self {
             child,
             pid,
             armed: true,
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -79,6 +94,32 @@ impl SubprocessGuard {
             Err(error) => warn!(error = %error, "Failed waiting for subprocess"),
         }
         status
+    }
+
+    pub(crate) async fn kill_process_tree(&mut self) {
+        trace!(
+            pid = self.child.id().unwrap_or_default(),
+            "Killing subprocess process tree"
+        );
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.child.id() {
+                use nix::sys::signal::{Signal, killpg};
+                use nix::unistd::Pid;
+                // Kill the process group to stop ffmpeg/yt-dlp subprocess trees.
+                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(job) = &self.job
+                && let Err(error) = job.terminate()
+            {
+                warn!(error = %error, "Failed to terminate Windows Job Object");
+            }
+        }
+
+        let _ = self.child.kill().await;
     }
 }
 
@@ -110,7 +151,20 @@ impl Drop for SubprocessGuard {
 
         #[cfg(not(unix))]
         {
-            let _ = self.child.start_kill();
+            #[cfg(windows)]
+            {
+                if let Some(job) = &self.job {
+                    if let Err(error) = job.terminate() {
+                        warn!(error = %error, "Failed to terminate Windows Job Object in Drop");
+                    }
+                } else {
+                    let _ = self.child.start_kill();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = self.child.start_kill();
+            }
         }
     }
 }
@@ -222,14 +276,14 @@ pub(crate) async fn run_json_subprocess(
             })
         }
         WaitOutcome::Timeout => {
-            kill_process_group(guard.child_mut()).await;
+            kill_process_group(&mut guard).await;
             let _ = guard.wait().await;
             stdout_handle.abort();
             stderr_handle.abort();
             Err(JsonSubprocessError::Timeout)
         }
         WaitOutcome::OutputLimit => {
-            kill_process_group(guard.child_mut()).await;
+            kill_process_group(&mut guard).await;
             let _ = guard.wait().await;
             let _ = stdout_handle.await;
             let stderr_tail = match stderr_handle.await {
@@ -253,22 +307,103 @@ pub(crate) fn configure_process_group(command: &mut Command) {
     }
 }
 
-pub(crate) async fn kill_process_group(child: &mut Child) {
-    trace!(
-        pid = child.id().unwrap_or_default(),
-        "Killing subprocess process group"
-    );
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            use nix::sys::signal::{Signal, killpg};
-            use nix::unistd::Pid;
-            // Kill the process group to stop ffmpeg/yt-dlp subprocess trees.
-            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+pub(crate) async fn kill_process_group(guard: &mut SubprocessGuard) {
+    guard.kill_process_tree().await;
+}
+
+#[cfg(windows)]
+struct WindowsJob {
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    #[allow(unsafe_code)]
+    fn create_kill_on_close() -> std::io::Result<Self> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        // Safety: a null name/attributes is the documented way to create an
+        // unnamed job object. The returned handle is immediately wrapped in
+        // `OwnedHandle`, transferring ownership to Rust RAII.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
         }
+
+        // Safety: `handle` is a fresh job-object handle we own, and the struct
+        // pointer/size pair matches the Windows API contract exactly.
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            // Safety: `handle` was created above and has not been wrapped yet.
+            unsafe {
+                let _ = std::os::windows::io::OwnedHandle::from_raw_handle(handle);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            // Safety: ownership of the fresh handle transfers into `OwnedHandle`
+            // exactly once here, and the handle remains valid for the lifetime
+            // of the guard.
+            handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
+        })
     }
 
-    let _ = child.kill().await;
+    #[allow(unsafe_code)]
+    fn assign_child(&self, child: &Child) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let Some(raw_handle) = child.raw_handle() else {
+            return Err(std::io::Error::other("subprocess handle missing"));
+        };
+
+        // Safety: both handles are live OS handles borrowed for the duration of
+        // the call only; ownership remains with `OwnedHandle`/`Child`.
+        let assigned = unsafe {
+            AssignProcessToJobObject(self.handle.as_raw_handle() as HANDLE, raw_handle as HANDLE)
+        };
+        if assigned == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    fn terminate(&self) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        // Safety: the job handle is owned by `self`; terminating it is the
+        // intended shutdown path when Azalea needs to kill the full child tree.
+        let terminated = unsafe { TerminateJobObject(self.handle.as_raw_handle() as _, 1) };
+        if terminated == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn attach_child_to_job(child: &Child) -> std::io::Result<WindowsJob> {
+    let job = WindowsJob::create_kill_on_close()?;
+    job.assign_child(child)?;
+    Ok(job)
 }
 
 fn push_stderr_tail_line(

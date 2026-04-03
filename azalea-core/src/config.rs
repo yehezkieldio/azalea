@@ -81,6 +81,10 @@ pub enum HardwareAcceleration {
     Vaapi,
     /// VideoToolbox (Apple Silicon/macOS).
     VideoToolbox,
+    /// Intel Quick Sync Video.
+    Qsv,
+    /// AMD Advanced Media Framework.
+    Amf,
 }
 
 impl HardwareAcceleration {
@@ -90,6 +94,8 @@ impl HardwareAcceleration {
             1 => Some(Self::Nvenc),
             2 => Some(Self::Vaapi),
             3 => Some(Self::VideoToolbox),
+            4 => Some(Self::Qsv),
+            5 => Some(Self::Amf),
             _ => None,
         }
     }
@@ -108,6 +114,8 @@ impl HardwareAcceleration {
             Self::Nvenc => "nvenc",
             Self::Vaapi => "vaapi",
             Self::VideoToolbox => "videotoolbox",
+            Self::Qsv => "qsv",
+            Self::Amf => "amf",
         }
     }
 
@@ -118,6 +126,8 @@ impl HardwareAcceleration {
             Self::Nvenc => "h264_nvenc",
             Self::Vaapi => "h264_vaapi",
             Self::VideoToolbox => "h264_videotoolbox",
+            Self::Qsv => "h264_qsv",
+            Self::Amf => "h264_amf",
         }
     }
 
@@ -135,6 +145,10 @@ impl HardwareAcceleration {
             }
             Self::Vaapi => stderr.contains("vaapi") || stderr.contains("hwaccel"),
             Self::VideoToolbox => stderr.contains("videotoolbox") || stderr.contains("hwaccel"),
+            Self::Qsv => {
+                stderr.contains("qsv") || stderr.contains("mfx") || stderr.contains("hwaccel")
+            }
+            Self::Amf => stderr.contains("amf") || stderr.contains("hwaccel"),
         }
     }
 }
@@ -220,7 +234,7 @@ pub struct StorageSettings {
 impl Default for StorageSettings {
     fn default() -> Self {
         Self {
-            temp_dir: PathBuf::from("/tmp/azalea"),
+            temp_dir: default_temp_dir(),
             dedup_ttl_hours: 24,
             dedup_cache_size: 1000,
             dedup_persistent: true,
@@ -262,7 +276,7 @@ impl Default for TranscodeSettings {
             quality_preset: QualityPreset::Fast,
             hardware_acceleration: HardwareAcceleration::None,
             ffmpeg_threads: 0,
-            vaapi_device: "/dev/dri/renderD128".into(),
+            vaapi_device: default_vaapi_device(),
             max_upload_bytes: 8 * 1024 * 1024,
             container_overhead_ratio: 0.03,
             vbr_safety_margin: 0.05,
@@ -274,6 +288,21 @@ impl Default for TranscodeSettings {
             ffprobe_timeout_secs: 30,
             ffmpeg_timeout_secs: 600,
         }
+    }
+}
+
+fn default_temp_dir() -> PathBuf {
+    std::env::temp_dir().join("azalea")
+}
+
+fn default_vaapi_device() -> Box<str> {
+    #[cfg(unix)]
+    {
+        "/dev/dri/renderD128".into()
+    }
+    #[cfg(not(unix))]
+    {
+        "".into()
     }
 }
 
@@ -543,6 +572,38 @@ impl Default for BinarySettings {
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn hardware_acceleration_repr_round_trips_new_backends() {
+        for backend in [
+            HardwareAcceleration::None,
+            HardwareAcceleration::Nvenc,
+            HardwareAcceleration::Vaapi,
+            HardwareAcceleration::VideoToolbox,
+            HardwareAcceleration::Qsv,
+            HardwareAcceleration::Amf,
+        ] {
+            assert_eq!(
+                HardwareAcceleration::from_repr(backend.as_repr()),
+                Some(backend)
+            );
+        }
+    }
+
+    #[test]
+    fn storage_default_uses_system_temp_dir() {
+        let defaults = StorageSettings::default();
+        assert_eq!(defaults.temp_dir, std::env::temp_dir().join("azalea"));
+    }
+
+    #[test]
+    fn transcode_defaults_keep_non_unix_vaapi_device_empty() {
+        let defaults = TranscodeSettings::default();
+        #[cfg(unix)]
+        assert_eq!(defaults.vaapi_device.as_ref(), "/dev/dri/renderD128");
+        #[cfg(not(unix))]
+        assert!(defaults.vaapi_device.is_empty());
+    }
 
     #[test]
     fn test_default_config_validates() {

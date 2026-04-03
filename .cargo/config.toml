@@ -5,3 +5,6 @@ rustflags = [
 	"-C", "link-arg=-Wl,--gc-sections",
 	"-C", "link-arg=-Wl,--icf=all",
 ]
+
+[target.'cfg(target_os = "windows")']
+# Intentionally use Cargo's default MSVC toolchain settings.

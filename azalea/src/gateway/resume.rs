@@ -25,6 +25,13 @@ fn temp_file_name() -> String {
     format!("{}.{}.tmp", INFO_FILE, std::process::id())
 }
 
+fn info_file_parent_dir() -> &'static std::path::Path {
+    std::path::Path::new(INFO_FILE)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
 async fn rename_with_retry(from: &str, to: &str) -> std::io::Result<()> {
     for attempt in 1..=RENAME_RETRY_ATTEMPTS {
         match fs::rename(from, to).await {
@@ -150,10 +157,7 @@ pub async fn save(info: &[SessionInfo]) -> anyhow::Result<()> {
         file.write_all(&contents).await?;
         file.sync_all().await?;
         rename_with_retry(&temp_file, INFO_FILE).await?;
-        let parent = std::path::Path::new(INFO_FILE)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
+        let parent = info_file_parent_dir().to_path_buf();
         // fsync the parent directory to make the rename durable on crash.
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             let dir = std::fs::File::open(parent)?;
@@ -249,6 +253,11 @@ mod tests {
         let temp = temp_file_name();
         assert!(temp.starts_with(INFO_FILE));
         assert!(temp.ends_with(".tmp"));
+    }
+
+    #[test]
+    fn bare_resume_file_uses_current_directory_as_parent() {
+        assert_eq!(info_file_parent_dir(), std::path::Path::new("."));
     }
 
     #[test]

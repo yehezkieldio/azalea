@@ -112,6 +112,73 @@ fn push_stderr_tail(output: &mut String, stderr_tail: &[u8]) {
     }
 }
 
+fn push_hw_device_input_args(args: &mut Args, config: &TranscodeSettings, split: bool) {
+    match config.hardware_acceleration {
+        HardwareAcceleration::Vaapi => {
+            let operation = if split { "split" } else { "transcode" };
+            debug!(
+                vaapi_device = %config.vaapi_device,
+                operation,
+                "Applying VAAPI hardware acceleration args"
+            );
+            args.push("-init_hw_device".into());
+            args.push(format!("vaapi=va:{}", config.vaapi_device).into());
+            args.push("-filter_hw_device".into());
+            args.push("va".into());
+            args.push("-hwaccel".into());
+            args.push("vaapi".into());
+            args.push("-hwaccel_output_format".into());
+            args.push("vaapi".into());
+            args.push("-hwaccel_device".into());
+            args.push("va".into());
+        }
+        HardwareAcceleration::Qsv => {
+            let operation = if split { "split" } else { "transcode" };
+            debug!(operation, "Applying QSV hardware acceleration args");
+            #[cfg(unix)]
+            {
+                args.push("-init_hw_device".into());
+                args.push(format!("vaapi=va:{}", config.vaapi_device).into());
+                args.push("-init_hw_device".into());
+                args.push("qsv=qsv@va".into());
+                args.push("-filter_hw_device".into());
+                args.push("qsv".into());
+            }
+            #[cfg(not(unix))]
+            {
+                args.push("-init_hw_device".into());
+                args.push("qsv=qsv:MFX_IMPL_hw_any".into());
+                args.push("-filter_hw_device".into());
+                args.push("qsv".into());
+            }
+        }
+        HardwareAcceleration::None
+        | HardwareAcceleration::Nvenc
+        | HardwareAcceleration::VideoToolbox
+        | HardwareAcceleration::Amf => {}
+    }
+}
+
+fn video_filter(
+    height: Option<u32>,
+    hardware_acceleration: HardwareAcceleration,
+) -> Option<String> {
+    match (hardware_acceleration, height) {
+        (HardwareAcceleration::Vaapi, Some(height)) => Some(format!(
+            "format=nv12|vaapi,hwupload,scale_vaapi=-2:{height}"
+        )),
+        (HardwareAcceleration::Vaapi, None) => Some("format=nv12|vaapi,hwupload".into()),
+        (HardwareAcceleration::Qsv, Some(height)) => Some(format!(
+            "format=nv12,hwupload=extra_hw_frames=64,scale_qsv=-2:{height}"
+        )),
+        (HardwareAcceleration::Qsv, None) => {
+            Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv".into())
+        }
+        (_, Some(height)) => Some(format!("scale=-2:{height}")),
+        (_, None) => None,
+    }
+}
+
 /// Stream-copy paths write MP4 outputs, so only MP4-friendly codecs qualify.
 pub fn mp4_stream_copy_viable(facts: MediaFacts) -> bool {
     matches!(facts.video_codec, VideoCodec::H264)
@@ -187,6 +254,33 @@ fn push_video_encoding_args(
             args.push("-realtime".into());
             args.push("true".into());
         }
+        HardwareAcceleration::Qsv => {
+            args.push("-b:v".into());
+            args.push(format!("{}k", video_kbps_clamped).into());
+            args.push("-maxrate".into());
+            args.push(format!("{}k", video_kbps_clamped).into());
+            args.push("-bufsize".into());
+            args.push(format!("{}k", video_buf_kbps).into());
+        }
+        HardwareAcceleration::Amf => {
+            let quality = match config.quality_preset {
+                crate::config::QualityPreset::Fast => "speed",
+                crate::config::QualityPreset::Balanced | crate::config::QualityPreset::Size => {
+                    "balanced"
+                }
+                crate::config::QualityPreset::Quality => "quality",
+            };
+            args.push("-rc".into());
+            args.push("vbr_latency".into());
+            args.push("-quality".into());
+            args.push(quality.into());
+            args.push("-b:v".into());
+            args.push(format!("{}k", video_kbps_clamped).into());
+            args.push("-maxrate".into());
+            args.push(format!("{}k", video_kbps_clamped).into());
+            args.push("-bufsize".into());
+            args.push(format!("{}k", video_buf_kbps).into());
+        }
     }
 }
 
@@ -226,38 +320,14 @@ pub fn transcode_args(
     let mut args = Args::new();
     args.push("-y".into());
 
-    if config.hardware_acceleration == HardwareAcceleration::Vaapi {
-        debug!(
-            vaapi_device = %config.vaapi_device,
-            "Applying VAAPI hardware acceleration args for transcode"
-        );
-        args.push("-init_hw_device".into());
-        args.push(format!("vaapi=va:{}", config.vaapi_device).into());
-        args.push("-filter_hw_device".into());
-        args.push("va".into());
-        args.push("-hwaccel".into());
-        args.push("vaapi".into());
-        args.push("-hwaccel_output_format".into());
-        args.push("vaapi".into());
-        args.push("-hwaccel_device".into());
-        args.push("va".into());
-    }
+    push_hw_device_input_args(&mut args, config, false);
 
     args.push("-i".into());
     args.push(input.as_os_str().into());
 
-    if let Some(height) = max_height {
-        let filter = match config.hardware_acceleration {
-            HardwareAcceleration::Vaapi => {
-                format!("format=nv12|vaapi,hwupload,scale_vaapi=-2:{}", height)
-            }
-            _ => format!("scale=-2:{}", height),
-        };
+    if let Some(filter) = video_filter(max_height, config.hardware_acceleration) {
         args.push("-vf".into());
         args.push(filter.into());
-    } else if config.hardware_acceleration == HardwareAcceleration::Vaapi {
-        args.push("-vf".into());
-        args.push("format=nv12|vaapi,hwupload".into());
     }
 
     args.push("-c:v".into());
@@ -295,29 +365,14 @@ pub fn split_args(
     let mut args = Args::new();
     args.push("-y".into());
 
-    if config.hardware_acceleration == HardwareAcceleration::Vaapi {
-        debug!(
-            vaapi_device = %config.vaapi_device,
-            "Applying VAAPI hardware acceleration args for split"
-        );
-        args.push("-init_hw_device".into());
-        args.push(format!("vaapi=va:{}", config.vaapi_device).into());
-        args.push("-filter_hw_device".into());
-        args.push("va".into());
-        args.push("-hwaccel".into());
-        args.push("vaapi".into());
-        args.push("-hwaccel_output_format".into());
-        args.push("vaapi".into());
-        args.push("-hwaccel_device".into());
-        args.push("va".into());
-    }
+    push_hw_device_input_args(&mut args, config, true);
 
     args.push("-i".into());
     args.push(input.as_os_str().into());
 
-    if config.hardware_acceleration == HardwareAcceleration::Vaapi {
+    if let Some(filter) = video_filter(None, config.hardware_acceleration) {
         args.push("-vf".into());
-        args.push("format=nv12|vaapi,hwupload".into());
+        args.push(filter.into());
     }
 
     args.push("-c:v".into());
@@ -433,7 +488,7 @@ pub async fn execute(
                     timeout_ms = timeout.as_millis() as u64,
                     "ffmpeg execution timed out"
                 );
-                kill_process_group(guard.child_mut()).await;
+                kill_process_group(&mut guard).await;
                 let _ = guard.wait().await;
                 stderr_handle.abort();
                 return Err(Error::Timeout {
@@ -465,7 +520,7 @@ pub async fn execute(
                     wait_timeout_secs = WAIT_TIMEOUT_SECS,
                     "ffmpeg wait timed out"
                 );
-                kill_process_group(guard.child_mut()).await;
+                kill_process_group(&mut guard).await;
                 let _ = guard.wait().await;
                 stderr_handle.abort();
                 return Err(Error::Timeout {
@@ -591,6 +646,75 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["-force_key_frames", "expr:gte(t,n_forced*11.5)"])
         );
+    }
+
+    #[test]
+    fn transcode_args_configure_qsv_device_and_filter() {
+        let args = transcode_args(
+            Path::new("input.mp4"),
+            Path::new("output.mp4"),
+            900,
+            128,
+            Some(720),
+            &TranscodeSettings {
+                hardware_acceleration: HardwareAcceleration::Qsv,
+                ..TranscodeSettings::default()
+            },
+            2,
+        );
+        let as_text = to_strings(&args);
+
+        #[cfg(unix)]
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-init_hw_device", "vaapi=va:/dev/dri/renderD128"])
+        );
+        #[cfg(unix)]
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-init_hw_device", "qsv=qsv@va"])
+        );
+        #[cfg(not(unix))]
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-init_hw_device", "qsv=qsv:MFX_IMPL_hw_any"])
+        );
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-filter_hw_device", "qsv"])
+        );
+        assert!(as_text.windows(2).any(|w| w == ["-c:v", "h264_qsv"]));
+        assert!(as_text.windows(2).any(|w| {
+            w.first() == Some(&"-vf".to_string())
+                && w.get(1)
+                    .is_some_and(|value| value.contains("scale_qsv=-2:720"))
+        }));
+    }
+
+    #[test]
+    fn split_args_configure_amf_quality_controls() {
+        let args = split_args(
+            Path::new("input.mp4"),
+            Path::new("seg%03d.mp4"),
+            11.5,
+            900,
+            128,
+            &TranscodeSettings {
+                hardware_acceleration: HardwareAcceleration::Amf,
+                quality_preset: crate::config::QualityPreset::Balanced,
+                ..TranscodeSettings::default()
+            },
+            2,
+        );
+        let as_text = to_strings(&args);
+
+        assert!(as_text.windows(2).any(|w| w == ["-c:v", "h264_amf"]));
+        assert!(as_text.windows(2).any(|w| w == ["-rc", "vbr_latency"]));
+        assert!(as_text.windows(2).any(|w| w == ["-quality", "balanced"]));
     }
 
     #[test]
