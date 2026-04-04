@@ -406,32 +406,69 @@ fn attach_child_to_job(child: &Child) -> std::io::Result<WindowsJob> {
     Ok(job)
 }
 
-fn push_stderr_tail_line(
-    tail: &mut Vec<u8>,
-    line: &[u8],
-    line_count: &mut usize,
-    max_lines: usize,
-) {
-    tail.extend_from_slice(line);
-    tail.push(b'\n');
-    *line_count += 1;
+struct StderrTailBuffer {
+    lines: Vec<Vec<u8>>,
+    next: usize,
+    len: usize,
+}
 
-    if max_lines == 0 {
-        tail.clear();
-        *line_count = 0;
-        return;
+impl StderrTailBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            lines: vec![Vec::new(); capacity],
+            next: 0,
+            len: 0,
+        }
     }
 
-    if *line_count <= max_lines {
-        return;
+    fn push(&mut self, mut line: Vec<u8>) -> Vec<u8> {
+        if self.lines.is_empty() {
+            line.clear();
+            return line;
+        }
+
+        let slot = match self.lines.get_mut(self.next) {
+            Some(slot) => slot,
+            None => unreachable!("ring index must stay within capacity"),
+        };
+        std::mem::swap(slot, &mut line);
+        self.next += 1;
+        if self.next == self.lines.len() {
+            self.next = 0;
+        }
+        self.len = self.len.saturating_add(1).min(self.lines.len());
+        line
     }
 
-    if let Some(first_newline) = tail.iter().position(|&byte| byte == b'\n') {
-        tail.drain(..=first_newline);
-        *line_count -= 1;
-    } else {
-        tail.clear();
-        *line_count = 0;
+    fn into_boxed_str(self) -> Box<str> {
+        if self.len == 0 {
+            return "".into();
+        }
+
+        let total_bytes = self.total_bytes() + self.len.saturating_sub(1);
+        let mut tail = Vec::with_capacity(total_bytes);
+
+        for (offset, line) in self.iter_ordered_lines().enumerate() {
+            if offset > 0 {
+                tail.push(b'\n');
+            }
+            tail.extend_from_slice(line);
+        }
+
+        String::from_utf8_lossy(&tail).into_owned().into_boxed_str()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.iter_ordered_lines().map(<[u8]>::len).sum()
+    }
+
+    fn iter_ordered_lines(&self) -> Box<dyn Iterator<Item = &[u8]> + '_> {
+        if self.len < self.lines.len() {
+            return Box::new(self.lines.iter().take(self.len).map(Vec::as_slice));
+        }
+
+        let (head, tail) = self.lines.split_at(self.next);
+        Box::new(tail.iter().chain(head.iter()).map(Vec::as_slice))
     }
 }
 
@@ -449,8 +486,7 @@ async fn read_stderr_tail<R: AsyncRead + Unpin>(
     }
 
     let mut reader = BufReader::new(stderr);
-    let mut tail = Vec::with_capacity(max_lines.saturating_mul(256));
-    let mut line_count = 0;
+    let mut tail = StderrTailBuffer::new(max_lines);
     let mut buffer = Vec::with_capacity(256);
 
     loop {
@@ -468,14 +504,10 @@ async fn read_stderr_tail<R: AsyncRead + Unpin>(
             buffer.pop();
         }
 
-        push_stderr_tail_line(&mut tail, &buffer, &mut line_count, max_lines);
+        buffer = tail.push(std::mem::take(&mut buffer));
     }
 
-    if tail.last() == Some(&b'\n') {
-        tail.pop();
-    }
-
-    Ok(String::from_utf8_lossy(&tail).into_owned().into_boxed_str())
+    Ok(tail.into_boxed_str())
 }
 
 #[cfg(test)]
@@ -530,6 +562,20 @@ mod tests {
             .expect("stderr tail read should succeed");
 
         assert_eq!(tail.as_ref(), "\nthird");
+    }
+
+    #[tokio::test]
+    async fn read_stderr_tail_wraps_to_keep_only_latest_lines() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            let _ = writer.write_all(b"one\ntwo\nthree\nfour\n").await;
+        });
+
+        let tail = read_stderr_tail(reader, 2)
+            .await
+            .expect("stderr tail read should succeed");
+
+        assert_eq!(tail.as_ref(), "three\nfour");
     }
 
     #[tokio::test]
