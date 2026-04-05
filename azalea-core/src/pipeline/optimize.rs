@@ -23,7 +23,6 @@ use crate::pipeline::quality::{BitrateParams, Ladder, SplitTranscodePlan};
 use crate::pipeline::types::{
     DownloadedFile, MediaType, PreparedPart, PreparedUpload, Progress, ResolvedMedia,
 };
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -972,13 +971,13 @@ async fn split_parallel(
     send_progress_best_effort(&progress_tx, Progress::Transcoding(0, total_segments));
 
     let mut join_set = tokio::task::JoinSet::new();
-    let mut pending_segments: VecDeque<_> = raw_segments.into_iter().enumerate().collect();
 
     let parallel_transcode = Arc::new(ParallelSegmentTranscodeContext {
         ffmpeg_path: ctx.config.binaries.ffmpeg.clone(),
         transcode_settings: ctx.config.transcode.clone(),
         transcode_runtime: ctx.runtime.clone(),
     });
+    let transcode_permits = Arc::clone(&ctx.permits.transcode);
     let transcode_concurrency = ctx.config.concurrency.transcode;
     let segment_video_kbps = segment_params.video_bitrate_kbps;
     let segment_audio_kbps = segment_params.audio_bitrate_kbps;
@@ -986,18 +985,20 @@ async fn split_parallel(
     let mut final_segments = vec![None; total_segments];
     let mut finished = 0;
 
-    spawn_parallel_segment_tasks(
-        &mut join_set,
-        &mut pending_segments,
-        &stem,
-        Arc::clone(&ctx.permits.transcode),
-        Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
-        &parallel_transcode,
-        transcode_concurrency,
-        segment_video_kbps,
-        segment_audio_kbps,
-    )
-    .await?;
+    for (idx, raw_segment) in raw_segments.into_iter().enumerate() {
+        spawn_parallel_segment_task(
+            &mut join_set,
+            idx,
+            raw_segment,
+            &stem,
+            Arc::clone(&transcode_permits),
+            Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
+            Arc::clone(&parallel_transcode),
+            transcode_concurrency,
+            segment_video_kbps,
+            segment_audio_kbps,
+        );
+    }
 
     while let Some(res) = join_set.join_next().await {
         match res {
@@ -1015,18 +1016,6 @@ async fn split_parallel(
                     &progress_tx,
                     Progress::Transcoding(finished, total_segments),
                 );
-                spawn_parallel_segment_tasks(
-                    &mut join_set,
-                    &mut pending_segments,
-                    &stem,
-                    Arc::clone(&ctx.permits.transcode),
-                    Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
-                    &parallel_transcode,
-                    transcode_concurrency,
-                    segment_video_kbps,
-                    segment_audio_kbps,
-                )
-                .await?;
             }
             Ok(Err(e)) => {
                 join_set.abort_all();
@@ -1067,66 +1056,12 @@ async fn split_parallel(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn spawn_parallel_segment_tasks(
-    join_set: &mut tokio::task::JoinSet<Result<(usize, SegmentOutput), Error>>,
-    pending_segments: &mut VecDeque<(usize, SegmentOutput)>,
-    stem: &str,
-    permit: Arc<tokio::sync::Semaphore>,
-    timeout: Duration,
-    parallel_transcode: &Arc<ParallelSegmentTranscodeContext>,
-    transcode_concurrency: u32,
-    segment_video_kbps: u32,
-    segment_audio_kbps: u32,
-) -> Result<(), Error> {
-    while let Ok(permit) = Arc::clone(&permit).try_acquire_owned() {
-        let Some((idx, raw_segment)) = pending_segments.pop_front() else {
-            return Ok(());
-        };
-        spawn_parallel_segment_task(
-            join_set,
-            idx,
-            raw_segment,
-            stem,
-            permit,
-            timeout,
-            Arc::clone(parallel_transcode),
-            transcode_concurrency,
-            segment_video_kbps,
-            segment_audio_kbps,
-        );
-    }
-
-    if join_set.is_empty()
-        && let Some((idx, raw_segment)) = pending_segments.pop_front()
-    {
-        let permit = Arc::clone(&permit)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
-        spawn_parallel_segment_task(
-            join_set,
-            idx,
-            raw_segment,
-            stem,
-            permit,
-            timeout,
-            Arc::clone(parallel_transcode),
-            transcode_concurrency,
-            segment_video_kbps,
-            segment_audio_kbps,
-        );
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn spawn_parallel_segment_task(
     join_set: &mut tokio::task::JoinSet<Result<(usize, SegmentOutput), Error>>,
     idx: usize,
     raw_segment: SegmentOutput,
     stem: &str,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permits: Arc<tokio::sync::Semaphore>,
     timeout: Duration,
     parallel_transcode: Arc<ParallelSegmentTranscodeContext>,
     transcode_concurrency: u32,
@@ -1136,6 +1071,10 @@ fn spawn_parallel_segment_task(
     let input_path = raw_segment.path;
     let output_path = input_path.with_file_name(format!("{}_seg{:03}.mp4", stem, idx));
     join_set.spawn(async move {
+        let permit = permits
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
         let result = execute_with_hwacc_fallback(
             &parallel_transcode.ffmpeg_path,
             timeout,
