@@ -417,6 +417,8 @@ pub fn split_copy_args(input: &Path, pattern: &Path, segment_duration: f64) -> A
     args.push(format!("{:.1}", segment_duration).into());
     args.push("-reset_timestamps".into());
     args.push("1".into());
+    args.push("-avoid_negative_ts".into());
+    args.push("make_zero".into());
     args.push("-movflags".into());
     args.push("+faststart".into());
     args.push(pattern.as_os_str().into());
@@ -626,6 +628,11 @@ mod tests {
         let as_text = to_strings(&args);
         assert!(as_text.windows(2).any(|w| w == ["-f", "segment"]));
         assert!(as_text.windows(2).any(|w| w == ["-segment_time", "11.5"]));
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-avoid_negative_ts", "make_zero"])
+        );
     }
 
     #[test]
