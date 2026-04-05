@@ -26,13 +26,34 @@ use crate::pipeline::types::{
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::Instrument as _;
 
 const MIN_PLAUSIBLE_SPLIT_COPY_SEGMENT_SECS: f64 = 10.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscodeOutcome {
+    encoder_used: &'static str,
+    backend_used: HardwareAcceleration,
+    used_hardware: bool,
+    fallback_occurred: bool,
+    duration_ms: u64,
+}
+
+impl TranscodeOutcome {
+    fn new(backend_used: HardwareAcceleration, fallback_occurred: bool, duration_ms: u64) -> Self {
+        Self {
+            encoder_used: backend_used.encoder(),
+            backend_used,
+            used_hardware: backend_used.is_hardware(),
+            fallback_occurred,
+            duration_ms,
+        }
+    }
+}
 
 struct TranscodeContext<'a> {
     permits: &'a Permits,
@@ -1129,15 +1150,24 @@ async fn execute_with_hwacc_fallback<F>(
     base_settings: &TranscodeSettings,
     transcode_runtime: &TranscodeRuntime,
     build_args: F,
-) -> Result<(), Error>
+) -> Result<TranscodeOutcome, Error>
 where
     F: Fn(&TranscodeSettings) -> ffmpeg::Args,
 {
+    let started_at = Instant::now();
     let active_settings = transcode_runtime.effective_settings(base_settings);
     let args = build_args(&active_settings);
 
     match ffmpeg::execute(ffmpeg_path, &args, timeout, stage).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let outcome = TranscodeOutcome::new(
+                active_settings.hardware_acceleration,
+                false,
+                elapsed_ms(started_at),
+            );
+            record_transcode_outcome(transcode_runtime, stage, outcome);
+            Ok(outcome)
+        }
         Err(error) if should_retry_with_software(&error, active_settings.hardware_acceleration) => {
             let latched = transcode_runtime.activate_software_fallback();
             let retry_settings = transcode_runtime.effective_settings(base_settings);
@@ -1153,10 +1183,46 @@ where
             );
 
             let retry_args = build_args(&retry_settings);
-            ffmpeg::execute(ffmpeg_path, &retry_args, timeout, stage).await
+            ffmpeg::execute(ffmpeg_path, &retry_args, timeout, stage)
+                .await
+                .map(|()| {
+                    let outcome = TranscodeOutcome::new(
+                        retry_settings.hardware_acceleration,
+                        true,
+                        elapsed_ms(started_at),
+                    );
+                    record_transcode_outcome(transcode_runtime, stage, outcome);
+                    outcome
+                })
         }
         Err(error) => Err(error),
     }
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis() as u64
+}
+
+fn record_transcode_outcome(
+    transcode_runtime: &TranscodeRuntime,
+    stage: TranscodeStage,
+    outcome: TranscodeOutcome,
+) {
+    if outcome.used_hardware {
+        transcode_runtime.record_hw_encode(outcome.duration_ms);
+    } else {
+        transcode_runtime.record_sw_encode(outcome.duration_ms);
+    }
+
+    tracing::info!(
+        ?stage,
+        encoder = outcome.encoder_used,
+        backend = %outcome.backend_used,
+        used_hardware = outcome.used_hardware,
+        fallback_occurred = outcome.fallback_occurred,
+        duration_ms = outcome.duration_ms,
+        "Hardware acceleration diagnostics"
+    );
 }
 
 fn should_retry_with_software(error: &Error, backend: HardwareAcceleration) -> bool {
@@ -1975,7 +2041,7 @@ mod tests {
             ..TranscodeSettings::default()
         };
 
-        execute_with_hwacc_fallback(
+        let outcome = execute_with_hwacc_fallback(
             &script_path,
             Duration::from_secs(1),
             TranscodeStage::Transcode,
@@ -1994,8 +2060,15 @@ mod tests {
         let invocations = fs::read_to_string(&log_path).expect("read ffmpeg invocation log");
         assert!(invocations.contains("h264_vaapi"));
         assert!(invocations.contains("libx264"));
+        assert_eq!(outcome.encoder_used, "libx264");
+        assert_eq!(outcome.backend_used, HardwareAcceleration::None);
+        assert!(!outcome.used_hardware);
+        assert!(outcome.fallback_occurred);
         assert_eq!(runtime.active_backend(), HardwareAcceleration::None);
         assert!(runtime.software_fallback_active());
+        assert_eq!(runtime.hw_encode_count(), 0);
+        assert_eq!(runtime.sw_encode_count(), 1);
+        assert!(runtime.sw_avg_duration_ms() <= outcome.duration_ms);
 
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_file(log_path);

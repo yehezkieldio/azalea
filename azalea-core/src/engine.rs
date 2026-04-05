@@ -30,6 +30,10 @@ struct TranscodeRuntimeInner {
     configured_backend: HardwareAcceleration,
     active_backend: AtomicU8,
     fallback_transitions: AtomicU64,
+    hw_encode_count: AtomicU64,
+    sw_encode_count: AtomicU64,
+    hw_encode_duration_ms_sum: AtomicU64,
+    sw_encode_duration_ms_sum: AtomicU64,
 }
 
 /// Runtime view of the currently active encoder backend.
@@ -49,6 +53,10 @@ impl TranscodeRuntime {
                 configured_backend,
                 active_backend: AtomicU8::new(configured_backend.as_repr()),
                 fallback_transitions: AtomicU64::new(0),
+                hw_encode_count: AtomicU64::new(0),
+                sw_encode_count: AtomicU64::new(0),
+                hw_encode_duration_ms_sum: AtomicU64::new(0),
+                sw_encode_duration_ms_sum: AtomicU64::new(0),
             }),
         }
     }
@@ -69,6 +77,42 @@ impl TranscodeRuntime {
 
     pub fn fallback_transitions(&self) -> u64 {
         self.inner.fallback_transitions.load(Ordering::Relaxed)
+    }
+
+    pub fn record_hw_encode(&self, duration_ms: u64) {
+        self.inner.hw_encode_count.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .hw_encode_duration_ms_sum
+            .fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_sw_encode(&self, duration_ms: u64) {
+        self.inner.sw_encode_count.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .sw_encode_duration_ms_sum
+            .fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    pub fn hw_encode_count(&self) -> u64 {
+        self.inner.hw_encode_count.load(Ordering::Relaxed)
+    }
+
+    pub fn sw_encode_count(&self) -> u64 {
+        self.inner.sw_encode_count.load(Ordering::Relaxed)
+    }
+
+    pub fn hw_avg_duration_ms(&self) -> u64 {
+        average_duration_ms(
+            self.inner.hw_encode_duration_ms_sum.load(Ordering::Relaxed),
+            self.hw_encode_count(),
+        )
+    }
+
+    pub fn sw_avg_duration_ms(&self) -> u64 {
+        average_duration_ms(
+            self.inner.sw_encode_duration_ms_sum.load(Ordering::Relaxed),
+            self.sw_encode_count(),
+        )
     }
 
     pub fn effective_settings(&self, template: &TranscodeSettings) -> TranscodeSettings {
@@ -95,6 +139,10 @@ impl TranscodeRuntime {
             .fetch_add(1, Ordering::Relaxed);
         true
     }
+}
+
+fn average_duration_ms(duration_sum_ms: u64, count: u64) -> u64 {
+    duration_sum_ms.checked_div(count).unwrap_or(0)
 }
 
 /// Shared engine state used by pipeline stages.
@@ -226,5 +274,19 @@ mod tests {
         let effective = runtime.effective_settings(&settings);
 
         assert_eq!(effective.hardware_acceleration, HardwareAcceleration::None);
+    }
+
+    #[test]
+    fn encode_stats_accumulate_counts_and_average_durations() {
+        let runtime = TranscodeRuntime::new(HardwareAcceleration::Nvenc);
+
+        runtime.record_hw_encode(120);
+        runtime.record_hw_encode(180);
+        runtime.record_sw_encode(300);
+
+        assert_eq!(runtime.hw_encode_count(), 2);
+        assert_eq!(runtime.sw_encode_count(), 1);
+        assert_eq!(runtime.hw_avg_duration_ms(), 150);
+        assert_eq!(runtime.sw_avg_duration_ms(), 300);
     }
 }

@@ -219,6 +219,11 @@ pub async fn run(
                     duration_ms = optimize_duration_ms,
                     kind = prepared_kind,
                     parts = prepared_parts,
+                    configured_backend = %engine.transcode_runtime.configured_backend(),
+                    active_backend = %engine.transcode_runtime.active_backend(),
+                    software_fallback = engine.transcode_runtime.software_fallback_active(),
+                    hw_encodes = engine.transcode_runtime.hw_encode_count(),
+                    sw_encodes = engine.transcode_runtime.sw_encode_count(),
                     "Optimize completed"
                 );
 

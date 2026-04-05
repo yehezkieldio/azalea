@@ -222,6 +222,14 @@ async fn format_status(app: &App) -> String {
     let resolver_stats = app.engine.resolver.cache_stats();
     let active_backend = app.engine.transcode_runtime.active_backend();
     let configured_backend = app.engine.transcode_runtime.configured_backend();
+    let hw_encode_count = app.engine.transcode_runtime.hw_encode_count();
+    let sw_encode_count = app.engine.transcode_runtime.sw_encode_count();
+    let total_encodes = hw_encode_count + sw_encode_count;
+    let hw_usage_rate = if total_encodes == 0 {
+        0.0
+    } else {
+        (hw_encode_count as f64 / total_encodes as f64) * 100.0
+    };
     let transcode_backend = if app.engine.transcode_runtime.software_fallback_active() {
         format!(
             "{} (runtime fallback from {})",
@@ -235,9 +243,14 @@ async fn format_status(app: &App) -> String {
     };
 
     format!(
-        "Azalea is online.\nUptime: {}s\nTranscode backend: {}\nQueue depth: {}\nTotal runs: {} ({} ok / {} failed)\nDedup cache: {} entries ({} pending writes)\nResolver cache: {} ok / {} negative",
+        "Azalea is online.\nUptime: {}s\nTranscode backend: {}\nHW accel stats: {} hw / {} sw encodes ({:.1}% hw usage)\nHW accel avg encode time: {} ms hw / {} ms sw\nQueue depth: {}\nTotal runs: {} ({} ok / {} failed)\nDedup cache: {} entries ({} pending writes)\nResolver cache: {} ok / {} negative",
         uptime.as_secs(),
         transcode_backend,
+        hw_encode_count,
+        sw_encode_count,
+        hw_usage_rate,
+        app.engine.transcode_runtime.hw_avg_duration_ms(),
+        app.engine.transcode_runtime.sw_avg_duration_ms(),
         queue_depth,
         totals.total_runs,
         totals.successes,
@@ -455,10 +468,14 @@ mod tests {
     async fn status_reports_runtime_hwacc_fallback() {
         let app = test_app_with_hwacc(HardwareAcceleration::Vaapi);
         assert!(app.engine.transcode_runtime.activate_software_fallback());
+        app.engine.transcode_runtime.record_hw_encode(120);
+        app.engine.transcode_runtime.record_sw_encode(240);
 
         let status = format_status(&app).await;
 
         assert!(status.contains("Transcode backend: libx264 (runtime fallback from vaapi)"));
+        assert!(status.contains("HW accel stats: 1 hw / 1 sw encodes (50.0% hw usage)"));
+        assert!(status.contains("HW accel avg encode time: 120 ms hw / 240 ms sw"));
     }
 
     #[tokio::test]
