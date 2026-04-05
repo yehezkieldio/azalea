@@ -61,6 +61,13 @@ struct TranscodeContext<'a> {
     runtime: &'a TranscodeRuntime,
 }
 
+#[derive(Debug)]
+struct ParallelSegmentTranscodeContext {
+    ffmpeg_path: PathBuf,
+    transcode_settings: TranscodeSettings,
+    transcode_runtime: TranscodeRuntime,
+}
+
 /// Prepare media for Discord upload, choosing the cheapest viable strategy.
 ///
 /// ## Preconditions
@@ -967,9 +974,11 @@ async fn split_parallel(
     let mut join_set = tokio::task::JoinSet::new();
     let mut pending_segments: VecDeque<_> = raw_segments.into_iter().enumerate().collect();
 
-    let ffmpeg_path = ctx.config.binaries.ffmpeg.clone();
-    let transcode_settings = ctx.config.transcode.clone();
-    let transcode_runtime = ctx.runtime.clone();
+    let parallel_transcode = Arc::new(ParallelSegmentTranscodeContext {
+        ffmpeg_path: ctx.config.binaries.ffmpeg.clone(),
+        transcode_settings: ctx.config.transcode.clone(),
+        transcode_runtime: ctx.runtime.clone(),
+    });
     let transcode_concurrency = ctx.config.concurrency.transcode;
     let segment_video_kbps = segment_params.video_bitrate_kbps;
     let segment_audio_kbps = segment_params.audio_bitrate_kbps;
@@ -983,9 +992,7 @@ async fn split_parallel(
         &stem,
         Arc::clone(&ctx.permits.transcode),
         Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
-        &ffmpeg_path,
-        &transcode_settings,
-        &transcode_runtime,
+        &parallel_transcode,
         transcode_concurrency,
         segment_video_kbps,
         segment_audio_kbps,
@@ -1014,9 +1021,7 @@ async fn split_parallel(
                     &stem,
                     Arc::clone(&ctx.permits.transcode),
                     Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
-                    &ffmpeg_path,
-                    &transcode_settings,
-                    &transcode_runtime,
+                    &parallel_transcode,
                     transcode_concurrency,
                     segment_video_kbps,
                     segment_audio_kbps,
@@ -1068,9 +1073,7 @@ async fn spawn_parallel_segment_tasks(
     stem: &str,
     permit: Arc<tokio::sync::Semaphore>,
     timeout: Duration,
-    ffmpeg_path: &Path,
-    transcode_settings: &TranscodeSettings,
-    transcode_runtime: &TranscodeRuntime,
+    parallel_transcode: &Arc<ParallelSegmentTranscodeContext>,
     transcode_concurrency: u32,
     segment_video_kbps: u32,
     segment_audio_kbps: u32,
@@ -1086,9 +1089,7 @@ async fn spawn_parallel_segment_tasks(
             stem,
             permit,
             timeout,
-            ffmpeg_path,
-            transcode_settings,
-            transcode_runtime,
+            Arc::clone(parallel_transcode),
             transcode_concurrency,
             segment_video_kbps,
             segment_audio_kbps,
@@ -1109,9 +1110,7 @@ async fn spawn_parallel_segment_tasks(
             stem,
             permit,
             timeout,
-            ffmpeg_path,
-            transcode_settings,
-            transcode_runtime,
+            Arc::clone(parallel_transcode),
             transcode_concurrency,
             segment_video_kbps,
             segment_audio_kbps,
@@ -1129,25 +1128,20 @@ fn spawn_parallel_segment_task(
     stem: &str,
     permit: tokio::sync::OwnedSemaphorePermit,
     timeout: Duration,
-    ffmpeg_path: &Path,
-    transcode_settings: &TranscodeSettings,
-    transcode_runtime: &TranscodeRuntime,
+    parallel_transcode: Arc<ParallelSegmentTranscodeContext>,
     transcode_concurrency: u32,
     segment_video_kbps: u32,
     segment_audio_kbps: u32,
 ) {
-    let ffmpeg_path = ffmpeg_path.to_path_buf();
     let input_path = raw_segment.path;
     let output_path = input_path.with_file_name(format!("{}_seg{:03}.mp4", stem, idx));
-    let transcode_settings = transcode_settings.clone();
-    let transcode_runtime = transcode_runtime.clone();
     join_set.spawn(async move {
         let result = execute_with_hwacc_fallback(
-            &ffmpeg_path,
+            &parallel_transcode.ffmpeg_path,
             timeout,
             TranscodeStage::Split,
-            &transcode_settings,
-            &transcode_runtime,
+            &parallel_transcode.transcode_settings,
+            &parallel_transcode.transcode_runtime,
             |active_settings| {
                 ffmpeg::transcode_args(
                     &input_path,
