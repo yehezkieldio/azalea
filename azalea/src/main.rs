@@ -196,7 +196,11 @@ fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .init();
 
     let loaded = AppConfig::load()?;
     let token = loaded.auth.discord_token.into_inner();
@@ -618,19 +622,28 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
             let _queue_guard = queue_guard;
             let _permit = permit;
             let span = tracing::info_span!(
-                "pipeline_run",
-                request_id = job.request_id.0,
-                trigger_id = job.trigger_id.get(),
+                "job",
+                req = job.request_id.0,
                 tweet_id = job.tweet_url.tweet_id.0,
-                channel_id = job.channel_id.get(),
-                author_id = job.author_id.get(),
-                source_kind = if job.source_message_id.is_some() { "message" } else { "command" },
-                queue_depth = queue_depth_at_start,
-                tweet_url = %job.tweet_url.original_url()
+                source = if job.source_message_id.is_some() {
+                    "message"
+                } else {
+                    "command"
+                }
             );
 
             async {
                 let job_started_at = Instant::now();
+                let channel_id = job.channel_id.get();
+                let author_id = job.author_id.get();
+                let trigger_id = job.trigger_id.get();
+                tracing::info!(
+                    channel_id,
+                    author_id,
+                    trigger_id,
+                    queue_depth = queue_depth_at_start,
+                    "Job started"
+                );
                 let reply_message_id =
                     discord::send_processing(&app.discord, job.channel_id, job.source_message_id)
                         .await;
@@ -653,7 +666,7 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
 
                 let core_job = job.core();
                 let result = core_pipeline::run(core_job, &app.engine, Some(progress_tx.clone()))
-                    .instrument(tracing::info_span!("pipeline.stage.core"))
+                    .instrument(tracing::info_span!("core"))
                     .await;
 
                 let outcome = match result {
@@ -668,7 +681,7 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             &app.engine.config,
                             Some(&progress_tx),
                         )
-                        .instrument(tracing::info_span!("pipeline.stage.upload"))
+                        .instrument(tracing::info_span!("upload"))
                         .await
                         {
                             Ok(outcome) => {

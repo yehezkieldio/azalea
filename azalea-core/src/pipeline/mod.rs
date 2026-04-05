@@ -69,10 +69,8 @@ pub async fn run(
     progress: Option<mpsc::Sender<Progress>>,
 ) -> Result<PreparedUpload, Error> {
     let pipeline_span = tracing::info_span!(
-        "core_pipeline",
-        request_id = job.request_id.0,
-        scope_id = job.scope_id,
-        job_id = job.job_id,
+        "pipeline",
+        req = job.request_id.0,
         tweet_id = job.tweet_url.tweet_id.0
     );
 
@@ -93,7 +91,7 @@ pub async fn run(
         }
 
         let result = async {
-            let resolve_span = tracing::info_span!("pipeline_stage", stage = "resolve");
+            let resolve_span = tracing::info_span!("resolve");
             let resolved = async {
                 let resolve_start = Instant::now();
                 if let Some(tx) = &progress
@@ -131,7 +129,7 @@ pub async fn run(
             .instrument(resolve_span)
             .await?;
 
-            let download_span = tracing::info_span!("pipeline_stage", stage = "download");
+            let download_span = tracing::info_span!("download");
             let downloaded = async {
                 let download_start = Instant::now();
                 if let Some(tx) = &progress
@@ -181,7 +179,7 @@ pub async fn run(
             .instrument(download_span)
             .await?;
 
-            let optimize_span = tracing::info_span!("pipeline_stage", stage = "optimize");
+            let optimize_span = tracing::info_span!("optimize");
             let prepared = async {
                 let optimize_start = Instant::now();
                 if let Some(tx) = &progress

@@ -46,11 +46,7 @@ pub async fn upload(
     progress_tx: Option<&mpsc::Sender<Progress>>,
 ) -> Result<UploadOutcome, Error> {
     tracing::trace!("Entered upload stage");
-    tracing::info!(
-        channel_id = channel_id.get(),
-        tweet_id = tweet_id.0,
-        "Starting upload"
-    );
+    tracing::info!("Starting upload");
     let _permit = permits.upload.acquire().await.map_err(|_| {
         Error::Core(azalea_core::pipeline::Error::Io(std::io::Error::other(
             "upload semaphore closed",
@@ -144,10 +140,9 @@ async fn upload_parts_sequential(
 
         let response = send_with_retry(&ctx, std::slice::from_ref(&attachment))
             .instrument(tracing::info_span!(
-                "upload.part",
+                "upload_part",
                 part = index + 1,
-                total = total_files,
-                path = %part.path().display()
+                total = total_files
             ))
             .await?;
 
@@ -201,7 +196,7 @@ async fn upload_parts_batched(
     };
 
     let response = send_with_retry(&ctx, &attachments)
-        .instrument(tracing::info_span!("upload.batch", total = total_files))
+        .instrument(tracing::info_span!("upload_batch", total = total_files))
         .await?;
     let message = response.model().await.map_err(|e| Error::UploadFailed {
         part: total_files,

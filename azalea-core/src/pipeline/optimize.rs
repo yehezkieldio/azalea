@@ -108,6 +108,12 @@ pub async fn optimize(
             "Pass-through eligible"
         );
         tracing::info!(strategy = %TranscodeStrategy::PassThrough, "Using transcode strategy");
+        tracing::info!(
+            mode = "pass-through",
+            size_bytes = downloaded.size,
+            limit_bytes = max_upload_bytes,
+            "Upload ready without re-encode"
+        );
         let dir_guard = downloaded
             ._dir_guard
             .take()
@@ -171,6 +177,12 @@ pub async fn optimize(
                     .await
                 {
                     Ok(size) if size <= max_upload_bytes => {
+                        tracing::info!(
+                            mode = "remux",
+                            size_bytes = size,
+                            limit_bytes = max_upload_bytes,
+                            "Remux completed without re-encode"
+                        );
                         let dir_guard = downloaded._dir_guard.take().ok_or_else(|| {
                             Error::Io(std::io::Error::other("missing temp dir guard"))
                         })?;
@@ -180,7 +192,13 @@ pub async fn optimize(
                             dir_guard,
                         ));
                     }
-                    Ok(_) => {
+                    Ok(size) => {
+                        tracing::info!(
+                            mode = "remux",
+                            size_bytes = size,
+                            limit_bytes = max_upload_bytes,
+                            "Remux completed but still exceeded upload limit"
+                        );
                         tracing::trace!(
                             strategy = %strategy,
                             output = %remux_path.display(),
@@ -600,6 +618,13 @@ async fn try_transcode(
     let transcode_path = transcode_path(&downloaded.path);
     match transcode(&downloaded.path, &transcode_path, duration, max_height, ctx).await {
         Ok(size) if size <= ctx.config.transcode.max_upload_bytes => {
+            tracing::info!(
+                mode = "transcode",
+                size_bytes = size,
+                limit_bytes = ctx.config.transcode.max_upload_bytes,
+                max_height,
+                "Transcode completed and fit upload limit"
+            );
             // Success path: keep the transcode output and attach temp guards.
             let dir_guard = dir_guard
                 .take()
@@ -610,7 +635,14 @@ async fn try_transcode(
                 dir_guard,
             )))
         }
-        Ok(_) => {
+        Ok(size) => {
+            tracing::info!(
+                mode = "transcode",
+                size_bytes = size,
+                limit_bytes = ctx.config.transcode.max_upload_bytes,
+                max_height,
+                "Transcode completed but still exceeded upload limit"
+            );
             tracing::trace!(
                 path = %transcode_path.display(),
                 "Transcode output exceeded size limit"

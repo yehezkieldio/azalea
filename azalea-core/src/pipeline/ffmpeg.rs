@@ -433,7 +433,7 @@ pub async fn execute(
     const WAIT_TIMEOUT_SECS: u64 = 30;
 
     let ffmpeg_span = tracing::info_span!(
-        "ffmpeg.execute",
+        "ffmpeg",
         ?stage,
         ffmpeg = %ffmpeg_path.display(),
         timeout_ms = timeout.as_millis() as u64,

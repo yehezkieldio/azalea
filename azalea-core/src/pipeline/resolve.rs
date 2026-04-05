@@ -91,11 +91,7 @@ impl ResolverChain {
         http: &reqwest::Client,
         permits: &Permits,
     ) -> Result<Arc<ResolvedMedia>, Error> {
-        let resolve_span = tracing::info_span!(
-            "resolver_chain.resolve",
-            tweet_id = tweet_url.tweet_id.0,
-            tweet_user = %tweet_url.user
-        );
+        let resolve_span = tracing::info_span!("resolve_media", tweet_id = tweet_url.tweet_id.0, user = %tweet_url.user);
 
         async {
             tracing::trace!("Resolving media");
@@ -120,7 +116,7 @@ impl ResolverChain {
             match self
                 .vx
                 .resolve(tweet_url, http)
-                .instrument(tracing::info_span!("resolver.vxtwitter"))
+                .instrument(tracing::info_span!("vxtwitter"))
                 .await
             {
                 Ok(media) => {
@@ -162,7 +158,7 @@ impl ResolverChain {
             match self
                 .ytdlp
                 .resolve(tweet_url)
-                .instrument(tracing::info_span!("resolver.ytdlp"))
+                .instrument(tracing::info_span!("ytdlp"))
                 .await
             {
                 Ok(media) => {
