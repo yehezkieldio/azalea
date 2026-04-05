@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, mpsc::error::TrySendError, watch};
 
 const CLEANUP_CHANNEL_CAPACITY: usize = 10_000;
 const CLEANUP_DRAIN_TIMEOUT_SECS: u64 = 5;
@@ -153,14 +153,18 @@ pub struct TempFileGuard {
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        if self.path.as_os_str().is_empty() {
+        let path = std::mem::take(&mut self.path);
+        if path.as_os_str().is_empty() {
             return;
         }
 
-        // Fall back to synchronous deletion when the cleanup queue is saturated.
-        if self.tx.try_send(self.path.clone()).is_err() {
-            // Synchronous delete keeps temp dirs bounded even under backpressure.
-            remove_path_sync(&self.path);
+        match self.tx.try_send(path) {
+            Ok(()) => {}
+            Err(TrySendError::Full(path)) | Err(TrySendError::Closed(path)) => {
+                // Dropping the owned path here guarantees cleanup even if the
+                // async queue cannot accept more work.
+                remove_path_sync(&path);
+            }
         }
     }
 }
@@ -377,6 +381,47 @@ mod tests {
 
         let remaining = std::fs::read_dir(&dir).expect("read dir").count();
         assert_eq!(remaining, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guard_drop_removes_file_when_queue_is_full() {
+        let dir = unique_temp_dir("guard-file-full");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let file = dir.join("temp.bin");
+        std::fs::write(&file, b"payload").expect("write file");
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(dir.join("queued.tmp")).expect("fill queue");
+
+        let guard = TempFileGuard {
+            path: file.clone(),
+            tx,
+        };
+        drop(guard);
+
+        assert!(!file.exists());
+        assert!(rx.try_recv().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guard_drop_removes_file_when_queue_is_closed() {
+        let dir = unique_temp_dir("guard-file-closed");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let file = dir.join("temp.bin");
+        std::fs::write(&file, b"payload").expect("write file");
+
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let guard = TempFileGuard {
+            path: file.clone(),
+            tx,
+        };
+        drop(guard);
+
+        assert!(!file.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
