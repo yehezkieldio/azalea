@@ -232,65 +232,54 @@ pub(crate) async fn run_json_subprocess(
     })?;
 
     let (limit_tx, mut limit_rx) = mpsc::channel::<()>(1);
-    let limit_guard = limit_tx.clone();
-    let stdout_handle = tokio::spawn(read_bounded(stdout, stdout_limit, Some(limit_tx)));
-    let stderr_handle = tokio::spawn(read_stderr_tail(stderr, stderr_lines));
-
-    enum WaitOutcome {
-        Exit(std::io::Result<std::process::ExitStatus>),
-        Timeout,
-        OutputLimit,
-    }
-
-    let wait_outcome = tokio::select! {
-        res = tokio::time::timeout(timeout, guard.wait()) => {
-            match res {
-                Ok(status) => WaitOutcome::Exit(status),
-                Err(_) => WaitOutcome::Timeout,
-            }
-        }
-        _ = limit_rx.recv() => WaitOutcome::OutputLimit,
+    let stdout = async {
+        read_bounded(stdout, stdout_limit, Some(limit_tx))
+            .await
+            .map_err(JsonSubprocessError::Io)
     };
-    drop(limit_guard);
+    let stderr = async {
+        read_stderr_tail(stderr, stderr_lines)
+            .await
+            .map_err(JsonSubprocessError::Io)
+    };
+    let process = supervise_json_subprocess(guard, timeout, &mut limit_rx);
 
-    match wait_outcome {
-        WaitOutcome::Exit(status) => {
-            let status = status.map_err(JsonSubprocessError::Io)?;
-            let stdout = stdout_handle
-                .await
-                .map_err(|error| JsonSubprocessError::Io(std::io::Error::other(error.to_string())))?
-                .map_err(JsonSubprocessError::Io)?;
-            let stderr_tail = stderr_handle
-                .await
-                .map_err(|error| JsonSubprocessError::Io(std::io::Error::other(error.to_string())))?
-                .map_err(JsonSubprocessError::Io)?;
+    let (stdout, stderr_tail, status) = tokio::try_join!(stdout, stderr, process)?;
+    let Some(status) = status.filter(|_| !stdout.exceeded) else {
+        return Err(JsonSubprocessError::OutputLimit { stderr_tail });
+    };
 
-            if stdout.exceeded {
-                return Err(JsonSubprocessError::OutputLimit { stderr_tail });
-            }
+    Ok(JsonSubprocessOutput {
+        status,
+        stdout: stdout.data,
+        stderr_tail,
+    })
+}
 
-            Ok(JsonSubprocessOutput {
-                status,
-                stdout: stdout.data,
-                stderr_tail,
-            })
-        }
-        WaitOutcome::Timeout => {
+async fn supervise_json_subprocess(
+    mut guard: SubprocessGuard,
+    timeout: Duration,
+    limit_rx: &mut mpsc::Receiver<()>,
+) -> Result<Option<std::process::ExitStatus>, JsonSubprocessError> {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+
+    tokio::select! {
+        status = guard.wait() => status.map(Some).map_err(JsonSubprocessError::Io),
+        _ = &mut deadline => {
             kill_process_group(&mut guard).await;
             let _ = guard.wait().await;
-            stdout_handle.abort();
-            stderr_handle.abort();
             Err(JsonSubprocessError::Timeout)
         }
-        WaitOutcome::OutputLimit => {
-            kill_process_group(&mut guard).await;
-            let _ = guard.wait().await;
-            let _ = stdout_handle.await;
-            let stderr_tail = match stderr_handle.await {
-                Ok(Ok(stderr_tail)) => stderr_tail,
-                _ => "unknown error".into(),
-            };
-            Err(JsonSubprocessError::OutputLimit { stderr_tail })
+        limit = limit_rx.recv() => {
+            match limit {
+                Some(()) => {
+                    kill_process_group(&mut guard).await;
+                    let _ = guard.wait().await;
+                    Ok(None)
+                }
+                None => guard.wait().await.map(Some).map_err(JsonSubprocessError::Io),
+            }
         }
     }
 }
