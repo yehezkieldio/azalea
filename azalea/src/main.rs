@@ -625,10 +625,10 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                 "job",
                 req = job.request_id.0,
                 tweet_id = job.tweet_url.tweet_id.0,
-                source = if job.source_message_id.is_some() {
-                    "message"
-                } else {
+                source = if job.is_slash_command() {
                     "command"
+                } else {
+                    "message"
                 }
             );
 
@@ -644,28 +644,34 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                     queue_depth = queue_depth_at_start,
                     "Job started"
                 );
-                let reply_message_id =
+                let reply_message_id = if job.is_slash_command() {
+                    None
+                } else {
                     discord::send_processing(&app.discord, job.channel_id, job.source_message_id)
-                        .await;
+                        .await
+                };
 
-                let (progress_tx, progress_rx) = mpsc::channel(10);
-                let progress_updater = if let Some(msg_id) = reply_message_id {
+                let (progress_tx, progress_updater) = if let Some(msg_id) = reply_message_id {
+                    let (progress_tx, progress_rx) = mpsc::channel(10);
                     let debounce = Duration::from_secs(PROGRESS_UPDATE_DEBOUNCE_SECS);
                     // Spawn a debounced progress updater to limit API churn.
-                    Some(discord::spawn_progress_updates(
-                        Arc::clone(&app.discord),
-                        app.engine.metrics.clone(),
-                        job.channel_id,
-                        msg_id,
-                        progress_rx,
-                        debounce,
-                    ))
+                    (
+                        Some(progress_tx),
+                        Some(discord::spawn_progress_updates(
+                            Arc::clone(&app.discord),
+                            app.engine.metrics.clone(),
+                            job.channel_id,
+                            msg_id,
+                            progress_rx,
+                            debounce,
+                        )),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
 
                 let core_job = job.core();
-                let result = core_pipeline::run(core_job, &app.engine, Some(progress_tx.clone()))
+                let result = core_pipeline::run(core_job, &app.engine, progress_tx.clone())
                     .instrument(tracing::info_span!("core"))
                     .await;
 
@@ -679,7 +685,7 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             &app.discord,
                             &app.engine.permits,
                             &app.engine.config,
-                            Some(&progress_tx),
+                            progress_tx.as_ref(),
                         )
                         .instrument(tracing::info_span!("upload"))
                         .await
@@ -776,8 +782,23 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             diagnostics.hwacc_failures.fetch_add(1, Ordering::Relaxed);
                         }
                         log_job_failure_diagnostics(&error, job_started_at.elapsed());
-                        discord::send_error(&app.discord, job.channel_id, reply_message_id, &error)
+                        if let Some(interaction_response) = job.interaction_response.as_ref() {
+                            discord::send_interaction_error(
+                                &app.discord,
+                                app.config.application_id,
+                                interaction_response.token(),
+                                &error,
+                            )
                             .await;
+                        } else {
+                            discord::send_error(
+                                &app.discord,
+                                job.channel_id,
+                                reply_message_id,
+                                &error,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
