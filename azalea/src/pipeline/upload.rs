@@ -2,12 +2,12 @@
 //! Upload stage for sending prepared media to Discord.
 //!
 //! ## Algorithm overview
-//! Uploads prepared files either sequentially or as a single batched message,
-//! depending on configuration.
+//! Uploads prepared files either as standalone messages or batched requests of
+//! up to Discord's attachment limit, depending on configuration.
 //!
 //! ## Trade-off acknowledgment
-//! Sequential uploads preserve explicit per-segment ordering; batched uploads
-//! reduce Discord requests at the cost of reply threading.
+//! Batched uploads minimize Discord requests; bounded parallel preparation keeps
+//! ordering deterministic without forcing file reads to happen one-by-one.
 
 use crate::ids::{ChannelId, MessageId};
 use crate::pipeline::{Error, Progress, UploadOutcome};
@@ -16,10 +16,11 @@ use azalea_core::config::EngineSettings;
 use azalea_core::media::TweetId;
 use azalea_core::pipeline::{PreparedPart, PreparedUpload};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing::Instrument as _;
 use twilight_http::Client;
 use twilight_http::api_error::ApiError;
@@ -27,6 +28,8 @@ use twilight_http::error::Error as TwilightError;
 use twilight_http::error::ErrorType;
 use twilight_http::response::StatusCode;
 use twilight_model::http::attachment::Attachment;
+
+const MAX_ATTACHMENTS_PER_REQUEST: usize = 10;
 
 /// Upload prepared media, chaining messages when multiple parts are required.
 ///
@@ -105,6 +108,10 @@ fn should_batch_upload(parts: &[PreparedPart], config: &EngineSettings) -> bool 
     parts.len() > 1 && config.pipeline.batch_upload_multiple_media
 }
 
+fn batch_request_count(parts: usize) -> usize {
+    parts.div_ceil(MAX_ATTACHMENTS_PER_REQUEST)
+}
+
 async fn upload_parts_sequential(
     parts: &[PreparedPart],
     channel_id: ChannelId,
@@ -115,7 +122,6 @@ async fn upload_parts_sequential(
 ) -> Result<UploadOutcome, Error> {
     let total_files = parts.len();
     let mut first_message_id = None;
-    let mut last_message_id = None;
 
     for (index, part) in parts.iter().enumerate() {
         if let Some(tx) = progress_tx {
@@ -133,7 +139,6 @@ async fn upload_parts_sequential(
         let ctx = UploadRetryContext {
             discord,
             channel_id,
-            reply_to: last_message_id,
             part: index + 1,
             total: total_files,
         };
@@ -155,7 +160,6 @@ async fn upload_parts_sequential(
         if first_message_id.is_none() {
             first_message_id = Some(MessageId::from(message.id));
         }
-        last_message_id = Some(MessageId::from(message.id));
         tracing::info!(
             part = index + 1,
             total = total_files,
@@ -186,51 +190,83 @@ async fn upload_parts_batched(
     progress_tx: Option<&mpsc::Sender<Progress>>,
 ) -> Result<UploadOutcome, Error> {
     let total_files = parts.len();
-    let attachments = build_attachments(parts, config, tweet_id, progress_tx).await?;
-    let ctx = UploadRetryContext {
-        discord,
-        channel_id,
-        reply_to: None,
-        part: total_files,
-        total: total_files,
-    };
+    let total_batches = batch_request_count(total_files);
+    let mut first_message_id = None;
 
-    let response = send_with_retry(&ctx, &attachments)
-        .instrument(tracing::info_span!("upload_batch", total = total_files))
+    for (batch_index, batch_parts) in parts.chunks(MAX_ATTACHMENTS_PER_REQUEST).enumerate() {
+        let batch_start = batch_index * MAX_ATTACHMENTS_PER_REQUEST;
+        let batch_end = batch_start + batch_parts.len();
+        let attachments = build_attachments(
+            batch_parts,
+            config,
+            tweet_id,
+            batch_start,
+            total_files,
+            progress_tx,
+        )
         .await?;
-    let message = response.model().await.map_err(|e| Error::UploadFailed {
-        part: total_files,
-        total: total_files,
-        source: Box::new(e),
-    })?;
+        let ctx = UploadRetryContext {
+            discord,
+            channel_id,
+            part: batch_end,
+            total: total_files,
+        };
 
-    tracing::info!(
-        total = total_files,
-        message_id = message.id.get(),
-        "Batch upload complete"
-    );
+        let response = send_with_retry(&ctx, &attachments)
+            .instrument(tracing::info_span!(
+                "upload_batch",
+                batch = batch_index + 1,
+                total_batches,
+                batch_parts = batch_parts.len(),
+                batch_start = batch_start + 1,
+                batch_end
+            ))
+            .await?;
+        let message = response.model().await.map_err(|e| Error::UploadFailed {
+            part: batch_end,
+            total: total_files,
+            source: Box::new(e),
+        })?;
+
+        if first_message_id.is_none() {
+            first_message_id = Some(MessageId::from(message.id));
+        }
+        tracing::info!(
+            batch = batch_index + 1,
+            total_batches,
+            batch_parts = batch_parts.len(),
+            message_id = message.id.get(),
+            "Batch upload complete"
+        );
+    }
 
     Ok(UploadOutcome {
-        first_message_id: MessageId::from(message.id),
-        messages_sent: 1,
+        first_message_id: first_message_id.ok_or_else(|| Error::UploadFailed {
+            part: 0,
+            total: total_files,
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "upload produced no messages",
+            )),
+        })?,
+        messages_sent: total_batches,
     })
 }
 
-fn file_size_checked(
-    part: &PreparedPart,
-    config: &EngineSettings,
+fn file_size_checked_from_metadata(
+    file_path: &Path,
+    file_size: u64,
+    max_upload_bytes: u64,
     part_number: usize,
     total: usize,
 ) -> Result<u64, Error> {
-    let file_size = part.size();
-
     tracing::trace!(
-        path = %part.path().display(),
+        path = %file_path.display(),
         size_bytes = file_size,
         "Reading upload file"
     );
 
-    if file_size > config.transcode.max_upload_bytes {
+    if file_size > max_upload_bytes {
         return Err(Error::UploadFailed {
             part: part_number,
             total,
@@ -262,7 +298,13 @@ async fn read_file_with_limit(
     part_number: usize,
     total: usize,
 ) -> Result<Vec<u8>, Error> {
-    let size = file_size_checked(part, config, part_number, total)?;
+    let size = file_size_checked_from_metadata(
+        part.path(),
+        part.size(),
+        config.transcode.max_upload_bytes,
+        part_number,
+        total,
+    )?;
     read_file(part.path().to_path_buf(), size).await
 }
 
@@ -296,8 +338,34 @@ async fn build_attachment(
     total: usize,
     attachment_id: u64,
 ) -> Result<Attachment, Error> {
-    let file_path = part.path();
-    let file_size = file_size_checked(part, config, part_number, total)?;
+    build_attachment_from_path(
+        part.path().to_path_buf(),
+        part.size(),
+        config.transcode.max_upload_bytes,
+        tweet_id,
+        part_number,
+        total,
+        attachment_id,
+    )
+    .await
+}
+
+async fn build_attachment_from_path(
+    file_path: PathBuf,
+    file_size: u64,
+    max_upload_bytes: u64,
+    tweet_id: TweetId,
+    part_number: usize,
+    total: usize,
+    attachment_id: u64,
+) -> Result<Attachment, Error> {
+    let file_size = file_size_checked_from_metadata(
+        &file_path,
+        file_size,
+        max_upload_bytes,
+        part_number,
+        total,
+    )?;
     tracing::trace!(
         part = part_number,
         total,
@@ -306,9 +374,9 @@ async fn build_attachment(
         "Prepared upload payload"
     );
 
-    let data = read_file(file_path.to_path_buf(), file_size).await?;
+    let data = read_file(file_path.clone(), file_size).await?;
     Ok(Attachment::from_bytes(
-        attachment_filename(file_path, tweet_id, part_number, total),
+        attachment_filename(&file_path, tweet_id, part_number, total),
         data,
         attachment_id,
     ))
@@ -318,24 +386,88 @@ async fn build_attachments(
     parts: &[PreparedPart],
     config: &EngineSettings,
     tweet_id: TweetId,
+    start_part_index: usize,
+    total_files: usize,
     progress_tx: Option<&mpsc::Sender<Progress>>,
 ) -> Result<Vec<Attachment>, Error> {
-    let total_files = parts.len();
-    let mut attachments = Vec::with_capacity(total_files);
+    let max_upload_bytes = config.transcode.max_upload_bytes;
+    let concurrency_limit = config
+        .pipeline
+        .attachment_prepare_concurrency
+        .min(parts.len().max(1));
+    let mut next_to_spawn = 0usize;
+    let mut join_set = JoinSet::new();
+    let mut attachments = (0..parts.len()).map(|_| None).collect::<Vec<_>>();
 
-    for (index, part) in parts.iter().enumerate() {
-        if let Some(tx) = progress_tx {
-            let _ = tx
-                .send(Progress::UploadingSegment(index + 1, total_files))
-                .await;
+    while next_to_spawn < parts.len() || !join_set.is_empty() {
+        while next_to_spawn < parts.len() && join_set.len() < concurrency_limit {
+            let Some(part) = parts.get(next_to_spawn) else {
+                return Err(Error::UploadFailed {
+                    part: start_part_index + next_to_spawn + 1,
+                    total: total_files,
+                    source: Box::new(std::io::Error::other(
+                        "attachment preparation index out of range",
+                    )),
+                });
+            };
+            let slot = next_to_spawn;
+            let part_number = start_part_index + slot + 1;
+            if let Some(tx) = progress_tx {
+                let stage = if total_files > 1 {
+                    Progress::UploadingSegment(part_number, total_files)
+                } else {
+                    Progress::Uploading
+                };
+                let _ = tx.send(stage).await;
+            }
+
+            let file_path = part.path().to_path_buf();
+            let file_size = part.size();
+            join_set.spawn(async move {
+                build_attachment_from_path(
+                    file_path,
+                    file_size,
+                    max_upload_bytes,
+                    tweet_id,
+                    part_number,
+                    total_files,
+                    slot as u64,
+                )
+                .await
+                .map(|attachment| (slot, attachment))
+            });
+            next_to_spawn += 1;
         }
 
-        attachments.push(
-            build_attachment(part, config, tweet_id, index + 1, total_files, index as u64).await?,
-        );
+        let Some(result) = join_set.join_next().await else {
+            break;
+        };
+        let (slot, attachment) = result.map_err(|e| {
+            Error::Core(azalea_core::pipeline::Error::Io(std::io::Error::other(e)))
+        })??;
+        let Some(target) = attachments.get_mut(slot) else {
+            return Err(Error::UploadFailed {
+                part: start_part_index + slot + 1,
+                total: total_files,
+                source: Box::new(std::io::Error::other("attachment slot out of range")),
+            });
+        };
+        *target = Some(attachment);
     }
 
-    Ok(attachments)
+    attachments
+        .into_iter()
+        .enumerate()
+        .map(|(slot, attachment)| {
+            attachment.ok_or_else(|| Error::UploadFailed {
+                part: start_part_index + slot + 1,
+                total: total_files,
+                source: Box::new(std::io::Error::other(
+                    "attachment preparation produced incomplete batch",
+                )),
+            })
+        })
+        .collect()
 }
 
 /// Read the file into a preallocated buffer to minimize reallocations.
@@ -371,7 +503,6 @@ fn checked_preallocation_len(size: u64) -> std::io::Result<usize> {
 struct UploadRetryContext<'a> {
     discord: &'a Client,
     channel_id: ChannelId,
-    reply_to: Option<MessageId>,
     part: usize,
     total: usize,
 }
@@ -392,12 +523,12 @@ async fn send_with_retry(
             "Sending upload attempt"
         );
 
-        let mut request = ctx.discord.create_message(ctx.channel_id.into());
-        if let Some(reply_to) = ctx.reply_to {
-            request = request.reply(reply_to.into());
-        }
-
-        match request.attachments(attachments).await {
+        match ctx
+            .discord
+            .create_message(ctx.channel_id.into())
+            .attachments(attachments)
+            .await
+        {
             Ok(response) => {
                 tracing::info!(
                     part = ctx.part,
@@ -642,7 +773,13 @@ mod tests {
         config.transcode.max_upload_bytes = 4;
 
         let part = prepared_part(&path, 8);
-        let result = file_size_checked(&part, &config, 1, 1);
+        let result = file_size_checked_from_metadata(
+            part.path(),
+            part.size(),
+            config.transcode.max_upload_bytes,
+            1,
+            1,
+        );
         cleanup_file(&path);
 
         let rendered = result.as_ref().err().map(ToString::to_string);
@@ -669,7 +806,13 @@ mod tests {
         config.transcode.max_upload_bytes = payload.len() as u64 + 1;
 
         let part = prepared_part(&path, payload.len() as u64);
-        let result = file_size_checked(&part, &config, 1, 1);
+        let result = file_size_checked_from_metadata(
+            part.path(),
+            part.size(),
+            config.transcode.max_upload_bytes,
+            1,
+            1,
+        );
         cleanup_file(&path);
 
         assert_eq!(result.ok(), Some(payload.len() as u64));
@@ -722,10 +865,11 @@ mod tests {
             prepared_part(&second_path, second_payload.len() as u64),
         ];
 
-        let attachments = match build_attachments(&parts, &config, TweetId(42), None).await {
-            Ok(attachments) => attachments,
-            Err(error) => panic!("attachments should build: {error}"),
-        };
+        let attachments =
+            match build_attachments(&parts, &config, TweetId(42), 0, parts.len(), None).await {
+                Ok(attachments) => attachments,
+                Err(error) => panic!("attachments should build: {error}"),
+            };
         cleanup_file(&first_path);
         cleanup_file(&second_path);
 
@@ -739,6 +883,15 @@ mod tests {
         assert_eq!(second.id, 1);
         assert_eq!(first.file, first_payload);
         assert_eq!(second.file, second_payload);
+    }
+
+    #[test]
+    fn batch_request_count_uses_discord_attachment_limit() {
+        assert_eq!(batch_request_count(1), 1);
+        assert_eq!(batch_request_count(10), 1);
+        assert_eq!(batch_request_count(11), 2);
+        assert_eq!(batch_request_count(20), 2);
+        assert_eq!(batch_request_count(21), 3);
     }
 
     #[test]

@@ -177,9 +177,15 @@
       "description": "Pipeline configuration.",
       "type": "object",
       "properties": {
+        "attachment_prepare_concurrency": {
+          "type": "integer",
+          "format": "uint",
+          "default": 4,
+          "minimum": 0
+        },
         "batch_upload_multiple_media": {
           "type": "boolean",
-          "default": false
+          "default": true
         },
         "channel_rate_limit_requests": {
           "type": "integer",
