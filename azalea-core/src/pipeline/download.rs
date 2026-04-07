@@ -178,6 +178,7 @@ pub async fn download(
             .await?;
         let mut file = BufWriter::with_capacity(config.pipeline.download_write_buffer_bytes, file);
         let mut downloaded = 0u64;
+        let mut upload_ready_bytes = bounded_upload_ready_buffer(total_size, config);
         let mut last_log = std::time::Instant::now();
         let log_interval = Duration::from_secs(5);
 
@@ -186,7 +187,16 @@ pub async fn download(
                 source: DownloadError::WriteFailed(std::io::Error::other(e)),
             })?;
 
-            downloaded += chunk.len() as u64;
+            let next_downloaded = downloaded.saturating_add(chunk.len() as u64);
+            if let Some(bytes) = upload_ready_bytes.as_mut() {
+                if next_downloaded <= config.transcode.max_upload_bytes {
+                    bytes.extend_from_slice(&chunk);
+                } else {
+                    upload_ready_bytes = None;
+                }
+            }
+
+            downloaded = next_downloaded;
 
             if max_download > 0 && downloaded > max_download {
                 // Drop the partially written file to avoid leaving oversized artifacts.
@@ -312,6 +322,7 @@ pub async fn download(
             duration,
             resolution,
             facts,
+            upload_ready_bytes: upload_ready_bytes.map(Arc::<[u8]>::from),
             _guard: guard,
             _dir_guard: Some(dir_guard),
         })
@@ -331,6 +342,25 @@ pub async fn download(
             })
         }
     }
+}
+
+fn bounded_upload_ready_buffer(
+    total_size: Option<u64>,
+    config: &EngineSettings,
+) -> Option<Vec<u8>> {
+    let max_upload_bytes = config.transcode.max_upload_bytes;
+    if total_size.is_some_and(|size| size > max_upload_bytes) {
+        return None;
+    }
+
+    let capacity = total_size
+        .unwrap_or(0)
+        .min(max_upload_bytes)
+        .try_into()
+        .unwrap_or(0);
+    // Retain pass-through bytes only for under-limit candidates. This bounds
+    // extra memory to one upload-sized buffer per eligible in-flight job.
+    Some(Vec::with_capacity(capacity))
 }
 
 async fn fetch_with_redirects(
@@ -644,9 +674,10 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::{
-        FetchStep, MAX_REDIRECTS, content_length_header_bytes, estimate_bitrate_kbps,
-        fetch_with_redirects_inner, parse_bitrate_kbps,
+        FetchStep, MAX_REDIRECTS, bounded_upload_ready_buffer, content_length_header_bytes,
+        estimate_bitrate_kbps, fetch_with_redirects_inner, parse_bitrate_kbps,
     };
+    use crate::config::EngineSettings;
     use crate::pipeline::errors::{DownloadError, Error};
     use reqwest::Url;
     use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
@@ -678,6 +709,18 @@ mod tests {
     fn parses_ffprobe_bitrate_in_kbps() {
         assert_eq!(parse_bitrate_kbps("1234567"), Some(1235));
         assert_eq!(parse_bitrate_kbps("nope"), None);
+    }
+
+    #[test]
+    fn upload_ready_buffer_is_only_allocated_for_under_limit_candidates() {
+        let config = EngineSettings::default();
+
+        let bounded = bounded_upload_ready_buffer(Some(config.transcode.max_upload_bytes), &config);
+        assert!(bounded.is_some());
+
+        let oversized =
+            bounded_upload_ready_buffer(Some(config.transcode.max_upload_bytes + 1), &config);
+        assert!(oversized.is_none());
     }
 
     #[tokio::test]

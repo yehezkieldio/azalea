@@ -338,6 +338,39 @@ async fn build_attachment(
     total: usize,
     attachment_id: u64,
 ) -> Result<Attachment, Error> {
+    if let Some(upload_ready_bytes) = part.upload_ready_bytes() {
+        let file_size = file_size_checked_from_metadata(
+            part.path(),
+            part.size(),
+            config.transcode.max_upload_bytes,
+            part_number,
+            total,
+        )?;
+        if upload_ready_bytes.len() as u64 != file_size {
+            return Err(Error::UploadFailed {
+                part: part_number,
+                total,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "in-memory upload payload size mismatch",
+                )),
+            });
+        }
+
+        tracing::trace!(
+            part = part_number,
+            total,
+            path = %part.path().display(),
+            size_bytes = file_size,
+            "Prepared upload payload from memory"
+        );
+        return Ok(Attachment::from_bytes(
+            attachment_filename(part.path(), tweet_id, part_number, total),
+            upload_ready_bytes.as_ref().to_vec(),
+            attachment_id,
+        ));
+    }
+
     build_attachment_from_path(
         part.path().to_path_buf(),
         part.size(),
@@ -650,6 +683,7 @@ mod tests {
     use azalea_core::config::EngineSettings;
     use azalea_core::media::TempFileCleanup;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_file_path(label: &str) -> PathBuf {
@@ -678,6 +712,16 @@ mod tests {
             path.to_path_buf(),
             size,
             temp_files.guard(path.to_path_buf()),
+        )
+    }
+
+    fn prepared_part_with_upload_ready_bytes(path: &Path, bytes: &[u8]) -> PreparedPart {
+        let temp_files = TempFileCleanup::new();
+        PreparedPart::with_upload_ready_bytes(
+            path.to_path_buf(),
+            bytes.len() as u64,
+            temp_files.guard(path.to_path_buf()),
+            Arc::<[u8]>::from(bytes.to_vec()),
         )
     }
 
@@ -883,6 +927,26 @@ mod tests {
         assert_eq!(second.id, 1);
         assert_eq!(first.file, first_payload);
         assert_eq!(second.file, second_payload);
+    }
+
+    #[tokio::test]
+    async fn build_attachment_uses_in_memory_payload_without_reopening_file() {
+        let path = unique_temp_file_path("missing-upload-fast-path.mp4");
+        cleanup_file(&path);
+        let payload = b"in-memory-upload";
+        let config = EngineSettings::default();
+        let part = prepared_part_with_upload_ready_bytes(&path, payload);
+
+        let attachment = match build_attachment(&part, &config, TweetId(7), 1, 1, 0).await {
+            Ok(attachment) => attachment,
+            Err(error) => panic!(
+                "memory-backed payload should upload without reopening file: {error}"
+            ),
+        };
+
+        assert_eq!(attachment.filename, "tweet_7.mp4");
+        assert_eq!(attachment.file, payload);
+        assert_eq!(attachment.id, 0);
     }
 
     #[test]
