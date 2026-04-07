@@ -16,12 +16,26 @@ use std::fmt;
 ///
 /// ## Invariants
 /// - `tweet_url` is canonicalized (see `azalea_core::media`).
-#[derive(Debug, Clone)]
+pub struct InteractionResponseHandle {
+    token: String,
+}
+
+impl InteractionResponseHandle {
+    pub fn new(token: String) -> Self {
+        Self { token }
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
 pub struct Job {
     pub request_id: RequestId,
     pub channel_id: ChannelId,
     pub trigger_id: InteractionId,
     pub source_message_id: Option<MessageId>,
+    pub interaction_response: Option<InteractionResponseHandle>,
     pub author_id: UserId,
     pub tweet_url: TweetLink,
 }
@@ -33,6 +47,7 @@ impl Job {
         channel_id: ChannelId,
         trigger_id: InteractionId,
         source_message_id: Option<MessageId>,
+        interaction_response: Option<InteractionResponseHandle>,
         author_id: UserId,
         tweet_url: TweetLink,
     ) -> Self {
@@ -41,6 +56,7 @@ impl Job {
             channel_id,
             trigger_id,
             source_message_id,
+            interaction_response,
             author_id,
             tweet_url,
         }
@@ -57,6 +73,10 @@ impl Job {
             self.trigger_id.get(),
             self.tweet_url.clone(),
         )
+    }
+
+    pub fn is_slash_command(&self) -> bool {
+        self.interaction_response.is_some()
     }
 }
 

@@ -345,6 +345,7 @@ pub struct PipelineSettings {
     pub download_timeout_secs: u64,
     pub download_write_buffer_bytes: usize,
     pub upload_timeout_secs: u64,
+    pub attachment_prepare_concurrency: usize,
     pub min_disk_space_bytes: u64,
     pub max_download_bytes: u64,
     pub resolver_timeout_secs: u64,
@@ -364,6 +365,7 @@ impl Default for PipelineSettings {
             download_timeout_secs: 60,
             download_write_buffer_bytes: 1024 * 1024,
             upload_timeout_secs: 120,
+            attachment_prepare_concurrency: 4,
             min_disk_space_bytes: 500 * 1024 * 1024,
             max_download_bytes: 500 * 1024 * 1024,
             resolver_timeout_secs: 10,
@@ -373,7 +375,7 @@ impl Default for PipelineSettings {
             channel_rate_limit_requests: 20,
             channel_rate_limit_window_secs: 60,
             parallel_segment_threshold: 4,
-            batch_upload_multiple_media: false,
+            batch_upload_multiple_media: true,
         }
     }
 }
@@ -522,6 +524,9 @@ impl EngineSettings {
             "pipeline.upload_timeout_secs",
             self.pipeline.upload_timeout_secs,
         )?;
+        if self.pipeline.attachment_prepare_concurrency == 0 {
+            anyhow::bail!("pipeline.attachment_prepare_concurrency must be at least 1");
+        }
         validate_timeout(
             "pipeline.resolver_timeout_secs",
             self.pipeline.resolver_timeout_secs,
@@ -705,7 +710,22 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_batch_upload_multiple_media_defaults_to_false() {
-        assert!(!PipelineSettings::default().batch_upload_multiple_media);
+    fn validate_rejects_zero_attachment_prepare_concurrency() {
+        let mut config = EngineSettings::default();
+        config.pipeline.attachment_prepare_concurrency = 0;
+        let err = config
+            .validate()
+            .expect_err("zero attachment preparation concurrency must be invalid");
+        assert!(err.to_string().contains("attachment_prepare_concurrency"));
+    }
+
+    #[test]
+    fn pipeline_batch_upload_multiple_media_defaults_to_true() {
+        assert!(PipelineSettings::default().batch_upload_multiple_media);
+    }
+
+    #[test]
+    fn pipeline_attachment_prepare_concurrency_has_nonzero_default() {
+        assert!(PipelineSettings::default().attachment_prepare_concurrency > 0);
     }
 }

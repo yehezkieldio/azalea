@@ -119,6 +119,11 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
         "pipeline.download_write_buffer_bytes",
     ),
     ("UPLOAD_TIMEOUT_SECS", &[], "pipeline.upload_timeout_secs"),
+    (
+        "ATTACHMENT_PREPARE_CONCURRENCY",
+        &[],
+        "pipeline.attachment_prepare_concurrency",
+    ),
     ("MIN_DISK_SPACE_BYTES", &[], "pipeline.min_disk_space_bytes"),
     ("MAX_DOWNLOAD_BYTES", &[], "pipeline.max_download_bytes"),
     (
@@ -482,6 +487,13 @@ fn render_template() -> String {
         &format!(
             "upload_timeout_secs = {}",
             engine.pipeline.upload_timeout_secs
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "attachment_prepare_concurrency = {}",
+            engine.pipeline.attachment_prepare_concurrency
         ),
     );
     line(

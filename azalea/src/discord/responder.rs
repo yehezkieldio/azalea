@@ -8,6 +8,7 @@
 //! Updates are best-effort; failures are logged but do not interrupt the
 //! pipeline to preserve throughput.
 
+use crate::config::ApplicationId;
 use crate::ids::{ChannelId, MessageId};
 use crate::pipeline::{Error, Progress};
 use azalea_core::storage::{ErrorCategory, Metrics};
@@ -151,6 +152,43 @@ pub async fn send_error(
             .create_message(channel_id.into())
             .content(error.user_message())
             .await;
+    }
+}
+
+/// Notify a slash-command user through the deferred interaction response.
+pub async fn send_interaction_error(
+    client: &Client,
+    application_id: ApplicationId,
+    token: &str,
+    error: &Error,
+) {
+    let interaction = client.interaction(application_id.into());
+
+    match error_notification_policy(error) {
+        ErrorNotificationPolicy::SilentDelete => {
+            let _ = interaction.delete_response(token).await;
+        }
+        ErrorNotificationPolicy::VisibleError => {
+            let _ = interaction
+                .update_response(token)
+                .content(Some(error.user_message()))
+                .await;
+        }
+    }
+}
+
+/// Remove a deferred interaction response once the command has completed.
+pub async fn cleanup_interaction_response(
+    client: &Client,
+    application_id: ApplicationId,
+    token: &str,
+) {
+    if let Err(error) = client
+        .interaction(application_id.into())
+        .delete_response(token)
+        .await
+    {
+        tracing::warn!(error = %error, "Failed to delete interaction response");
     }
 }
 

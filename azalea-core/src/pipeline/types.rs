@@ -9,6 +9,7 @@ use std::{
     borrow::Cow,
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::media::{TempFileGuard, TweetLink};
@@ -189,6 +190,7 @@ pub struct DownloadedFile {
     pub duration: Option<f64>,
     pub resolution: Option<(u32, u32)>,
     pub facts: MediaFacts,
+    pub upload_ready_bytes: Option<Arc<[u8]>>,
     /// Guard ensures the temp file lives through later pipeline stages.
     pub _guard: TempFileGuard,
     /// Optional guard for a temp directory holding additional artifacts.
@@ -200,6 +202,7 @@ pub struct DownloadedFile {
 pub struct PreparedPart {
     path: PathBuf,
     size: u64,
+    upload_ready_bytes: Option<Arc<[u8]>>,
     _guard: TempFileGuard,
 }
 
@@ -208,6 +211,21 @@ impl PreparedPart {
         Self {
             path,
             size,
+            upload_ready_bytes: None,
+            _guard: guard,
+        }
+    }
+
+    pub fn with_upload_ready_bytes(
+        path: PathBuf,
+        size: u64,
+        guard: TempFileGuard,
+        upload_ready_bytes: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            path,
+            size,
+            upload_ready_bytes: Some(upload_ready_bytes),
             _guard: guard,
         }
     }
@@ -218,6 +236,10 @@ impl PreparedPart {
 
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    pub fn upload_ready_bytes(&self) -> Option<&Arc<[u8]>> {
+        self.upload_ready_bytes.as_ref()
     }
 }
 

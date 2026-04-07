@@ -124,10 +124,17 @@ pub async fn optimize(
             ._dir_guard
             .take()
             .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
-        return Ok(PreparedUpload::single(
-            PreparedPart::new(downloaded.path, downloaded.size, downloaded._guard),
-            dir_guard,
-        ));
+        let prepared_part = if let Some(upload_ready_bytes) = downloaded.upload_ready_bytes.take() {
+            PreparedPart::with_upload_ready_bytes(
+                downloaded.path,
+                downloaded.size,
+                downloaded._guard,
+                upload_ready_bytes,
+            )
+        } else {
+            PreparedPart::new(downloaded.path, downloaded.size, downloaded._guard)
+        };
+        return Ok(PreparedUpload::single(prepared_part, dir_guard));
     }
 
     let min_space = config.pipeline.min_disk_space_bytes;
@@ -1452,22 +1459,24 @@ mod tests {
 
     use super::{
         BitrateParams, SplitCopyPlan, SplitTranscodeProgress, TranscodeContext, TranscodeStrategy,
-        build_strategy_plan, execute_with_hwacc_fallback, send_progress_best_effort,
-        split_copy_is_plausible, split_parallel, split_parallel_is_plausible, split_serial,
-        try_split_copy,
+        build_strategy_plan, execute_with_hwacc_fallback, optimize, predict_resolution,
+        send_progress_best_effort, split_copy_is_plausible, split_parallel,
+        split_parallel_is_plausible, split_serial, try_split_copy,
     };
     use crate::concurrency::Permits;
-    use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings};
+    use crate::config::{EngineSettings, HardwareAcceleration, QualityPreset, TranscodeSettings};
     use crate::engine::TranscodeRuntime;
     use crate::media::TempFileCleanup;
     use crate::pipeline::errors::Error;
     use crate::pipeline::types::{
-        AudioCodec, DownloadedFile, MediaContainer, MediaFacts, Progress, VideoCodec,
+        AudioCodec, DownloadedFile, MediaContainer, MediaFacts, MediaType, PreparedUpload,
+        Progress, ResolvedMedia, VideoCodec,
     };
     use crate::pipeline::{self, errors::TranscodeStage};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
 
@@ -1479,6 +1488,7 @@ mod tests {
             duration: Some(duration),
             resolution: Some((1920, 1080)),
             facts,
+            upload_ready_bytes: None,
             _guard: temp_files.guard(PathBuf::from(path)),
             _dir_guard: None,
         }
@@ -1497,6 +1507,7 @@ mod tests {
             duration: Some(duration),
             resolution: Some((1920, 1080)),
             facts,
+            upload_ready_bytes: None,
             _guard: temp_files.guard(path),
             _dir_guard: None,
         }
@@ -1537,6 +1548,63 @@ mod tests {
                 ..
             } => assert_eq!(stderr_tail, "split segment exceeded upload limit"),
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pass_through_preserves_in_memory_upload_payload() {
+        let temp_files = TempFileCleanup::new();
+        let path = unique_temp_path("pass-through-upload-bytes.mp4");
+        let payload = b"already-uploadable".to_vec();
+        fs::write(&path, &payload).expect("write pass-through fixture");
+
+        let mut downloaded = downloaded_file_at(
+            path.clone(),
+            payload.len() as u64,
+            5.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(512),
+            },
+            &temp_files,
+        );
+        downloaded.upload_ready_bytes = Some(Arc::<[u8]>::from(payload.clone()));
+
+        let resolved = ResolvedMedia {
+            url: "https://example.com/media.mp4".into(),
+            media_type: MediaType::Video,
+            duration: Some(5.0),
+            resolution: Some((1920, 1080)),
+            extension: "mp4".into(),
+        };
+        let config = EngineSettings::default();
+        let permits = Permits::new(&config.concurrency);
+        let runtime = TranscodeRuntime::new(config.transcode.hardware_acceleration);
+
+        let prepared = optimize(
+            downloaded,
+            &resolved,
+            &permits,
+            &temp_files,
+            &config,
+            &runtime,
+            None,
+        )
+        .await
+        .expect("pass-through optimization should succeed");
+
+        match prepared {
+            PreparedUpload::Single { part, .. } => {
+                assert_eq!(part.path(), path.as_path());
+                assert_eq!(part.size(), payload.len() as u64);
+                assert_eq!(
+                    part.upload_ready_bytes().map(|bytes| bytes.as_ref()),
+                    Some(payload.as_slice())
+                );
+            }
+            PreparedUpload::Split { .. } => panic!("pass-through should remain single-part"),
         }
     }
 
@@ -1719,6 +1787,17 @@ mod tests {
         );
 
         assert!(split_parallel_is_plausible(&downloaded, 6, &config));
+    }
+
+    #[test]
+    fn aggressive_predict_resolution_downshifts_when_fast_path_would_preserve_480p() {
+        let config = EngineSettings::default();
+
+        let fast = predict_resolution(60.0, Some((854, 480)), &config, QualityPreset::Fast);
+        let size = predict_resolution(60.0, Some((854, 480)), &config, QualityPreset::Size);
+
+        assert_eq!(fast, None);
+        assert_eq!(size, Some(240));
     }
 
     #[tokio::test]

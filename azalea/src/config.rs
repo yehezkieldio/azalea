@@ -435,6 +435,11 @@ const ENV_BINDINGS: &[EnvBinding] = &[
         path: &["pipeline", "upload_timeout_secs"],
     },
     EnvBinding {
+        key: "ATTACHMENT_PREPARE_CONCURRENCY",
+        aliases: &[],
+        path: &["pipeline", "attachment_prepare_concurrency"],
+    },
+    EnvBinding {
         key: "MIN_DISK_SPACE_BYTES",
         aliases: &[],
         path: &["pipeline", "min_disk_space_bytes"],
@@ -799,6 +804,10 @@ mod tests {
                 ("APPLICATION_ID".to_string(), "123456789".to_string()),
                 ("AZALEA_MAX_DOWNLOAD_BYTES".to_string(), "700".to_string()),
                 (
+                    "AZALEA_ATTACHMENT_PREPARE_CONCURRENCY".to_string(),
+                    "6".to_string(),
+                ),
+                (
                     "AZALEA_BATCH_UPLOAD_MULTIPLE_MEDIA".to_string(),
                     "true".to_string(),
                 ),
@@ -807,6 +816,7 @@ mod tests {
         })?;
 
         assert_eq!(loaded.app.engine.pipeline.max_download_bytes, 700);
+        assert_eq!(loaded.app.engine.pipeline.attachment_prepare_concurrency, 6);
         assert!(loaded.app.engine.pipeline.batch_upload_multiple_media);
         Ok(())
     }
@@ -844,6 +854,13 @@ mod tests {
             Some(vec![
                 "pipeline".to_string(),
                 "max_download_bytes".to_string()
+            ])
+        );
+        assert_eq!(
+            config_path_from_env_key("AZALEA_ATTACHMENT_PREPARE_CONCURRENCY"),
+            Some(vec![
+                "pipeline".to_string(),
+                "attachment_prepare_concurrency".to_string()
             ])
         );
         assert_eq!(

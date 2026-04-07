@@ -78,6 +78,7 @@ async fn pass_through_local_fixture_smoke_flow() {
         duration: Some(1.0),
         resolution: Some((640, 360)),
         facts: MediaFacts::from_extension("mp4"),
+        upload_ready_bytes: None,
         _guard: temp_files.guard(fixture_path.clone()),
         _dir_guard: Some(temp_files.guard(fixture_dir)),
     };

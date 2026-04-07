@@ -7,7 +7,7 @@
 use crate::app::App;
 use crate::config::ApplicationId;
 use crate::ids::{ChannelId, InteractionId, UserId};
-use crate::pipeline::{Job, RequestId};
+use crate::pipeline::{InteractionResponseHandle, Job, RequestId};
 use azalea_core::media;
 use azalea_core::storage::Stage;
 use std::sync::atomic::Ordering;
@@ -23,6 +23,11 @@ use twilight_model::channel::message::MessageFlags;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_util::builder::InteractionResponseDataBuilder;
 use twilight_util::builder::command::{CommandBuilder, StringBuilder};
+
+enum CommandResponse {
+    Immediate(String),
+    Deferred(Job),
+}
 
 /// Register global slash commands for this application.
 ///
@@ -63,43 +68,92 @@ pub async fn handle_interaction(
         return Ok(());
     };
 
-    let content = match command_data.name.as_str() {
+    let response = match command_data.name.as_str() {
         "media" => {
             handle_media_command(
                 app,
                 channel_id,
                 author_id,
                 interaction_id,
+                &token,
                 command_data.options.as_slice(),
-                job_sender,
             )
             .await
         }
-        "stats" => format_stats(app),
-        "config" => format_config(app),
-        "status" => format_status(app).await,
+        "stats" => CommandResponse::Immediate(format_stats(app)),
+        "config" => CommandResponse::Immediate(format_config(app)),
+        "status" => CommandResponse::Immediate(format_status(app).await),
         _ => return Ok(()),
     };
 
-    // Ephemeral responses keep status/config details from cluttering channels.
-    let response = InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(
-            InteractionResponseDataBuilder::new()
-                .content(content)
-                .flags(MessageFlags::EPHEMERAL)
-                .build(),
-        ),
-    };
+    match response {
+        CommandResponse::Immediate(content) => {
+            // Ephemeral responses keep status/config details from cluttering channels.
+            respond(
+                &app.discord,
+                app.config.application_id,
+                interaction_id,
+                &token,
+                InteractionResponse {
+                    kind: InteractionResponseType::ChannelMessageWithSource,
+                    data: Some(
+                        InteractionResponseDataBuilder::new()
+                            .content(content)
+                            .flags(MessageFlags::EPHEMERAL)
+                            .build(),
+                    ),
+                },
+            )
+            .await?;
+        }
+        CommandResponse::Deferred(job) => {
+            respond(
+                &app.discord,
+                app.config.application_id,
+                interaction_id,
+                &token,
+                InteractionResponse {
+                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                    data: Some(
+                        InteractionResponseDataBuilder::new()
+                            .flags(MessageFlags::EPHEMERAL)
+                            .build(),
+                    ),
+                },
+            )
+            .await?;
 
-    respond(
-        &app.discord,
-        app.config.application_id,
-        interaction_id,
-        &token,
-        response,
-    )
-    .await?;
+            let enqueue = tokio::time::timeout(
+                Duration::from_millis(app.engine.config.pipeline.queue_backpressure_timeout_ms),
+                job_sender.send(job),
+            )
+            .await;
+
+            match enqueue {
+                Ok(Ok(())) => {
+                    app.record_queued_job();
+                }
+                Ok(Err(_)) => {
+                    update_response_content(
+                        &app.discord,
+                        app.config.application_id,
+                        &token,
+                        "job queue is unavailable right now. please try again later.",
+                    )
+                    .await?;
+                }
+                Err(_) => {
+                    update_response_content(
+                        &app.discord,
+                        app.config.application_id,
+                        &token,
+                        "queue is busy right now. please try again in a moment.",
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -125,21 +179,27 @@ async fn handle_media_command(
     channel_id: Option<ChannelId>,
     author_id: Option<UserId>,
     interaction_id: InteractionId,
+    token: &str,
     options: &[CommandDataOption],
-    job_sender: &mpsc::Sender<Job>,
-) -> String {
+) -> CommandResponse {
     let Some(channel_id) = channel_id else {
-        return "this command can only be used in a channel.".to_string();
+        return CommandResponse::Immediate(
+            "this command can only be used in a channel.".to_string(),
+        );
     };
     let Some(author_id) = author_id else {
-        return "could not determine the command author.".to_string();
+        return CommandResponse::Immediate("could not determine the command author.".to_string());
     };
 
     if !app.user_rate_limiter.check(author_id).await {
-        return "you're sending requests too quickly. please slow down.".to_string();
+        return CommandResponse::Immediate(
+            "you're sending requests too quickly. please slow down.".to_string(),
+        );
     }
     if !app.channel_rate_limiter.check(channel_id).await {
-        return "this channel is receiving too many requests. please try again later.".to_string();
+        return CommandResponse::Immediate(
+            "this channel is receiving too many requests. please try again later.".to_string(),
+        );
     }
 
     let url = match options
@@ -150,15 +210,17 @@ async fn handle_media_command(
             _ => None,
         }) {
         Some(url) => url,
-        None => return "missing required URL.".to_string(),
+        None => return CommandResponse::Immediate("missing required URL.".to_string()),
     };
 
     let mut tweet_urls = media::parse_tweet_urls(url).into_iter();
     let Some(tweet_url) = tweet_urls.next() else {
-        return "please provide a valid tweet URL.".to_string();
+        return CommandResponse::Immediate("please provide a valid tweet URL.".to_string());
     };
     if tweet_urls.next().is_some() {
-        return "please provide exactly one tweet URL per command.".to_string();
+        return CommandResponse::Immediate(
+            "please provide exactly one tweet URL per command.".to_string(),
+        );
     }
 
     // Admission checks are served from in-memory dedup state; persistence is
@@ -169,32 +231,20 @@ async fn handle_media_command(
         .is_duplicate(channel_id.get(), tweet_url.tweet_id)
         .await
     {
-        return "that tweet was already processed recently in this channel.".to_string();
+        return CommandResponse::Immediate(
+            "that tweet was already processed recently in this channel.".to_string(),
+        );
     }
 
-    let job = Job::new(
+    CommandResponse::Deferred(Job::new(
         RequestId(app.next_request_id()),
         channel_id,
         interaction_id,
         None,
+        Some(InteractionResponseHandle::new(token.to_owned())),
         author_id,
         tweet_url,
-    );
-
-    let enqueue = tokio::time::timeout(
-        Duration::from_millis(app.engine.config.pipeline.queue_backpressure_timeout_ms),
-        job_sender.send(job),
-    )
-    .await;
-
-    match enqueue {
-        Ok(Ok(())) => {
-            app.record_queued_job();
-            "Queued for processing.".to_string()
-        }
-        Ok(Err(_)) => "job queue is unavailable right now. please try again later.".to_string(),
-        Err(_) => "queue is busy right now. please try again in a moment.".to_string(),
-    }
+    ))
 }
 
 /// Issue a single interaction response and propagate errors.
@@ -208,6 +258,20 @@ async fn respond(
     client
         .interaction(application_id.into())
         .create_response(interaction_id.into(), token, &response)
+        .await?;
+    Ok(())
+}
+
+async fn update_response_content(
+    client: &Client,
+    application_id: ApplicationId,
+    token: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    client
+        .interaction(application_id.into())
+        .update_response(token)
+        .content(Some(content))
         .await?;
     Ok(())
 }
@@ -371,10 +435,13 @@ mod tests {
         }
     }
 
+    fn assert_immediate(response: CommandResponse, expected: &str) {
+        assert!(matches!(response, CommandResponse::Immediate(ref content) if content == expected));
+    }
+
     #[tokio::test]
     async fn handle_media_command_rejects_missing_channel() {
         let app = test_app();
-        let (job_sender, _job_receiver) = mpsc::channel(1);
         let author_id = Some(UserId::new(42));
 
         let response = handle_media_command(
@@ -382,18 +449,17 @@ mod tests {
             None,
             author_id,
             InteractionId::new(10),
+            "test-token",
             &[url_option("https://x.com/rustlang/status/123")],
-            &job_sender,
         )
         .await;
 
-        assert_eq!(response, "this command can only be used in a channel.");
+        assert_immediate(response, "this command can only be used in a channel.");
     }
 
     #[tokio::test]
     async fn handle_media_command_rejects_missing_author() {
         let app = test_app();
-        let (job_sender, _job_receiver) = mpsc::channel(1);
         let channel_id = Some(ChannelId::new(24));
 
         let response = handle_media_command(
@@ -401,18 +467,17 @@ mod tests {
             channel_id,
             None,
             InteractionId::new(11),
+            "test-token",
             &[url_option("https://x.com/rustlang/status/123")],
-            &job_sender,
         )
         .await;
 
-        assert_eq!(response, "could not determine the command author.");
+        assert_immediate(response, "could not determine the command author.");
     }
 
     #[tokio::test]
     async fn handle_media_command_rejects_missing_url() {
         let app = test_app();
-        let (job_sender, _job_receiver) = mpsc::channel(1);
         let channel_id = Some(ChannelId::new(25));
         let author_id = Some(UserId::new(43));
 
@@ -421,18 +486,17 @@ mod tests {
             channel_id,
             author_id,
             InteractionId::new(12),
+            "test-token",
             &[],
-            &job_sender,
         )
         .await;
 
-        assert_eq!(response, "missing required URL.");
+        assert_immediate(response, "missing required URL.");
     }
 
     #[tokio::test]
     async fn handle_media_command_rejects_invalid_url() {
         let app = test_app();
-        let (job_sender, _job_receiver) = mpsc::channel(1);
         let channel_id = Some(ChannelId::new(26));
         let author_id = Some(UserId::new(44));
 
@@ -441,18 +505,17 @@ mod tests {
             channel_id,
             author_id,
             InteractionId::new(13),
+            "test-token",
             &[url_option("not-a-url")],
-            &job_sender,
         )
         .await;
 
-        assert_eq!(response, "please provide a valid tweet URL.");
+        assert_immediate(response, "please provide a valid tweet URL.");
     }
 
     #[tokio::test]
     async fn handle_media_command_rejects_multiple_urls() {
         let app = test_app();
-        let (job_sender, _job_receiver) = mpsc::channel(1);
         let channel_id = Some(ChannelId::new(27));
         let author_id = Some(UserId::new(45));
 
@@ -461,16 +524,16 @@ mod tests {
             channel_id,
             author_id,
             InteractionId::new(14),
+            "test-token",
             &[url_option(
                 "https://x.com/rustlang/status/123 https://x.com/rustlang/status/456",
             )],
-            &job_sender,
         )
         .await;
 
-        assert_eq!(
+        assert_immediate(
             response,
-            "please provide exactly one tweet URL per command."
+            "please provide exactly one tweet URL per command.",
         );
     }
 

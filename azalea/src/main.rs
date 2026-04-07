@@ -69,6 +69,43 @@ const JOB_DURATION_WARN_MS: u64 = 45_000;
 const UPLOAD_DURATION_WARN_MS: u64 = 20_000;
 const QUEUE_DEPTH_WARN_THRESHOLD: usize = 80;
 
+fn warn_on_slow_upload(upload_elapsed_ms: u64, upload_metrics: &pipeline::upload::Metrics) {
+    let measured_upload_ms = upload_metrics.total_duration_ms();
+    if upload_elapsed_ms > UPLOAD_DURATION_WARN_MS {
+        let (slow_stage, slow_stage_elapsed_ms) = upload_metrics.slowest_stage();
+        tracing::warn!(
+            upload_elapsed_ms,
+            measured_upload_ms,
+            threshold_ms = UPLOAD_DURATION_WARN_MS,
+            slow_stage,
+            slow_stage_elapsed_ms,
+            attachment_prepare_ms = upload_metrics.attachment_prepare_ms,
+            http_send_ms = upload_metrics.http_send_ms,
+            response_parse_ms = upload_metrics.response_parse_ms,
+            post_upload_cleanup_ms = upload_metrics.post_upload_cleanup_ms,
+            payload_bytes = upload_metrics.payload_bytes,
+            request_count = upload_metrics.request_count,
+            effective_throughput_bytes_per_sec =
+                upload_metrics.effective_throughput_bytes_per_sec(),
+            "Upload duration exceeded warning threshold"
+        );
+    } else {
+        tracing::debug!(
+            upload_elapsed_ms,
+            measured_upload_ms,
+            attachment_prepare_ms = upload_metrics.attachment_prepare_ms,
+            http_send_ms = upload_metrics.http_send_ms,
+            response_parse_ms = upload_metrics.response_parse_ms,
+            post_upload_cleanup_ms = upload_metrics.post_upload_cleanup_ms,
+            payload_bytes = upload_metrics.payload_bytes,
+            request_count = upload_metrics.request_count,
+            effective_throughput_bytes_per_sec =
+                upload_metrics.effective_throughput_bytes_per_sec(),
+            "Upload completed within threshold"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RateLimitScope {
     User,
@@ -625,10 +662,10 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                 "job",
                 req = job.request_id.0,
                 tweet_id = job.tweet_url.tweet_id.0,
-                source = if job.source_message_id.is_some() {
-                    "message"
-                } else {
+                source = if job.is_slash_command() {
                     "command"
+                } else {
+                    "message"
                 }
             );
 
@@ -644,28 +681,34 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                     queue_depth = queue_depth_at_start,
                     "Job started"
                 );
-                let reply_message_id =
+                let reply_message_id = if job.is_slash_command() {
+                    None
+                } else {
                     discord::send_processing(&app.discord, job.channel_id, job.source_message_id)
-                        .await;
+                        .await
+                };
 
-                let (progress_tx, progress_rx) = mpsc::channel(10);
-                let progress_updater = if let Some(msg_id) = reply_message_id {
+                let (progress_tx, progress_updater) = if let Some(msg_id) = reply_message_id {
+                    let (progress_tx, progress_rx) = mpsc::channel(10);
                     let debounce = Duration::from_secs(PROGRESS_UPDATE_DEBOUNCE_SECS);
                     // Spawn a debounced progress updater to limit API churn.
-                    Some(discord::spawn_progress_updates(
-                        Arc::clone(&app.discord),
-                        app.engine.metrics.clone(),
-                        job.channel_id,
-                        msg_id,
-                        progress_rx,
-                        debounce,
-                    ))
+                    (
+                        Some(progress_tx),
+                        Some(discord::spawn_progress_updates(
+                            Arc::clone(&app.discord),
+                            app.engine.metrics.clone(),
+                            job.channel_id,
+                            msg_id,
+                            progress_rx,
+                            debounce,
+                        )),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
 
                 let core_job = job.core();
-                let result = core_pipeline::run(core_job, &app.engine, Some(progress_tx.clone()))
+                let result = core_pipeline::run(core_job, &app.engine, progress_tx.clone())
                     .instrument(tracing::info_span!("core"))
                     .await;
 
@@ -679,29 +722,33 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             &app.discord,
                             &app.engine.permits,
                             &app.engine.config,
-                            Some(&progress_tx),
+                            progress_tx.as_ref(),
                         )
                         .instrument(tracing::info_span!("upload"))
                         .await
                         {
-                            Ok(outcome) => {
+                            Ok((outcome, upload_metrics)) => {
                                 let upload_elapsed_ms = upload_start.elapsed().as_millis() as u64;
+                                let measured_upload_ms = upload_metrics.total_duration_ms();
                                 // Record metrics and mark dedup only on success.
                                 app.engine
                                     .metrics
                                     .record_stage_duration(Stage::Upload, upload_elapsed_ms);
-                                if upload_elapsed_ms > UPLOAD_DURATION_WARN_MS {
-                                    tracing::warn!(
-                                        upload_elapsed_ms,
-                                        threshold_ms = UPLOAD_DURATION_WARN_MS,
-                                        "Upload duration exceeded warning threshold"
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        upload_elapsed_ms,
-                                        "Upload completed within threshold"
-                                    );
-                                }
+                                let effective_throughput_bytes_per_sec =
+                                    upload_metrics.effective_throughput_bytes_per_sec();
+                                tracing::info!(
+                                    upload_elapsed_ms,
+                                    measured_upload_ms,
+                                    attachment_prepare_ms = upload_metrics.attachment_prepare_ms,
+                                    http_send_ms = upload_metrics.http_send_ms,
+                                    response_parse_ms = upload_metrics.response_parse_ms,
+                                    post_upload_cleanup_ms = upload_metrics.post_upload_cleanup_ms,
+                                    payload_bytes = upload_metrics.payload_bytes,
+                                    request_count = upload_metrics.request_count,
+                                    effective_throughput_bytes_per_sec,
+                                    "Upload completed"
+                                );
+                                warn_on_slow_upload(upload_elapsed_ms, &upload_metrics);
                                 app.engine.metrics.record_success();
                                 app.engine
                                     .dedup
@@ -751,6 +798,14 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             )
                             .await;
                         }
+                        if let Some(interaction_response) = job.interaction_response.as_ref() {
+                            discord::cleanup_interaction_response(
+                                &app.discord,
+                                app.config.application_id,
+                                interaction_response.token(),
+                            )
+                            .await;
+                        }
 
                         tracing::info!(
                             duration_ms = elapsed_ms,
@@ -776,8 +831,23 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             diagnostics.hwacc_failures.fetch_add(1, Ordering::Relaxed);
                         }
                         log_job_failure_diagnostics(&error, job_started_at.elapsed());
-                        discord::send_error(&app.discord, job.channel_id, reply_message_id, &error)
+                        if let Some(interaction_response) = job.interaction_response.as_ref() {
+                            discord::send_interaction_error(
+                                &app.discord,
+                                app.config.application_id,
+                                interaction_response.token(),
+                                &error,
+                            )
                             .await;
+                        } else {
+                            discord::send_error(
+                                &app.discord,
+                                job.channel_id,
+                                reply_message_id,
+                                &error,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
