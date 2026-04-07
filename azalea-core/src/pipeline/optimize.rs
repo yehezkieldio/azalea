@@ -1459,12 +1459,12 @@ mod tests {
 
     use super::{
         BitrateParams, SplitCopyPlan, SplitTranscodeProgress, TranscodeContext, TranscodeStrategy,
-        build_strategy_plan, execute_with_hwacc_fallback, optimize, send_progress_best_effort,
-        split_copy_is_plausible, split_parallel, split_parallel_is_plausible, split_serial,
-        try_split_copy,
+        build_strategy_plan, execute_with_hwacc_fallback, optimize, predict_resolution,
+        send_progress_best_effort, split_copy_is_plausible, split_parallel,
+        split_parallel_is_plausible, split_serial, try_split_copy,
     };
     use crate::concurrency::Permits;
-    use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings};
+    use crate::config::{EngineSettings, HardwareAcceleration, QualityPreset, TranscodeSettings};
     use crate::engine::TranscodeRuntime;
     use crate::media::TempFileCleanup;
     use crate::pipeline::errors::Error;
@@ -1787,6 +1787,17 @@ mod tests {
         );
 
         assert!(split_parallel_is_plausible(&downloaded, 6, &config));
+    }
+
+    #[test]
+    fn aggressive_predict_resolution_downshifts_when_fast_path_would_preserve_480p() {
+        let config = EngineSettings::default();
+
+        let fast = predict_resolution(60.0, Some((854, 480)), &config, QualityPreset::Fast);
+        let size = predict_resolution(60.0, Some((854, 480)), &config, QualityPreset::Size);
+
+        assert_eq!(fast, None);
+        assert_eq!(size, Some(240));
     }
 
     #[tokio::test]

@@ -183,17 +183,35 @@ impl Ladder {
             .map(|&(h, _)| h)
             .unwrap_or(240);
 
-        let mut target_height = match source_height {
-            Some(src_h) if src_h <= max_supported_height => None,
+        let target_height = match source_height {
             Some(src_h) => {
-                // Clamp to the largest tier below the source height.
-                let best = Self::TIERS
-                    .iter()
-                    .filter(|&&(h, min_kbps)| h <= src_h && video_bitrate_kbps >= min_kbps)
-                    .map(|&(h, _)| h)
-                    .next()
-                    .unwrap_or(240);
-                Some(best)
+                let capped_height = if src_h <= max_supported_height {
+                    src_h
+                } else {
+                    // Clamp to the largest tier below the source height.
+                    Self::TIERS
+                        .iter()
+                        .filter(|&&(h, min_kbps)| h <= src_h && video_bitrate_kbps >= min_kbps)
+                        .map(|&(h, _)| h)
+                        .next()
+                        .unwrap_or(240)
+                };
+
+                let recommended_height = match quality_preset {
+                    // The size fallback should still get more aggressive even when
+                    // the source already sits under the bitrate tier. Otherwise the
+                    // "aggressive" retry can be identical to the balanced path and
+                    // force an unnecessary split.
+                    QualityPreset::Size => Self::downshift_height(capped_height, 2),
+                    QualityPreset::Fast if src_h > max_supported_height => {
+                        Self::downshift_height(capped_height, 1)
+                    }
+                    QualityPreset::Fast | QualityPreset::Balanced | QualityPreset::Quality => {
+                        capped_height
+                    }
+                };
+
+                (recommended_height < src_h).then_some(recommended_height)
             }
             None => {
                 // Without source resolution, only downscale for low bitrates.
@@ -204,19 +222,6 @@ impl Ladder {
                 }
             }
         };
-
-        if let Some(height) = target_height {
-            let downshift = match quality_preset {
-                QualityPreset::Size => 2,
-                QualityPreset::Fast => 1,
-                QualityPreset::Balanced | QualityPreset::Quality => 0,
-            };
-
-            if downshift > 0 {
-                // Apply preset-specific downshift to bias toward size.
-                target_height = Some(Self::downshift_height(height, downshift));
-            }
-        }
 
         Recommendation { target_height }
     }
@@ -448,6 +453,15 @@ mod tests {
 
         assert_eq!(balanced.target_height, Some(720));
         assert_eq!(size.target_height, Some(360));
+    }
+
+    #[test]
+    fn ladder_size_preset_downshifts_even_when_source_is_within_supported_tier() {
+        let fast = Ladder::recommend(Some(480), 675, QualityPreset::Fast);
+        let size = Ladder::recommend(Some(480), 675, QualityPreset::Size);
+
+        assert_eq!(fast.target_height, None);
+        assert_eq!(size.target_height, Some(240));
     }
 
     proptest! {
