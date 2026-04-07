@@ -69,6 +69,43 @@ const JOB_DURATION_WARN_MS: u64 = 45_000;
 const UPLOAD_DURATION_WARN_MS: u64 = 20_000;
 const QUEUE_DEPTH_WARN_THRESHOLD: usize = 80;
 
+fn warn_on_slow_upload(upload_elapsed_ms: u64, upload_metrics: &pipeline::upload::Metrics) {
+    let measured_upload_ms = upload_metrics.total_duration_ms();
+    if upload_elapsed_ms > UPLOAD_DURATION_WARN_MS {
+        let (slow_stage, slow_stage_elapsed_ms) = upload_metrics.slowest_stage();
+        tracing::warn!(
+            upload_elapsed_ms,
+            measured_upload_ms,
+            threshold_ms = UPLOAD_DURATION_WARN_MS,
+            slow_stage,
+            slow_stage_elapsed_ms,
+            attachment_prepare_ms = upload_metrics.attachment_prepare_ms,
+            http_send_ms = upload_metrics.http_send_ms,
+            response_parse_ms = upload_metrics.response_parse_ms,
+            post_upload_cleanup_ms = upload_metrics.post_upload_cleanup_ms,
+            payload_bytes = upload_metrics.payload_bytes,
+            request_count = upload_metrics.request_count,
+            effective_throughput_bytes_per_sec =
+                upload_metrics.effective_throughput_bytes_per_sec(),
+            "Upload duration exceeded warning threshold"
+        );
+    } else {
+        tracing::debug!(
+            upload_elapsed_ms,
+            measured_upload_ms,
+            attachment_prepare_ms = upload_metrics.attachment_prepare_ms,
+            http_send_ms = upload_metrics.http_send_ms,
+            response_parse_ms = upload_metrics.response_parse_ms,
+            post_upload_cleanup_ms = upload_metrics.post_upload_cleanup_ms,
+            payload_bytes = upload_metrics.payload_bytes,
+            request_count = upload_metrics.request_count,
+            effective_throughput_bytes_per_sec =
+                upload_metrics.effective_throughput_bytes_per_sec(),
+            "Upload completed within threshold"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RateLimitScope {
     User,
@@ -690,24 +727,28 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                         .instrument(tracing::info_span!("upload"))
                         .await
                         {
-                            Ok(outcome) => {
+                            Ok((outcome, upload_metrics)) => {
                                 let upload_elapsed_ms = upload_start.elapsed().as_millis() as u64;
+                                let measured_upload_ms = upload_metrics.total_duration_ms();
                                 // Record metrics and mark dedup only on success.
                                 app.engine
                                     .metrics
                                     .record_stage_duration(Stage::Upload, upload_elapsed_ms);
-                                if upload_elapsed_ms > UPLOAD_DURATION_WARN_MS {
-                                    tracing::warn!(
-                                        upload_elapsed_ms,
-                                        threshold_ms = UPLOAD_DURATION_WARN_MS,
-                                        "Upload duration exceeded warning threshold"
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        upload_elapsed_ms,
-                                        "Upload completed within threshold"
-                                    );
-                                }
+                                let effective_throughput_bytes_per_sec =
+                                    upload_metrics.effective_throughput_bytes_per_sec();
+                                tracing::info!(
+                                    upload_elapsed_ms,
+                                    measured_upload_ms,
+                                    attachment_prepare_ms = upload_metrics.attachment_prepare_ms,
+                                    http_send_ms = upload_metrics.http_send_ms,
+                                    response_parse_ms = upload_metrics.response_parse_ms,
+                                    post_upload_cleanup_ms = upload_metrics.post_upload_cleanup_ms,
+                                    payload_bytes = upload_metrics.payload_bytes,
+                                    request_count = upload_metrics.request_count,
+                                    effective_throughput_bytes_per_sec,
+                                    "Upload completed"
+                                );
+                                warn_on_slow_upload(upload_elapsed_ms, &upload_metrics);
                                 app.engine.metrics.record_success();
                                 app.engine
                                     .dedup

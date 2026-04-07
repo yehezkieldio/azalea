@@ -31,6 +31,44 @@ use twilight_model::http::attachment::Attachment;
 
 const MAX_ATTACHMENTS_PER_REQUEST: usize = 10;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Metrics {
+    pub attachment_prepare_ms: u64,
+    pub http_send_ms: u64,
+    pub response_parse_ms: u64,
+    pub post_upload_cleanup_ms: u64,
+    pub payload_bytes: u64,
+    pub request_count: usize,
+}
+
+impl Metrics {
+    pub fn total_duration_ms(self) -> u64 {
+        self.attachment_prepare_ms
+            .saturating_add(self.http_send_ms)
+            .saturating_add(self.response_parse_ms)
+            .saturating_add(self.post_upload_cleanup_ms)
+    }
+
+    pub fn effective_throughput_bytes_per_sec(self) -> Option<f64> {
+        (self.http_send_ms > 0)
+            .then(|| self.payload_bytes as f64 / (self.http_send_ms as f64 / 1000.0))
+    }
+
+    pub fn slowest_stage(self) -> (&'static str, u64) {
+        let stages = [
+            ("attachment_preparation", self.attachment_prepare_ms),
+            ("http_send", self.http_send_ms),
+            ("response_parsing", self.response_parse_ms),
+            ("post_upload_cleanup", self.post_upload_cleanup_ms),
+        ];
+
+        stages
+            .into_iter()
+            .max_by_key(|(_, elapsed_ms)| *elapsed_ms)
+            .unwrap_or(("attachment_preparation", 0))
+    }
+}
+
 /// Upload prepared media, chaining messages when multiple parts are required.
 ///
 /// ## Preconditions
@@ -47,7 +85,7 @@ pub async fn upload(
     permits: &Permits,
     config: &EngineSettings,
     progress_tx: Option<&mpsc::Sender<Progress>>,
-) -> Result<UploadOutcome, Error> {
+) -> Result<(UploadOutcome, Metrics), Error> {
     tracing::trace!("Entered upload stage");
     tracing::info!("Starting upload");
     let _permit = permits.upload.acquire().await.map_err(|_| {
@@ -84,7 +122,7 @@ async fn upload_parts(
     discord: &Client,
     config: &EngineSettings,
     progress_tx: Option<&mpsc::Sender<Progress>>,
-) -> Result<UploadOutcome, Error> {
+) -> Result<(UploadOutcome, Metrics), Error> {
     if parts.is_empty() {
         return Err(Error::UploadFailed {
             part: 0,
@@ -119,9 +157,10 @@ async fn upload_parts_sequential(
     discord: &Client,
     config: &EngineSettings,
     progress_tx: Option<&mpsc::Sender<Progress>>,
-) -> Result<UploadOutcome, Error> {
+) -> Result<(UploadOutcome, Metrics), Error> {
     let total_files = parts.len();
     let mut first_message_id = None;
+    let mut metrics = Metrics::default();
 
     for (index, part) in parts.iter().enumerate() {
         if let Some(tx) = progress_tx {
@@ -133,8 +172,15 @@ async fn upload_parts_sequential(
             let _ = tx.send(stage).await;
         }
 
+        let prepare_start = std::time::Instant::now();
         let attachment =
             build_attachment(part, config, tweet_id, index + 1, total_files, 0).await?;
+        metrics.attachment_prepare_ms = metrics
+            .attachment_prepare_ms
+            .saturating_add(prepare_start.elapsed().as_millis() as u64);
+        metrics.payload_bytes = metrics
+            .payload_bytes
+            .saturating_add(attachment_payload_bytes(std::slice::from_ref(&attachment)));
 
         let ctx = UploadRetryContext {
             discord,
@@ -143,19 +189,25 @@ async fn upload_parts_sequential(
             total: total_files,
         };
 
-        let response = send_with_retry(&ctx, std::slice::from_ref(&attachment))
+        let (response, http_send_ms) = send_with_retry(&ctx, std::slice::from_ref(&attachment))
             .instrument(tracing::info_span!(
                 "upload_part",
                 part = index + 1,
                 total = total_files
             ))
             .await?;
+        metrics.http_send_ms = metrics.http_send_ms.saturating_add(http_send_ms);
+        metrics.request_count = metrics.request_count.saturating_add(1);
 
+        let parse_start = std::time::Instant::now();
         let message = response.model().await.map_err(|e| Error::UploadFailed {
             part: index + 1,
             total: total_files,
             source: Box::new(e),
         })?;
+        metrics.response_parse_ms = metrics
+            .response_parse_ms
+            .saturating_add(parse_start.elapsed().as_millis() as u64);
 
         if first_message_id.is_none() {
             first_message_id = Some(MessageId::from(message.id));
@@ -166,19 +218,29 @@ async fn upload_parts_sequential(
             message_id = message.id.get(),
             "Upload part complete"
         );
+
+        let cleanup_start = std::time::Instant::now();
+        drop(message);
+        drop(attachment);
+        metrics.post_upload_cleanup_ms = metrics
+            .post_upload_cleanup_ms
+            .saturating_add(cleanup_start.elapsed().as_millis() as u64);
     }
 
-    Ok(UploadOutcome {
-        first_message_id: first_message_id.ok_or_else(|| Error::UploadFailed {
-            part: 0,
-            total: total_files,
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "upload produced no messages",
-            )),
-        })?,
-        messages_sent: total_files,
-    })
+    Ok((
+        UploadOutcome {
+            first_message_id: first_message_id.ok_or_else(|| Error::UploadFailed {
+                part: 0,
+                total: total_files,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "upload produced no messages",
+                )),
+            })?,
+            messages_sent: total_files,
+        },
+        metrics,
+    ))
 }
 
 async fn upload_parts_batched(
@@ -188,14 +250,16 @@ async fn upload_parts_batched(
     discord: &Client,
     config: &EngineSettings,
     progress_tx: Option<&mpsc::Sender<Progress>>,
-) -> Result<UploadOutcome, Error> {
+) -> Result<(UploadOutcome, Metrics), Error> {
     let total_files = parts.len();
     let total_batches = batch_request_count(total_files);
     let mut first_message_id = None;
+    let mut metrics = Metrics::default();
 
     for (batch_index, batch_parts) in parts.chunks(MAX_ATTACHMENTS_PER_REQUEST).enumerate() {
         let batch_start = batch_index * MAX_ATTACHMENTS_PER_REQUEST;
         let batch_end = batch_start + batch_parts.len();
+        let prepare_start = std::time::Instant::now();
         let attachments = build_attachments(
             batch_parts,
             config,
@@ -205,6 +269,12 @@ async fn upload_parts_batched(
             progress_tx,
         )
         .await?;
+        metrics.attachment_prepare_ms = metrics
+            .attachment_prepare_ms
+            .saturating_add(prepare_start.elapsed().as_millis() as u64);
+        metrics.payload_bytes = metrics
+            .payload_bytes
+            .saturating_add(attachment_payload_bytes(&attachments));
         let ctx = UploadRetryContext {
             discord,
             channel_id,
@@ -212,7 +282,7 @@ async fn upload_parts_batched(
             total: total_files,
         };
 
-        let response = send_with_retry(&ctx, &attachments)
+        let (response, http_send_ms) = send_with_retry(&ctx, &attachments)
             .instrument(tracing::info_span!(
                 "upload_batch",
                 batch = batch_index + 1,
@@ -222,11 +292,17 @@ async fn upload_parts_batched(
                 batch_end
             ))
             .await?;
+        metrics.http_send_ms = metrics.http_send_ms.saturating_add(http_send_ms);
+        metrics.request_count = metrics.request_count.saturating_add(1);
+        let parse_start = std::time::Instant::now();
         let message = response.model().await.map_err(|e| Error::UploadFailed {
             part: batch_end,
             total: total_files,
             source: Box::new(e),
         })?;
+        metrics.response_parse_ms = metrics
+            .response_parse_ms
+            .saturating_add(parse_start.elapsed().as_millis() as u64);
 
         if first_message_id.is_none() {
             first_message_id = Some(MessageId::from(message.id));
@@ -238,19 +314,29 @@ async fn upload_parts_batched(
             message_id = message.id.get(),
             "Batch upload complete"
         );
+
+        let cleanup_start = std::time::Instant::now();
+        drop(message);
+        drop(attachments);
+        metrics.post_upload_cleanup_ms = metrics
+            .post_upload_cleanup_ms
+            .saturating_add(cleanup_start.elapsed().as_millis() as u64);
     }
 
-    Ok(UploadOutcome {
-        first_message_id: first_message_id.ok_or_else(|| Error::UploadFailed {
-            part: 0,
-            total: total_files,
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "upload produced no messages",
-            )),
-        })?,
-        messages_sent: total_batches,
-    })
+    Ok((
+        UploadOutcome {
+            first_message_id: first_message_id.ok_or_else(|| Error::UploadFailed {
+                part: 0,
+                total: total_files,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "upload produced no messages",
+                )),
+            })?,
+            messages_sent: total_batches,
+        },
+        metrics,
+    ))
 }
 
 fn file_size_checked_from_metadata(
@@ -543,10 +629,17 @@ struct UploadRetryContext<'a> {
 async fn send_with_retry(
     ctx: &UploadRetryContext<'_>,
     attachments: &[Attachment],
-) -> Result<twilight_http::Response<twilight_model::channel::Message>, Error> {
+) -> Result<
+    (
+        twilight_http::Response<twilight_model::channel::Message>,
+        u64,
+    ),
+    Error,
+> {
     const MAX_RETRIES: usize = 3;
 
     let mut attempt = 0usize;
+    let send_start = std::time::Instant::now();
     loop {
         tracing::trace!(
             part = ctx.part,
@@ -563,14 +656,16 @@ async fn send_with_retry(
             .await
         {
             Ok(response) => {
+                let http_send_ms = send_start.elapsed().as_millis() as u64;
                 tracing::info!(
                     part = ctx.part,
                     total = ctx.total,
                     attempt = attempt + 1,
                     attachments = attachments.len(),
+                    http_send_ms,
                     "Upload request succeeded"
                 );
-                return Ok(response);
+                return Ok((response, http_send_ms));
             }
             Err(err) => {
                 // Retry only for transient errors with a bounded backoff.
@@ -598,6 +693,13 @@ async fn send_with_retry(
             }
         }
     }
+}
+
+fn attachment_payload_bytes(attachments: &[Attachment]) -> u64 {
+    attachments
+        .iter()
+        .map(|attachment| attachment.file.len() as u64)
+        .sum()
 }
 
 /// Decide whether an upload error is worth retrying and compute backoff.
@@ -939,9 +1041,9 @@ mod tests {
 
         let attachment = match build_attachment(&part, &config, TweetId(7), 1, 1, 0).await {
             Ok(attachment) => attachment,
-            Err(error) => panic!(
-                "memory-backed payload should upload without reopening file: {error}"
-            ),
+            Err(error) => {
+                panic!("memory-backed payload should upload without reopening file: {error}")
+            }
         };
 
         assert_eq!(attachment.filename, "tweet_7.mp4");
