@@ -10,6 +10,6 @@ mod responder;
 
 pub use commands::{handle_interaction, register};
 pub use responder::{
-    cleanup_processing, delete_original, send_error, send_interaction_error, send_processing,
-    spawn_progress_updates,
+    cleanup_interaction_response, cleanup_processing, delete_original, send_error,
+    send_interaction_error, send_processing, spawn_progress_updates,
 };

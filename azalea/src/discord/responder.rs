@@ -177,6 +177,21 @@ pub async fn send_interaction_error(
     }
 }
 
+/// Remove a deferred interaction response once the command has completed.
+pub async fn cleanup_interaction_response(
+    client: &Client,
+    application_id: ApplicationId,
+    token: &str,
+) {
+    if let Err(error) = client
+        .interaction(application_id.into())
+        .delete_response(token)
+        .await
+    {
+        tracing::warn!(error = %error, "Failed to delete interaction response");
+    }
+}
+
 /// Remove the temporary "processing" message after completion.
 pub async fn cleanup_processing(client: &Client, channel_id: ChannelId, message_id: MessageId) {
     if let Err(e) = client

@@ -798,6 +798,14 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                             )
                             .await;
                         }
+                        if let Some(interaction_response) = job.interaction_response.as_ref() {
+                            discord::cleanup_interaction_response(
+                                &app.discord,
+                                app.config.application_id,
+                                interaction_response.token(),
+                            )
+                            .await;
+                        }
 
                         tracing::info!(
                             duration_ms = elapsed_ms,
