@@ -33,6 +33,7 @@ use config::AppConfig;
 use mimalloc::MiMalloc;
 use std::{
     collections::hash_map::DefaultHasher,
+    future::Future,
     hash::{Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
@@ -43,6 +44,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{process::Command, sync::mpsc, task::JoinSet};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use twilight_gateway::{ConfigBuilder, queue::InMemoryQueue};
 use twilight_http::Client;
@@ -398,7 +400,12 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
     let (job_sender, job_receiver) = mpsc::channel(JOB_QUEUE_CAPACITY);
     // Pipeline worker runs independently of gateway shards.
     let app_for_worker = app.clone();
-    let pipeline_worker = tokio::spawn(run_pipeline_worker(app_for_worker, job_receiver));
+    let force_pipeline_shutdown = CancellationToken::new();
+    let mut pipeline_worker = tokio::spawn(run_pipeline_worker(
+        app_for_worker,
+        job_receiver,
+        force_pipeline_shutdown.clone(),
+    ));
 
     let mut shard_set = JoinSet::new();
     for shard in shards {
@@ -418,15 +425,12 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
         signal = shutdown_signal.name(),
         "shutting down; send another shutdown signal to abort"
     );
+    let forced_signal = shutdown::wait_for_shutdown_signal();
+    tokio::pin!(forced_signal);
 
     let mut resume_info = Vec::new();
-    let forced_shutdown = tokio::select! {
-        signal = shutdown::wait_for_shutdown_signal() => {
-            let signal = signal?;
-            tracing::warn!(signal = signal.name(), "forced shutdown requested");
-            true
-        }
-        _ = async {
+    let mut forced_shutdown =
+        wait_for_completion_or_forced_shutdown(forced_signal.as_mut(), async {
             while let Some(result) = shard_set.join_next().await {
                 match result {
                     Ok(info) => resume_info.push(info),
@@ -439,10 +443,12 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
                     }
                 }
             }
-        } => false,
-    };
+        })
+        .await?
+        .is_none();
 
     if forced_shutdown {
+        force_pipeline_shutdown.cancel();
         shard_set.abort_all();
         while let Some(result) = shard_set.join_next().await {
             if let Err(error) = result {
@@ -454,16 +460,19 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
 
     drop(job_sender);
     if forced_shutdown {
-        // On forced shutdown, abort pipeline tasks with a timeout.
-        pipeline_worker.abort();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(SHUTDOWN_STEP_TIMEOUT_SECS),
-            pipeline_worker,
-        )
-        .await;
+        wait_for_forced_pipeline_shutdown(&mut pipeline_worker, &force_pipeline_shutdown).await;
     } else {
-        // Graceful shutdown: wait for the pipeline worker to finish.
-        let _ = pipeline_worker.await;
+        match wait_for_completion_or_forced_shutdown(forced_signal.as_mut(), &mut pipeline_worker)
+            .await?
+        {
+            None => {
+                forced_shutdown = true;
+                wait_for_forced_pipeline_shutdown(&mut pipeline_worker, &force_pipeline_shutdown)
+                    .await;
+            }
+            Some(Ok(())) => {}
+            Some(Err(error)) => log_pipeline_worker_join_error(error),
+        }
     }
 
     tracing::info!(
@@ -499,6 +508,55 @@ async fn async_main(config: AppConfig, token: String) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn wait_for_completion_or_forced_shutdown<T, F, G>(
+    mut forced_signal: std::pin::Pin<&mut F>,
+    action: G,
+) -> std::io::Result<Option<T>>
+where
+    F: Future<Output = std::io::Result<shutdown::ShutdownSignal>>,
+    G: Future<Output = T>,
+{
+    tokio::pin!(action);
+
+    tokio::select! {
+        signal = &mut forced_signal => {
+            let signal = signal?;
+            tracing::warn!(signal = signal.name(), "forced shutdown requested");
+            Ok(None)
+        }
+        result = &mut action => Ok(Some(result)),
+    }
+}
+
+async fn wait_for_forced_pipeline_shutdown(
+    pipeline_worker: &mut tokio::task::JoinHandle<()>,
+    force_pipeline_shutdown: &CancellationToken,
+) {
+    force_pipeline_shutdown.cancel();
+    let timeout = Duration::from_secs(SHUTDOWN_STEP_TIMEOUT_SECS);
+
+    match tokio::time::timeout(timeout, &mut *pipeline_worker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log_pipeline_worker_join_error(error),
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = SHUTDOWN_STEP_TIMEOUT_SECS,
+                "Pipeline worker did not stop after forced shutdown; aborting task"
+            );
+            pipeline_worker.abort();
+            let _ = tokio::time::timeout(timeout, &mut *pipeline_worker).await;
+        }
+    }
+}
+
+fn log_pipeline_worker_join_error(error: tokio::task::JoinError) {
+    if error.is_panic() {
+        tracing::error!(error = %error, "Pipeline worker panicked");
+    } else {
+        tracing::warn!(error = %error, "Pipeline worker cancelled");
+    }
 }
 
 fn validate_temp_dir_writable(temp_dir: &Path) -> anyhow::Result<()> {
@@ -613,7 +671,11 @@ fn raise_fd_limit() {
 /// ## Concurrency assumptions
 /// This loop owns the receiver; each job is processed in a task under the
 /// pipeline semaphore.
-async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Job>) {
+async fn run_pipeline_worker(
+    app: App,
+    mut receiver: mpsc::Receiver<pipeline::Job>,
+    force_shutdown: CancellationToken,
+) {
     tracing::info!(
         max_concurrency = app.engine.config.concurrency.pipeline.max(1),
         queue_warn_threshold = QUEUE_DEPTH_WARN_THRESHOLD,
@@ -631,7 +693,32 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
         }
     };
 
-    while let Some(job) = receiver.recv().await {
+    'worker: loop {
+        if force_shutdown.is_cancelled() {
+            break;
+        }
+
+        if join_set.len() >= max_concurrency {
+            tokio::select! {
+                _ = force_shutdown.cancelled() => break,
+                result = join_set.join_next() => {
+                    match result {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => log_join_error(error),
+                        None => break,
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let Some(job) = (tokio::select! {
+            _ = force_shutdown.cancelled() => None,
+            maybe_job = receiver.recv() => maybe_job,
+        }) else {
+            break;
+        };
+
         let app = app.clone();
         let diagnostics = Arc::clone(&diagnostics);
         let queue_guard = QueueDepthGuard::new(Arc::clone(&app.queue_depth));
@@ -643,10 +730,13 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
                 "Queue depth is approaching capacity"
             );
         }
-        let permit = match Arc::clone(&app.engine.permits.pipeline)
-            .acquire_owned()
-            .await
-        {
+        let permit = match tokio::select! {
+            _ = force_shutdown.cancelled() => {
+                drop(queue_guard);
+                break 'worker;
+            }
+            permit = Arc::clone(&app.engine.permits.pipeline).acquire_owned() => permit,
+        } {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::warn!("Pipeline semaphore closed");
@@ -854,15 +944,14 @@ async fn run_pipeline_worker(app: App, mut receiver: mpsc::Receiver<pipeline::Jo
             .instrument(span)
             .await
         });
+    }
 
-        // Cap parallel pipeline runs; backpressure is handled by the channel.
-        while join_set.len() >= max_concurrency {
-            match join_set.join_next().await {
-                Some(Ok(())) => {}
-                Some(Err(error)) => log_join_error(error),
-                None => break,
-            }
-        }
+    if force_shutdown.is_cancelled() {
+        tracing::warn!(
+            in_flight_jobs = join_set.len(),
+            "Forced shutdown requested; aborting pipeline jobs"
+        );
+        join_set.abort_all();
     }
 
     while let Some(result) = join_set.join_next().await {
@@ -1605,5 +1694,33 @@ mod tests {
             warning,
             StartupConfigWarning::SoftwareTranscodeCpuOversubscribed { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn wait_for_completion_or_forced_shutdown_returns_result_when_work_finishes() {
+        let forced_signal = std::future::pending::<std::io::Result<shutdown::ShutdownSignal>>();
+        tokio::pin!(forced_signal);
+
+        let result =
+            wait_for_completion_or_forced_shutdown(forced_signal.as_mut(), async { 42_u8 })
+                .await
+                .expect("helper should not fail");
+
+        assert_eq!(result, Some(42));
+    }
+
+    #[tokio::test]
+    async fn wait_for_completion_or_forced_shutdown_returns_none_when_forced_signal_arrives() {
+        let forced_signal = std::future::ready(Ok(shutdown::ShutdownSignal::CtrlC));
+        tokio::pin!(forced_signal);
+
+        let result = wait_for_completion_or_forced_shutdown(
+            forced_signal.as_mut(),
+            std::future::pending::<u8>(),
+        )
+        .await
+        .expect("helper should not fail");
+
+        assert_eq!(result, None);
     }
 }
