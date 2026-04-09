@@ -1554,7 +1554,9 @@ mod tests {
     #[tokio::test]
     async fn pass_through_preserves_in_memory_upload_payload() {
         let temp_files = TempFileCleanup::new();
-        let path = unique_temp_path("pass-through-upload-bytes.mp4");
+        let temp_dir = unique_temp_path("pass-through-upload-bytes-dir");
+        fs::create_dir_all(&temp_dir).expect("create pass-through fixture dir");
+        let path = temp_dir.join("input.mp4");
         let payload = b"already-uploadable".to_vec();
         fs::write(&path, &payload).expect("write pass-through fixture");
 
@@ -1571,6 +1573,7 @@ mod tests {
             &temp_files,
         );
         downloaded.upload_ready_bytes = Some(Arc::<[u8]>::from(payload.clone()));
+        downloaded._dir_guard = Some(temp_files.guard(temp_dir.clone()));
 
         let resolved = ResolvedMedia {
             url: "https://example.com/media.mp4".into(),

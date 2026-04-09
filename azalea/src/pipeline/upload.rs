@@ -795,7 +795,18 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("azalea-upload-{label}-{nanos}-{sequence}"))
+        let label_path = Path::new(label);
+        let stem = label_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(label);
+        let extension = label_path.extension().and_then(|value| value.to_str());
+        let filename = match extension {
+            Some(extension) => format!("azalea-upload-{stem}-{nanos}-{sequence}.{extension}"),
+            None => format!("azalea-upload-{stem}-{nanos}-{sequence}"),
+        };
+
+        std::env::temp_dir().join(filename)
     }
 
     fn write_temp_file(label: &str, bytes: &[u8]) -> PathBuf {
