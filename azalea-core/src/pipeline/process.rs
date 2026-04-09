@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
 const MAX_STDERR_LINE_BYTES: usize = 4096;
+const STDERR_DRAIN_TIMEOUT_SECS: u64 = 2;
 
 pub(crate) struct BoundedRead {
     pub(crate) data: Vec<u8>,
@@ -237,14 +238,42 @@ pub(crate) async fn run_json_subprocess(
             .await
             .map_err(JsonSubprocessError::Io)
     };
-    let stderr = async {
-        read_stderr_tail(stderr, stderr_lines)
-            .await
-            .map_err(JsonSubprocessError::Io)
-    };
+    let mut stderr_handle =
+        tokio::spawn(async move { read_stderr_tail(stderr, stderr_lines).await });
     let process = supervise_json_subprocess(guard, timeout, &mut limit_rx);
 
-    let (stdout, stderr_tail, status) = tokio::try_join!(stdout, stderr, process)?;
+    let (stdout, status) = match tokio::try_join!(stdout, process) {
+        Ok(result) => result,
+        Err(error) => {
+            stderr_handle.abort();
+            return Err(error);
+        }
+    };
+    let stderr_tail = match tokio::time::timeout(
+        Duration::from_secs(STDERR_DRAIN_TIMEOUT_SECS),
+        &mut stderr_handle,
+    )
+    .await
+    {
+        Ok(Ok(Ok(stderr_tail))) => stderr_tail,
+        Ok(Ok(Err(error))) => return Err(JsonSubprocessError::Io(error)),
+        Ok(Err(_)) => {
+            return Err(JsonSubprocessError::Io(std::io::Error::other(
+                "stderr task failed",
+            )));
+        }
+        Err(_) => {
+            warn!(
+                drain_timeout_secs = STDERR_DRAIN_TIMEOUT_SECS,
+                "subprocess stderr drain timed out"
+            );
+            stderr_handle.abort();
+            return Err(JsonSubprocessError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "stderr drain timed out",
+            )));
+        }
+    };
     let Some(status) = status.filter(|_| !stdout.exceeded) else {
         return Err(JsonSubprocessError::OutputLimit { stderr_tail });
     };
@@ -611,5 +640,24 @@ mod tests {
         if let JsonSubprocessError::OutputLimit { stderr_tail } = error {
             assert!(stderr_tail.contains("overflow"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_json_subprocess_times_out_stderr_drain_when_background_writer_lingers() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "(sleep 10) >&2 & printf 'ok'"]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(STDERR_DRAIN_TIMEOUT_SECS + 1),
+            run_json_subprocess(&mut command, Duration::from_secs(1), 1024, 4),
+        )
+        .await
+        .expect("subprocess wrapper should not hang on lingering stderr writer");
+
+        let error = result.expect_err("lingering stderr writer should time out drain");
+        assert!(
+            matches!(error, JsonSubprocessError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut)
+        );
     }
 }

@@ -20,7 +20,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tracing::{Instrument as _, debug, trace, warn};
+use tracing::{Instrument as _, debug, info, trace, warn};
 
 /// Small-vector argument list to avoid heap allocations for common cases.
 ///
@@ -31,6 +31,8 @@ pub type Args = SmallVec<[OsString; 40]>;
 const MAX_FFMPEG_KBPS: u64 = 100_000;
 const FFMPEG_ERROR_STDERR_TAIL_LINES: usize = 10;
 const FFMPEG_SUCCESS_STDERR_TAIL_LINES: usize = 20;
+const STDERR_DRAIN_TIMEOUT_SECS: u64 = 2;
+const PROGRESS_HEARTBEAT_SECS: u64 = 30;
 
 fn clamp_kbps(value: u64) -> u64 {
     value.min(MAX_FFMPEG_KBPS)
@@ -476,10 +478,11 @@ pub async fn execute(
             .take()
             .ok_or_else(|| Error::Io(std::io::Error::other("ffmpeg stderr missing")))?;
 
-        let stderr_handle =
+        let mut stderr_handle =
             tokio::spawn(async move { read_bounded(stderr, FFMPEG_STDERR_LIMIT, None).await });
 
         let start_time = std::time::Instant::now();
+        let mut last_heartbeat = start_time;
         let mut reader = BufReader::new(stdout).lines();
 
         // Drain ffmpeg progress output to avoid stdout pipe backpressure.
@@ -506,7 +509,18 @@ pub async fn execute(
                 Ok(Ok(Some(_))) => {}
                 Ok(Ok(None)) => break,
                 Ok(Err(_)) => break,
-                Err(_) => continue,
+                Err(_) => {
+                    if last_heartbeat.elapsed() >= Duration::from_secs(PROGRESS_HEARTBEAT_SECS) {
+                        info!(
+                            ?stage,
+                            elapsed_ms = start_time.elapsed().as_millis() as u64,
+                            timeout_ms = timeout.as_millis() as u64,
+                            "ffmpeg execution still running"
+                        );
+                        last_heartbeat = std::time::Instant::now();
+                    }
+                    continue;
+                }
             }
         }
 
@@ -534,8 +548,13 @@ pub async fn execute(
 
         // Keep error payloads compact while still surfacing ffmpeg's final
         // encoder progress lines in debug logs on successful runs.
-        let (stderr_error_tail, stderr_debug_tail) = match stderr_handle.await {
-            Ok(Ok(output)) => (
+        let (stderr_error_tail, stderr_debug_tail) = match tokio::time::timeout(
+            Duration::from_secs(STDERR_DRAIN_TIMEOUT_SECS),
+            &mut stderr_handle,
+        )
+        .await
+        {
+            Ok(Ok(Ok(output))) => (
                 format_stderr_tail(
                     &output.data,
                     FFMPEG_ERROR_STDERR_TAIL_LINES,
@@ -547,12 +566,22 @@ pub async fn execute(
                     output.exceeded,
                 ),
             ),
-            Ok(Err(e)) => {
+            Ok(Ok(Err(e))) => {
                 let error = format!("stderr read failed: {e}");
                 (error.clone(), error)
             }
+            Ok(Err(_)) => {
+                let error = "stderr task failed".to_string();
+                (error.clone(), error)
+            }
             Err(_) => {
-                let error = "unknown stderr error".to_string();
+                warn!(
+                    ?stage,
+                    drain_timeout_secs = STDERR_DRAIN_TIMEOUT_SECS,
+                    "ffmpeg stderr drain timed out"
+                );
+                stderr_handle.abort();
+                let error = "stderr drain timed out".to_string();
                 (error.clone(), error)
             }
         };

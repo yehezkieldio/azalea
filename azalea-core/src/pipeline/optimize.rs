@@ -32,6 +32,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::Instrument as _;
 
 const MIN_PLAUSIBLE_SPLIT_COPY_SEGMENT_SECS: f64 = 10.0;
+const PARALLEL_SEGMENT_HEARTBEAT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscodeOutcome {
@@ -991,6 +992,7 @@ async fn split_parallel(
 
     let mut final_segments = vec![None; total_segments];
     let mut finished = 0;
+    let mut last_heartbeat = Instant::now();
 
     for (idx, raw_segment) in raw_segments.into_iter().enumerate() {
         spawn_parallel_segment_task(
@@ -1005,6 +1007,60 @@ async fn split_parallel(
             segment_video_kbps,
             segment_audio_kbps,
         );
+    }
+
+    while finished < total_segments {
+        match tokio::time::timeout(
+            Duration::from_secs(PARALLEL_SEGMENT_HEARTBEAT_SECS),
+            join_set.join_next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(Ok((index, segment))))) => {
+                let slot = final_segments
+                    .get_mut(index)
+                    .ok_or_else(|| Error::TranscodeFailed {
+                        stage: TranscodeStage::Split,
+                        exit_code: None,
+                        stderr_tail: "parallel split reported an out-of-range segment".to_string(),
+                    })?;
+                *slot = Some(segment);
+                finished += 1;
+                last_heartbeat = Instant::now();
+                send_progress_best_effort(
+                    &progress_tx,
+                    Progress::Transcoding(finished, total_segments),
+                );
+            }
+            Ok(Some(Ok(Err(e)))) => {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                cleanup_segment_prefix(&downloaded.path, &raw_prefix).await;
+                cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
+                return Err(e);
+            }
+            Ok(Some(Err(e))) => {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                cleanup_segment_prefix(&downloaded.path, &raw_prefix).await;
+                cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
+                return Err(Error::TranscodeFailed {
+                    stage: TranscodeStage::Split,
+                    exit_code: None,
+                    stderr_tail: format!("segment task panicked: {}", e),
+                });
+            }
+            Ok(None) => break,
+            Err(_) => {
+                tracing::info!(
+                    finished_segments = finished,
+                    total_segments,
+                    remaining_segments = total_segments.saturating_sub(finished),
+                    elapsed_since_last_completion_ms = last_heartbeat.elapsed().as_millis() as u64,
+                    "Parallel segment transcode still running"
+                );
+            }
+        }
     }
 
     while let Some(res) = join_set.join_next().await {
@@ -1078,6 +1134,13 @@ fn spawn_parallel_segment_task(
     let input_path = raw_segment.path;
     let output_path = input_path.with_file_name(format!("{}_seg{:03}.mp4", stem, idx));
     join_set.spawn(async move {
+        let started_at = Instant::now();
+        tracing::info!(
+            segment_index = idx,
+            input = %input_path.display(),
+            output = %output_path.display(),
+            "Started parallel segment transcode"
+        );
         let permit = permits
             .acquire_owned()
             .await
@@ -1105,6 +1168,12 @@ fn spawn_parallel_segment_task(
         let _ = fs::remove_file(&input_path).await;
         result?;
         let size = fs::metadata(&output_path).await?.len();
+        tracing::info!(
+            segment_index = idx,
+            size_bytes = size,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "Parallel segment transcode completed"
+        );
         Ok((
             idx,
             SegmentOutput {
@@ -1143,6 +1212,15 @@ where
         Err(error) if should_retry_with_software(&error, active_settings.hardware_acceleration) => {
             let latched = transcode_runtime.activate_software_fallback();
             let retry_settings = transcode_runtime.effective_settings(base_settings);
+            let Some(retry_timeout) = remaining_timeout_budget(started_at, timeout) else {
+                tracing::warn!(
+                    ?stage,
+                    elapsed_ms = elapsed_ms(started_at),
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Hardware fallback skipped because the ffmpeg time budget was exhausted"
+                );
+                return Err(error);
+            };
 
             tracing::warn!(
                 ?stage,
@@ -1151,11 +1229,12 @@ where
                 failed_backend = %active_settings.hardware_acceleration,
                 fallback_encoder = retry_settings.hardware_acceleration.encoder(),
                 latched,
+                retry_timeout_ms = retry_timeout.as_millis() as u64,
                 "Hardware encoder failed; retrying with software encoder"
             );
 
             let retry_args = build_args(&retry_settings);
-            ffmpeg::execute(ffmpeg_path, &retry_args, timeout, stage)
+            ffmpeg::execute(ffmpeg_path, &retry_args, retry_timeout, stage)
                 .await
                 .map(|()| {
                     let outcome = TranscodeOutcome::new(
@@ -1173,6 +1252,10 @@ where
 
 fn elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis() as u64
+}
+
+fn remaining_timeout_budget(started_at: Instant, timeout: Duration) -> Option<Duration> {
+    timeout.checked_sub(started_at.elapsed())
 }
 
 fn record_transcode_outcome(
@@ -1460,8 +1543,8 @@ mod tests {
     use super::{
         BitrateParams, SplitCopyPlan, SplitTranscodeProgress, TranscodeContext, TranscodeStrategy,
         build_strategy_plan, execute_with_hwacc_fallback, optimize, predict_resolution,
-        send_progress_best_effort, split_copy_is_plausible, split_parallel,
-        split_parallel_is_plausible, split_serial, try_split_copy,
+        remaining_timeout_budget, send_progress_best_effort, split_copy_is_plausible,
+        split_parallel, split_parallel_is_plausible, split_serial, try_split_copy,
     };
     use crate::concurrency::Permits;
     use crate::config::{EngineSettings, HardwareAcceleration, QualityPreset, TranscodeSettings};
@@ -1477,7 +1560,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
 
     fn downloaded_file(path: &str, size: u64, duration: f64, facts: MediaFacts) -> DownloadedFile {
@@ -2119,5 +2202,14 @@ mod tests {
 
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn remaining_timeout_budget_returns_none_after_budget_is_exhausted() {
+        let started_at = Instant::now() - Duration::from_secs(2);
+
+        let remaining = remaining_timeout_budget(started_at, Duration::from_secs(1));
+
+        assert_eq!(remaining, None);
     }
 }
