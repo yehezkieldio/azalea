@@ -7,7 +7,33 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.4.2 (April 16, 2026)
+
+### <!-- 3 -->🚀 New Features
+- [`30dd999`](https://github.com/yehezkieldio/azalea/commit/30dd999439f4c67fb563aef5eabe548635241a97) **azalea**: Add cancellation token for forced pipeline shutdown
+- [`00e2176`](https://github.com/yehezkieldio/azalea/commit/00e21765fc612b80960919abeb1560c37c5f12eb) **pipeline**: Improve latency for pipeline and interaction by [@yehezkieldio](https://github.com/yehezkieldio) ([#18](https://github.com/yehezkieldio/azalea/issues/18))
+- [`e163327`](https://github.com/yehezkieldio/azalea/commit/e1633275d690b78bd5a4e20ee837ac01a17a97c8) **pipeline**: Improve tracing info loggings by [@yehezkieldio](https://github.com/yehezkieldio) ([#16](https://github.com/yehezkieldio/azalea/issues/16))
+- [`f5bd3cf`](https://github.com/yehezkieldio/azalea/commit/f5bd3cf800c8712f64855b73192c780520795027) **windows**: Support hardware-accelerated local runs by [@yehezkieldio](https://github.com/yehezkieldio) ([#14](https://github.com/yehezkieldio/azalea/issues/14))
+
+### <!-- 4 -->🐛 Bug Fixes
+- [`133ec05`](https://github.com/yehezkieldio/azalea/commit/133ec05da25575ba26d4f9afce77db7355753f21) **pipeline**: Add stderr drain timeouts and progress heartbeats
+- [`b3f1efd`](https://github.com/yehezkieldio/azalea/commit/b3f1efd016cfa4e23e09b77e8dbbfe7b7623d905) **pipeline**: Guard pass-through upload temp dir in tests
+- [`68fccf2`](https://github.com/yehezkieldio/azalea/commit/68fccf275e72e2ac6b6640b91be3f55d8d89440a) **pipeline**: Add -avoid_negative_ts make_zero ffmpeg arg
+- [`7482b27`](https://github.com/yehezkieldio/azalea/commit/7482b2761c971dfefdee7d90a8145c6f3300424a) **media**: Resolve tempfile guard drop to sync delete on full queue
+
+### <!-- 7 -->🚜 Refactor
+- [`8ef4f81`](https://github.com/yehezkieldio/azalea/commit/8ef4f8184567a38d4391c7525e5624ce2fa77bcd) **pipeline**: Remove batched spawner and spawn per-segment tasks
+- [`7ad7799`](https://github.com/yehezkieldio/azalea/commit/7ad7799f6ef640d447f209214f80b891d385685b) **pipeline**: Extract supervise_json_subprocess and join stdio
+- [`16d6867`](https://github.com/yehezkieldio/azalea/commit/16d68673a1bfea6e2f857c8d1c1304c145e42671) **pipeline**: Introduce parallel segment transcode context
+- [`c0663f8`](https://github.com/yehezkieldio/azalea/commit/c0663f858f0500b2a76a474d979ab28220425819) **pipeline**: Extract stderr tail into circular buffer
+
+### <!-- 99 -->🌀 Other
+- [`d1be5fb`](https://github.com/yehezkieldio/azalea/commit/d1be5fb5edbad75569f8ef4befa24a34f4534123) **pipeline**: Replace allocation with capacity limit.min(4096)
+
 ## 0.4.1 (April 2, 2026)
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`7407de7`](https://github.com/yehezkieldio/azalea/commit/7407de7c383976cd54eb867302aa1e779b6e0223) **release**: 0.4.1
 
 ### <!-- 3 -->🚀 New Features
 - [`92494c8`](https://github.com/yehezkieldio/azalea/commit/92494c83680ffa40cdc0c58a02e59ff0b3766e95) **pipeline**: Add best-effort split transcode progress reporting
