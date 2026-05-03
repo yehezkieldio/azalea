@@ -350,6 +350,65 @@ pub fn transcode_args(
     args
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn transcode_segment_args(
+    input: &Path,
+    output: &Path,
+    start_secs: f64,
+    duration_secs: f64,
+    video_kbps: u32,
+    audio_kbps: u32,
+    config: &TranscodeSettings,
+    transcode_concurrency: u32,
+) -> Args {
+    debug!(
+        hardware_acceleration = ?config.hardware_acceleration,
+        encoder = config.hardware_acceleration.encoder(),
+        start_secs,
+        duration_secs,
+        "Building ffmpeg segment transcode args"
+    );
+    let mut args = Args::new();
+    args.push("-y".into());
+
+    push_hw_device_input_args(&mut args, config, true);
+
+    args.push("-i".into());
+    args.push(input.as_os_str().into());
+    args.push("-ss".into());
+    args.push(format!("{start_secs:.3}").into());
+    args.push("-t".into());
+    args.push(format!("{duration_secs:.3}").into());
+
+    if let Some(filter) = video_filter(None, config.hardware_acceleration) {
+        args.push("-vf".into());
+        args.push(filter.into());
+    }
+
+    args.push("-c:v".into());
+    args.push(config.hardware_acceleration.encoder().into());
+
+    push_video_encoding_args(&mut args, config, video_kbps, transcode_concurrency);
+
+    args.push("-c:a".into());
+    args.push("aac".into());
+    args.push("-b:a".into());
+    args.push(format!("{}k", audio_kbps).into());
+    args.push("-ac".into());
+    args.push("2".into());
+    args.push("-force_key_frames".into());
+    args.push("expr:gte(t,0)".into());
+    args.push("-reset_timestamps".into());
+    args.push("1".into());
+    args.push("-avoid_negative_ts".into());
+    args.push("make_zero".into());
+    args.push("-movflags".into());
+    args.push("+faststart".into());
+    args.push(output.as_os_str().into());
+
+    args
+}
+
 pub fn split_args(
     input: &Path,
     pattern: &Path,
@@ -681,6 +740,35 @@ mod tests {
             as_text
                 .windows(2)
                 .any(|w| w == ["-force_key_frames", "expr:gte(t,n_forced*11.5)"])
+        );
+    }
+
+    #[test]
+    fn transcode_segment_args_seek_and_reset_segment_timestamps() {
+        let args = transcode_segment_args(
+            Path::new("input.mp4"),
+            Path::new("seg001.mp4"),
+            12.5,
+            10.0,
+            900,
+            128,
+            &TranscodeSettings::default(),
+            2,
+        );
+        let as_text = to_strings(&args);
+
+        assert!(as_text.windows(2).any(|w| w == ["-ss", "12.500"]));
+        assert!(as_text.windows(2).any(|w| w == ["-t", "10.000"]));
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-force_key_frames", "expr:gte(t,0)"])
+        );
+        assert!(as_text.windows(2).any(|w| w == ["-reset_timestamps", "1"]));
+        assert!(
+            as_text
+                .windows(2)
+                .any(|w| w == ["-avoid_negative_ts", "make_zero"])
         );
     }
 

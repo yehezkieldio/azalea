@@ -31,7 +31,6 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::Instrument as _;
 
-const MIN_PLAUSIBLE_SPLIT_COPY_SEGMENT_SECS: f64 = 10.0;
 const PARALLEL_SEGMENT_HEARTBEAT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,8 +174,6 @@ pub async fn optimize(
         aggressive_height,
         config,
     );
-    let split_copy_plan = strategy_plan.split_copy;
-
     for strategy in strategy_plan.strategies.into_iter().flatten() {
         tracing::info!(strategy = %strategy, "Using transcode strategy");
         match strategy {
@@ -271,30 +268,6 @@ pub async fn optimize(
                 }
                 downloaded._dir_guard = dir_guard;
             }
-            TranscodeStrategy::SplitCopy => {
-                let mut dir_guard = downloaded._dir_guard.take();
-                let split_copy_plan = split_copy_plan
-                    .ok_or_else(|| Error::Io(std::io::Error::other("missing split-copy plan")))?;
-                let result = try_split_copy(
-                    &downloaded,
-                    split_copy_plan,
-                    permits,
-                    temp_files,
-                    config,
-                    &mut dir_guard,
-                )
-                .instrument(tracing::info_span!(
-                    "optimize.strategy.split_copy",
-                    duration_secs = duration,
-                    segment_duration_secs = split_copy_plan.segment_duration,
-                    estimated_segments = split_copy_plan.estimated_segments
-                ))
-                .await?;
-                if let Some(result) = result {
-                    return Ok(result);
-                }
-                downloaded._dir_guard = dir_guard;
-            }
             TranscodeStrategy::SplitTranscode => {
                 let split_transcode_plan = strategy_plan.split_transcode.ok_or_else(|| {
                     Error::Io(std::io::Error::other("missing split-transcode plan"))
@@ -336,7 +309,6 @@ enum TranscodeStrategy {
     Remux,
     TranscodeBalanced,
     TranscodeAggressive,
-    SplitCopy,
     SplitTranscode,
     ImageCompress,
 }
@@ -348,7 +320,6 @@ impl std::fmt::Display for TranscodeStrategy {
             Self::Remux => "remux",
             Self::TranscodeBalanced => "transcode-balanced",
             Self::TranscodeAggressive => "transcode-aggressive",
-            Self::SplitCopy => "split-copy",
             Self::SplitTranscode => "split-transcode",
             Self::ImageCompress => "image-compress",
         };
@@ -361,14 +332,7 @@ const STRATEGY_PLAN_CAPACITY: usize = 6;
 #[derive(Debug, Clone)]
 struct StrategyPlan {
     strategies: [Option<TranscodeStrategy>; STRATEGY_PLAN_CAPACITY],
-    split_copy: Option<SplitCopyPlan>,
     split_transcode: Option<SplitTranscodePlan>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SplitCopyPlan {
-    segment_duration: f64,
-    estimated_segments: u32,
 }
 
 fn build_strategy_plan(
@@ -380,7 +344,6 @@ fn build_strategy_plan(
 ) -> StrategyPlan {
     let remux_viable = remux_is_plausible(downloaded);
     let single_transcode_viable = single_transcode_is_plausible(duration, config);
-    let split_copy = split_copy_is_plausible(downloaded, duration, config);
     let split_transcode = SplitTranscodePlan::compute(&config.transcode, duration).ok();
 
     let remux = if remux_viable {
@@ -409,22 +372,6 @@ fn build_strategy_plan(
         (None, None)
     };
 
-    let split_copy_strategy = if let Some(plan) = split_copy {
-        tracing::trace!(
-            segment_duration_secs = plan.segment_duration,
-            estimated_segments = plan.estimated_segments,
-            "Split-copy preflight succeeded"
-        );
-        Some(TranscodeStrategy::SplitCopy)
-    } else {
-        tracing::trace!(
-            bitrate_kbps = downloaded.facts.bitrate_kbps,
-            duration_secs = duration,
-            "Skipping split-copy preflight"
-        );
-        None
-    };
-
     let split_transcode_strategy = if let Some(plan) = split_transcode {
         tracing::trace!(
             segment_duration_secs = plan.segment_duration,
@@ -446,8 +393,8 @@ fn build_strategy_plan(
         remux,
         transcode_balanced,
         transcode_aggressive,
-        split_copy_strategy,
         split_transcode_strategy,
+        None,
         None,
     ];
     let mut strategies = [None; STRATEGY_PLAN_CAPACITY];
@@ -460,7 +407,6 @@ fn build_strategy_plan(
 
     StrategyPlan {
         strategies,
-        split_copy,
         split_transcode,
     }
 }
@@ -476,26 +422,8 @@ fn single_transcode_is_plausible(duration: f64, config: &EngineSettings) -> bool
     }
 }
 
-fn split_copy_is_plausible(
-    downloaded: &DownloadedFile,
-    duration: f64,
-    config: &EngineSettings,
-) -> Option<SplitCopyPlan> {
-    if !ffmpeg::mp4_stream_copy_viable(downloaded.facts) {
-        return None;
-    }
-
-    copy_segment_plan(downloaded, duration, config)
-}
-
-fn split_parallel_is_plausible(
-    downloaded: &DownloadedFile,
-    num_segments: u32,
-    config: &EngineSettings,
-) -> bool {
-    ffmpeg::mp4_stream_copy_viable(downloaded.facts)
-        && config.concurrency.transcode > 1
-        && num_segments >= config.pipeline.parallel_segment_threshold
+fn split_parallel_is_plausible(num_segments: u32, config: &EngineSettings) -> bool {
+    config.concurrency.transcode > 1 && num_segments >= config.pipeline.parallel_segment_threshold
 }
 
 async fn optimize_image(
@@ -752,25 +680,23 @@ async fn split_video(
         ._dir_guard
         .take()
         .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
-    let use_parallel =
-        split_parallel_is_plausible(&downloaded, plan.estimated_segments, ctx.config);
+    let use_parallel = split_parallel_is_plausible(plan.estimated_segments, ctx.config);
 
     tracing::info!(
         segment_duration_secs = plan.segment_duration,
         num_segments = plan.estimated_segments,
         video_bitrate_kbps = plan.bitrate.video_bitrate_kbps,
         audio_bitrate_kbps = plan.bitrate.audio_bitrate_kbps,
-        raw_split_copy_viable = ffmpeg::mp4_stream_copy_viable(downloaded.facts),
         transcode_concurrency = ctx.config.concurrency.transcode,
         parallel = use_parallel,
         "Splitting media"
     );
 
     if use_parallel {
-        // Parallel path: split quickly, then transcode segments concurrently.
         split_parallel(
             downloaded,
             plan.segment_duration,
+            plan.estimated_segments,
             &plan.bitrate,
             temp_files,
             ctx,
@@ -923,6 +849,7 @@ async fn split_serial(
 async fn split_parallel(
     downloaded: DownloadedFile,
     segment_duration: f64,
+    total_segments: u32,
     segment_params: &BitrateParams,
     temp_files: &TempFileCleanup,
     ctx: &TranscodeContext<'_>,
@@ -939,41 +866,11 @@ async fn split_parallel(
         .unwrap_or_default()
         .to_string_lossy();
 
-    let raw_pattern = downloaded
-        .path
-        .with_file_name(format!("{}_raw%03d.mp4", stem));
-
-    {
-        // First pass: split without re-encoding for speed and determinism.
-        let _permit = ctx
-            .permits
-            .transcode
-            .acquire()
-            .await
-            .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
-
-        let split_args = ffmpeg::split_copy_args(&downloaded.path, &raw_pattern, segment_duration);
-        ffmpeg::execute(
-            &ctx.config.binaries.ffmpeg,
-            &split_args,
-            Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
-            TranscodeStage::Split,
-        )
-        .await?;
-    }
-
-    let raw_prefix = format!("{}_raw", stem);
-    let raw_segments = collect_segments(&downloaded.path, &raw_prefix).await?;
-    if raw_segments.is_empty() {
-        return Err(Error::TranscodeFailed {
-            stage: TranscodeStage::Split,
-            exit_code: None,
-            stderr_tail: "split produced no raw segments".to_string(),
-        });
-    }
-
-    let total_segments = raw_segments.len();
-    tracing::info!(segments = total_segments, "Raw segments created");
+    let total_segments = total_segments as usize;
+    tracing::info!(
+        segments = total_segments,
+        "Starting direct parallel segment transcodes"
+    );
 
     let output_prefix = format!("{}_seg", stem);
     send_progress_best_effort(&progress_tx, Progress::Transcoding(0, total_segments));
@@ -994,12 +891,13 @@ async fn split_parallel(
     let mut finished = 0;
     let mut last_heartbeat = Instant::now();
 
-    for (idx, raw_segment) in raw_segments.into_iter().enumerate() {
+    for idx in 0..total_segments {
         spawn_parallel_segment_task(
             &mut join_set,
             idx,
-            raw_segment,
+            &downloaded.path,
             &stem,
+            segment_duration,
             Arc::clone(&transcode_permits),
             Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
             Arc::clone(&parallel_transcode),
@@ -1035,14 +933,12 @@ async fn split_parallel(
             Ok(Some(Ok(Err(e)))) => {
                 join_set.abort_all();
                 while join_set.join_next().await.is_some() {}
-                cleanup_segment_prefix(&downloaded.path, &raw_prefix).await;
                 cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
                 return Err(e);
             }
             Ok(Some(Err(e))) => {
                 join_set.abort_all();
                 while join_set.join_next().await.is_some() {}
-                cleanup_segment_prefix(&downloaded.path, &raw_prefix).await;
                 cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
                 return Err(Error::TranscodeFailed {
                     stage: TranscodeStage::Split,
@@ -1083,14 +979,12 @@ async fn split_parallel(
             Ok(Err(e)) => {
                 join_set.abort_all();
                 while join_set.join_next().await.is_some() {}
-                cleanup_segment_prefix(&downloaded.path, &raw_prefix).await;
                 cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
                 return Err(e);
             }
             Err(e) => {
                 join_set.abort_all();
                 while join_set.join_next().await.is_some() {}
-                cleanup_segment_prefix(&downloaded.path, &raw_prefix).await;
                 cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
                 return Err(Error::TranscodeFailed {
                     stage: TranscodeStage::Split,
@@ -1122,8 +1016,9 @@ async fn split_parallel(
 fn spawn_parallel_segment_task(
     join_set: &mut tokio::task::JoinSet<Result<(usize, SegmentOutput), Error>>,
     idx: usize,
-    raw_segment: SegmentOutput,
+    input_path: &Path,
     stem: &str,
+    segment_duration: f64,
     permits: Arc<tokio::sync::Semaphore>,
     timeout: Duration,
     parallel_transcode: Arc<ParallelSegmentTranscodeContext>,
@@ -1131,12 +1026,14 @@ fn spawn_parallel_segment_task(
     segment_video_kbps: u32,
     segment_audio_kbps: u32,
 ) {
-    let input_path = raw_segment.path;
+    let input_path = input_path.to_owned();
     let output_path = input_path.with_file_name(format!("{}_seg{:03}.mp4", stem, idx));
     join_set.spawn(async move {
         let started_at = Instant::now();
         tracing::info!(
             segment_index = idx,
+            start_secs = idx as f64 * segment_duration,
+            duration_secs = segment_duration,
             input = %input_path.display(),
             output = %output_path.display(),
             "Started parallel segment transcode"
@@ -1152,12 +1049,13 @@ fn spawn_parallel_segment_task(
             &parallel_transcode.transcode_settings,
             &parallel_transcode.transcode_runtime,
             |active_settings| {
-                ffmpeg::transcode_args(
+                ffmpeg::transcode_segment_args(
                     &input_path,
                     &output_path,
+                    idx as f64 * segment_duration,
+                    segment_duration,
                     segment_video_kbps,
                     segment_audio_kbps,
-                    None,
                     active_settings,
                     transcode_concurrency,
                 )
@@ -1165,7 +1063,6 @@ fn spawn_parallel_segment_task(
         )
         .await;
         drop(permit);
-        let _ = fs::remove_file(&input_path).await;
         result?;
         let size = fs::metadata(&output_path).await?.len();
         tracing::info!(
@@ -1291,147 +1188,6 @@ fn should_retry_with_software(error: &Error, backend: HardwareAcceleration) -> b
     }
 }
 
-async fn try_split_copy(
-    downloaded: &DownloadedFile,
-    plan: SplitCopyPlan,
-    permits: &Permits,
-    temp_files: &TempFileCleanup,
-    config: &EngineSettings,
-    dir_guard: &mut Option<TempFileGuard>,
-) -> Result<Option<PreparedUpload>, Error> {
-    tracing::trace!(
-        segment_duration_secs = plan.segment_duration,
-        estimated_segments = plan.estimated_segments,
-        "Trying split-copy strategy"
-    );
-
-    let stem = downloaded
-        .path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let prefix = format!("{}_copy", stem);
-    let output_pattern = downloaded
-        .path
-        .with_file_name(format!("{}%03d.mp4", prefix));
-
-    let args = ffmpeg::split_copy_args(&downloaded.path, &output_pattern, plan.segment_duration);
-    let _permit = permits
-        .transcode
-        .acquire()
-        .await
-        .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
-
-    if let Err(error) = ffmpeg::execute(
-        &config.binaries.ffmpeg,
-        &args,
-        Duration::from_secs(config.transcode.ffmpeg_timeout_secs),
-        TranscodeStage::Split,
-    )
-    .await
-    {
-        abandon_split_copy(&downloaded.path, &prefix, format!("ffmpeg failed: {error}")).await;
-        return Ok(None);
-    }
-
-    let segments = match collect_segments(&downloaded.path, &prefix).await {
-        Ok(segments) => segments,
-        Err(error) => {
-            let cleaned_outputs = cleanup_segment_prefix(&downloaded.path, &prefix).await;
-            tracing::warn!(
-                error = %error,
-                cleaned_outputs,
-                prefix = %prefix,
-                "Split-copy strategy scan failed after ffmpeg completed"
-            );
-            return Err(error);
-        }
-    };
-    if segments.is_empty() {
-        abandon_split_copy(
-            &downloaded.path,
-            &prefix,
-            "produced no usable segments".to_string(),
-        )
-        .await;
-        return Ok(None);
-    }
-
-    if !segments_fit_limit(&segments, config) {
-        abandon_split_copy(
-            &downloaded.path,
-            &prefix,
-            format!(
-                "produced {} segment(s) exceeding the {} byte upload limit",
-                segments.len(),
-                config.transcode.max_upload_bytes
-            ),
-        )
-        .await;
-        return Ok(None);
-    }
-
-    let dir_guard = match dir_guard.take() {
-        Some(dir_guard) => dir_guard,
-        None => {
-            cleanup_segment_outputs(&segments).await;
-            return Err(Error::Io(std::io::Error::other("missing temp dir guard")));
-        }
-    };
-    let parts = into_prepared_parts(segments, temp_files);
-    Ok(Some(PreparedUpload::split(parts, dir_guard)))
-}
-
-async fn abandon_split_copy(path: &Path, prefix: &str, reason: String) {
-    let cleaned_outputs = cleanup_segment_prefix(path, prefix).await;
-    tracing::info!(
-        reason,
-        cleaned_outputs,
-        prefix = %prefix,
-        "Abandoning split-copy strategy"
-    );
-}
-
-fn copy_segment_plan(
-    downloaded: &DownloadedFile,
-    duration: f64,
-    config: &EngineSettings,
-) -> Option<SplitCopyPlan> {
-    if duration <= 0.0 {
-        return None;
-    }
-
-    let bitrate_kbps = downloaded.facts.bitrate_kbps?;
-    let bytes_per_sec = bitrate_kbps as f64 * 1000.0 / 8.0;
-    if !(bytes_per_sec.is_finite() && bytes_per_sec > 0.0) {
-        return None;
-    }
-
-    let target_segment_size =
-        (config.transcode.max_upload_bytes as f64 * config.transcode.split_target_ratio).max(1.0);
-    let mut segment_duration = target_segment_size / bytes_per_sec;
-
-    // Copy-split sizing becomes too noisy below this threshold because keyframe
-    // alignment and mux overhead dominate the estimate.
-    if !segment_duration.is_finite() || segment_duration < MIN_PLAUSIBLE_SPLIT_COPY_SEGMENT_SECS {
-        return None;
-    }
-
-    let max_segment = config.transcode.max_single_video_duration_secs as f64;
-    if segment_duration > max_segment {
-        segment_duration = max_segment;
-    }
-
-    if segment_duration >= duration {
-        return None;
-    }
-
-    Some(SplitCopyPlan {
-        segment_duration,
-        estimated_segments: (duration / segment_duration).ceil() as u32,
-    })
-}
-
 #[derive(Debug, Clone)]
 struct SegmentOutput {
     path: PathBuf,
@@ -1541,10 +1297,10 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic)]
 
     use super::{
-        BitrateParams, SplitCopyPlan, SplitTranscodeProgress, TranscodeContext, TranscodeStrategy,
+        BitrateParams, SplitTranscodeProgress, TranscodeContext, TranscodeStrategy,
         build_strategy_plan, execute_with_hwacc_fallback, optimize, predict_resolution,
-        remaining_timeout_budget, send_progress_best_effort, split_copy_is_plausible,
-        split_parallel, split_parallel_is_plausible, split_serial, try_split_copy,
+        remaining_timeout_budget, send_progress_best_effort, split_parallel,
+        split_parallel_is_plausible, split_serial,
     };
     use crate::concurrency::Permits;
     use crate::config::{EngineSettings, HardwareAcceleration, QualityPreset, TranscodeSettings};
@@ -1613,14 +1369,6 @@ mod tests {
 
     fn split_oversize_script() -> String {
         "#!/bin/sh\ncopy_mode=0\npattern=''\nlast_mp4=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n    *.mp4)\n      last_mp4=\"$arg\"\n      ;;\n  esac\ndone\nif [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  if [ \"$copy_mode\" -eq 1 ]; then\n    printf 'raw0' > \"${prefix}000.mp4\"\n    printf 'raw1' > \"${prefix}001.mp4\"\n  else\n    printf 'ok' > \"${prefix}000.mp4\"\n    printf '0123456789ABCDEF' > \"${prefix}001.mp4\"\n  fi\n  exit 0\nfi\nif [ -n \"$last_mp4\" ]; then\n  case \"$last_mp4\" in\n    *seg000.mp4)\n      printf 'ok' > \"$last_mp4\"\n      ;;\n    *)\n      printf '0123456789ABCDEF' > \"$last_mp4\"\n      ;;\n  esac\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 1\n".to_string()
-    }
-
-    fn split_copy_partial_failure_script() -> String {
-        "#!/bin/sh\ncopy_mode=0\npattern=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n  esac\ndone\nif [ \"$copy_mode\" -eq 1 ] && [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  printf 'partial' > \"${prefix}000.mp4\"\n  printf 'copy split failed\\n' >&2\n  exit 1\nfi\nprintf 'unexpected args\\n' >&2\nexit 2\n".to_string()
-    }
-
-    fn split_copy_zero_byte_script() -> String {
-        "#!/bin/sh\ncopy_mode=0\npattern=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n  esac\ndone\nif [ \"$copy_mode\" -eq 1 ] && [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  : > \"${prefix}000.mp4\"\n  : > \"${prefix}001.mp4\"\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 2\n".to_string()
     }
 
     fn assert_split_oversize(err: Error) {
@@ -1716,13 +1464,12 @@ mod tests {
             [
                 Some(TranscodeStrategy::TranscodeBalanced),
                 Some(TranscodeStrategy::TranscodeAggressive),
-                Some(TranscodeStrategy::SplitCopy),
                 Some(TranscodeStrategy::SplitTranscode),
+                None,
                 None,
                 None,
             ]
         );
-        assert!(plan.split_copy.is_some());
         let split_transcode = plan
             .split_transcode
             .expect("split-transcode plan should be computed");
@@ -1758,7 +1505,6 @@ mod tests {
                 None,
             ]
         );
-        assert!(plan.split_copy.is_none());
     }
 
     #[test]
@@ -1781,15 +1527,14 @@ mod tests {
         assert_eq!(
             plan.strategies,
             [
-                Some(TranscodeStrategy::SplitCopy),
                 Some(TranscodeStrategy::SplitTranscode),
+                None,
                 None,
                 None,
                 None,
                 None,
             ]
         );
-        assert!(plan.split_copy.is_some());
         let split_transcode = plan
             .split_transcode
             .expect("split-transcode plan should be computed");
@@ -1798,41 +1543,11 @@ mod tests {
     }
 
     #[test]
-    fn split_copy_preflight_rejects_tiny_segments() {
-        let config = EngineSettings::default();
-        let downloaded = downloaded_file(
-            "tiny-segments.mp4",
-            80 * 1024 * 1024,
-            20.0,
-            MediaFacts {
-                container: MediaContainer::Mp4,
-                video_codec: VideoCodec::H264,
-                audio_codec: AudioCodec::Aac,
-                bitrate_kbps: Some(32_000),
-            },
-        );
-
-        assert!(split_copy_is_plausible(&downloaded, 20.0, &config).is_none());
-    }
-
-    #[test]
-    fn split_parallel_preflight_rejects_non_mp4_stream_copy_input() {
+    fn split_parallel_preflight_accepts_any_transcodable_input_with_parallel_capacity() {
         let mut config = EngineSettings::default();
         config.concurrency.transcode = 4;
 
-        let downloaded = downloaded_file(
-            "long.webm",
-            120 * 1024 * 1024,
-            720.0,
-            MediaFacts {
-                container: MediaContainer::Webm,
-                video_codec: VideoCodec::Vp9,
-                audio_codec: AudioCodec::Opus,
-                bitrate_kbps: Some(1_400),
-            },
-        );
-
-        assert!(!split_parallel_is_plausible(&downloaded, 6, &config));
+        assert!(split_parallel_is_plausible(6, &config));
     }
 
     #[test]
@@ -1840,39 +1555,15 @@ mod tests {
         let mut config = EngineSettings::default();
         config.concurrency.transcode = 1;
 
-        let downloaded = downloaded_file(
-            "long.mp4",
-            120 * 1024 * 1024,
-            720.0,
-            MediaFacts {
-                container: MediaContainer::Mp4,
-                video_codec: VideoCodec::H264,
-                audio_codec: AudioCodec::Aac,
-                bitrate_kbps: Some(1_400),
-            },
-        );
-
-        assert!(!split_parallel_is_plausible(&downloaded, 6, &config));
+        assert!(!split_parallel_is_plausible(6, &config));
     }
 
     #[test]
-    fn split_parallel_preflight_accepts_copyable_input_with_parallel_capacity() {
+    fn split_parallel_preflight_rejects_small_segment_counts() {
         let mut config = EngineSettings::default();
         config.concurrency.transcode = 4;
 
-        let downloaded = downloaded_file(
-            "long.mp4",
-            120 * 1024 * 1024,
-            720.0,
-            MediaFacts {
-                container: MediaContainer::Mp4,
-                video_codec: VideoCodec::H264,
-                audio_codec: AudioCodec::Aac,
-                bitrate_kbps: Some(1_400),
-            },
-        );
-
-        assert!(split_parallel_is_plausible(&downloaded, 6, &config));
+        assert!(!split_parallel_is_plausible(1, &config));
     }
 
     #[test]
@@ -1995,6 +1686,7 @@ mod tests {
         let err = split_parallel(
             downloaded,
             10.0,
+            2,
             &segment_params,
             &temp_files,
             &ctx,
@@ -2005,119 +1697,8 @@ mod tests {
         .expect_err("oversize split segment must fail");
 
         assert_split_oversize(err);
-        assert!(!temp_dir.join("input_raw000.mp4").exists());
-        assert!(!temp_dir.join("input_raw001.mp4").exists());
         assert!(!temp_dir.join("input_seg000.mp4").exists());
         assert!(!temp_dir.join("input_seg001.mp4").exists());
-
-        temp_files.shutdown().await;
-        let _ = fs::remove_file(script_path);
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn try_split_copy_cleans_partial_outputs_after_ffmpeg_failure() {
-        let temp_files = TempFileCleanup::new();
-        let temp_dir = unique_temp_path("split-copy-partial-dir");
-        let script_path = unique_temp_path("split-copy-partial-ffmpeg.sh");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        write_executable(&script_path, &split_copy_partial_failure_script());
-
-        let input_path = temp_dir.join("input.mp4");
-        fs::write(&input_path, b"input").expect("write input");
-
-        let mut config = EngineSettings::default();
-        config.binaries.ffmpeg = script_path.clone();
-        config.storage.temp_dir = temp_dir.clone();
-        config.transcode.ffmpeg_timeout_secs = 1;
-
-        let permits = Permits::new(&config.concurrency);
-        let downloaded = downloaded_file_at(
-            input_path.clone(),
-            32,
-            30.0,
-            MediaFacts {
-                container: MediaContainer::Mp4,
-                video_codec: VideoCodec::H264,
-                audio_codec: AudioCodec::Aac,
-                bitrate_kbps: Some(1_400),
-            },
-            &temp_files,
-        );
-        let mut dir_guard = Some(temp_files.guard(temp_dir.clone()));
-
-        let result = try_split_copy(
-            &downloaded,
-            SplitCopyPlan {
-                segment_duration: 10.0,
-                estimated_segments: 2,
-            },
-            &permits,
-            &temp_files,
-            &config,
-            &mut dir_guard,
-        )
-        .await
-        .expect("split-copy failure should fall back cleanly");
-
-        assert!(result.is_none());
-        assert!(dir_guard.is_some());
-        assert!(!temp_dir.join("input_copy000.mp4").exists());
-
-        temp_files.shutdown().await;
-        let _ = fs::remove_file(script_path);
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn try_split_copy_cleans_zero_byte_outputs_when_no_segments_are_usable() {
-        let temp_files = TempFileCleanup::new();
-        let temp_dir = unique_temp_path("split-copy-empty-dir");
-        let script_path = unique_temp_path("split-copy-empty-ffmpeg.sh");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        write_executable(&script_path, &split_copy_zero_byte_script());
-
-        let input_path = temp_dir.join("input.mp4");
-        fs::write(&input_path, b"input").expect("write input");
-
-        let mut config = EngineSettings::default();
-        config.binaries.ffmpeg = script_path.clone();
-        config.storage.temp_dir = temp_dir.clone();
-        config.transcode.ffmpeg_timeout_secs = 1;
-
-        let permits = Permits::new(&config.concurrency);
-        let downloaded = downloaded_file_at(
-            input_path.clone(),
-            32,
-            30.0,
-            MediaFacts {
-                container: MediaContainer::Mp4,
-                video_codec: VideoCodec::H264,
-                audio_codec: AudioCodec::Aac,
-                bitrate_kbps: Some(1_400),
-            },
-            &temp_files,
-        );
-        let mut dir_guard = Some(temp_files.guard(temp_dir.clone()));
-
-        let result = try_split_copy(
-            &downloaded,
-            SplitCopyPlan {
-                segment_duration: 10.0,
-                estimated_segments: 2,
-            },
-            &permits,
-            &temp_files,
-            &config,
-            &mut dir_guard,
-        )
-        .await
-        .expect("split-copy should fall back when scan finds no usable segments");
-
-        assert!(result.is_none());
-        assert!(dir_guard.is_some());
-        assert!(!temp_dir.join("input_copy000.mp4").exists());
-        assert!(!temp_dir.join("input_copy001.mp4").exists());
 
         temp_files.shutdown().await;
         let _ = fs::remove_file(script_path);
