@@ -67,6 +67,7 @@ async fn pass_through_local_fixture_smoke_flow() {
     settings.storage.temp_dir = fixture_root;
     settings.pipeline.min_disk_space_bytes = 1;
     settings.transcode.max_upload_bytes = fixture_bytes.len() as u64 + 1024;
+    settings.pipeline.upload_ready_buffer_max_bytes = settings.transcode.max_upload_bytes;
     settings
         .validate()
         .expect("test settings must remain valid");

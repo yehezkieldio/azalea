@@ -241,6 +241,12 @@
           "default": 10,
           "minimum": 0
         },
+        "upload_ready_buffer_max_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 8388608,
+          "minimum": 0
+        },
         "upload_timeout_secs": {
           "type": "integer",
           "format": "uint64",
