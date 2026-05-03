@@ -344,6 +344,7 @@ pub struct PipelineSettings {
     pub queue_backpressure_timeout_ms: u64,
     pub download_timeout_secs: u64,
     pub download_write_buffer_bytes: usize,
+    pub upload_ready_buffer_max_bytes: u64,
     pub upload_timeout_secs: u64,
     pub attachment_prepare_concurrency: usize,
     pub min_disk_space_bytes: u64,
@@ -364,6 +365,7 @@ impl Default for PipelineSettings {
             queue_backpressure_timeout_ms: 1_000,
             download_timeout_secs: 60,
             download_write_buffer_bytes: 1024 * 1024,
+            upload_ready_buffer_max_bytes: 8 * 1024 * 1024,
             upload_timeout_secs: 120,
             attachment_prepare_concurrency: 4,
             min_disk_space_bytes: 500 * 1024 * 1024,
@@ -519,6 +521,11 @@ impl EngineSettings {
         )?;
         if self.pipeline.download_write_buffer_bytes == 0 {
             anyhow::bail!("pipeline.download_write_buffer_bytes must be at least 1");
+        }
+        if self.pipeline.upload_ready_buffer_max_bytes > self.transcode.max_upload_bytes {
+            anyhow::bail!(
+                "pipeline.upload_ready_buffer_max_bytes must not exceed transcode.max_upload_bytes"
+            );
         }
         validate_timeout(
             "pipeline.upload_timeout_secs",
@@ -700,6 +707,16 @@ mod tests {
             .validate()
             .expect_err("zero write buffer must be invalid");
         assert!(err.to_string().contains("download_write_buffer_bytes"));
+    }
+
+    #[test]
+    fn validate_rejects_upload_ready_buffer_above_upload_limit() {
+        let mut config = EngineSettings::default();
+        config.pipeline.upload_ready_buffer_max_bytes = config.transcode.max_upload_bytes + 1;
+        let err = config
+            .validate()
+            .expect_err("upload-ready memory cap must fit within upload cap");
+        assert!(err.to_string().contains("upload_ready_buffer_max_bytes"));
     }
 
     #[test]

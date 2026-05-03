@@ -118,6 +118,11 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
         &[],
         "pipeline.download_write_buffer_bytes",
     ),
+    (
+        "UPLOAD_READY_BUFFER_MAX_BYTES",
+        &[],
+        "pipeline.upload_ready_buffer_max_bytes",
+    ),
     ("UPLOAD_TIMEOUT_SECS", &[], "pipeline.upload_timeout_secs"),
     (
         "ATTACHMENT_PREPARE_CONCURRENCY",
@@ -480,6 +485,13 @@ fn render_template() -> String {
         &format!(
             "download_write_buffer_bytes = {}",
             engine.pipeline.download_write_buffer_bytes
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "upload_ready_buffer_max_bytes = {}",
+            engine.pipeline.upload_ready_buffer_max_bytes
         ),
     );
     line(

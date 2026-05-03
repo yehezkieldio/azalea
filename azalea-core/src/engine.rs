@@ -46,6 +46,18 @@ pub struct TranscodeRuntime {
     inner: Arc<TranscodeRuntimeInner>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscodeRuntimeSnapshot {
+    pub configured_backend: HardwareAcceleration,
+    pub active_backend: HardwareAcceleration,
+    pub software_fallback_active: bool,
+    pub fallback_transitions: u64,
+    pub hw_encode_count: u64,
+    pub sw_encode_count: u64,
+    pub hw_avg_duration_ms: u64,
+    pub sw_avg_duration_ms: u64,
+}
+
 impl TranscodeRuntime {
     pub fn new(configured_backend: HardwareAcceleration) -> Self {
         Self {
@@ -119,6 +131,27 @@ impl TranscodeRuntime {
         let mut settings = template.clone();
         settings.hardware_acceleration = self.active_backend();
         settings
+    }
+
+    pub fn effective_transcode_concurrency(&self, configured: u32) -> u32 {
+        if self.software_fallback_active() {
+            1
+        } else {
+            configured.max(1)
+        }
+    }
+
+    pub fn snapshot(&self) -> TranscodeRuntimeSnapshot {
+        TranscodeRuntimeSnapshot {
+            configured_backend: self.configured_backend(),
+            active_backend: self.active_backend(),
+            software_fallback_active: self.software_fallback_active(),
+            fallback_transitions: self.fallback_transitions(),
+            hw_encode_count: self.hw_encode_count(),
+            sw_encode_count: self.sw_encode_count(),
+            hw_avg_duration_ms: self.hw_avg_duration_ms(),
+            sw_avg_duration_ms: self.sw_avg_duration_ms(),
+        }
     }
 
     pub fn activate_software_fallback(&self) -> bool {
@@ -260,6 +293,17 @@ mod tests {
 
         assert!(!runtime.activate_software_fallback());
         assert_eq!(runtime.fallback_transitions(), 1);
+    }
+
+    #[test]
+    fn software_fallback_reduces_effective_transcode_concurrency() {
+        let runtime = TranscodeRuntime::new(HardwareAcceleration::Qsv);
+
+        assert_eq!(runtime.effective_transcode_concurrency(2), 2);
+
+        assert!(runtime.activate_software_fallback());
+        assert_eq!(runtime.effective_transcode_concurrency(2), 1);
+        assert_eq!(runtime.effective_transcode_concurrency(0), 1);
     }
 
     #[test]

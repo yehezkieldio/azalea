@@ -466,27 +466,36 @@ impl StderrTailBuffer {
         let total_bytes = self.total_bytes() + self.len.saturating_sub(1);
         let mut tail = Vec::with_capacity(total_bytes);
 
-        for (offset, line) in self.iter_ordered_lines().enumerate() {
-            if offset > 0 {
+        self.for_each_ordered_line(|index, line| {
+            if index > 0 {
                 tail.push(b'\n');
             }
             tail.extend_from_slice(line);
-        }
+        });
 
         String::from_utf8_lossy(&tail).into_owned().into_boxed_str()
     }
 
     fn total_bytes(&self) -> usize {
-        self.iter_ordered_lines().map(<[u8]>::len).sum()
+        let mut total = 0usize;
+        self.for_each_ordered_line(|_, line| {
+            total += line.len();
+        });
+        total
     }
 
-    fn iter_ordered_lines(&self) -> Box<dyn Iterator<Item = &[u8]> + '_> {
+    fn for_each_ordered_line(&self, mut visit: impl FnMut(usize, &[u8])) {
         if self.len < self.lines.len() {
-            return Box::new(self.lines.iter().take(self.len).map(Vec::as_slice));
+            for (index, line) in self.lines.iter().take(self.len).enumerate() {
+                visit(index, line);
+            }
+            return;
         }
 
         let (head, tail) = self.lines.split_at(self.next);
-        Box::new(tail.iter().chain(head.iter()).map(Vec::as_slice))
+        for (index, line) in tail.iter().chain(head.iter()).enumerate() {
+            visit(index, line);
+        }
     }
 }
 

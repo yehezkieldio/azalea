@@ -209,6 +209,7 @@ pub async fn run(
                     .metrics
                     .record_stage_duration(Stage::Optimize, optimize_duration_ms);
                 warn_if_slow(Stage::Optimize, optimize_duration_ms, OPTIMIZE_WARN_MS);
+                let transcode_runtime = engine.transcode_runtime.snapshot();
                 let (prepared_kind, prepared_parts) = match &prepared {
                     types::PreparedUpload::Single { .. } => ("single", 1),
                     types::PreparedUpload::Split { parts, .. } => ("split", parts.len()),
@@ -217,11 +218,12 @@ pub async fn run(
                     duration_ms = optimize_duration_ms,
                     kind = prepared_kind,
                     parts = prepared_parts,
-                    configured_backend = %engine.transcode_runtime.configured_backend(),
-                    active_backend = %engine.transcode_runtime.active_backend(),
-                    software_fallback = engine.transcode_runtime.software_fallback_active(),
-                    hw_encodes = engine.transcode_runtime.hw_encode_count(),
-                    sw_encodes = engine.transcode_runtime.sw_encode_count(),
+                    configured_backend = %transcode_runtime.configured_backend,
+                    active_backend = %transcode_runtime.active_backend,
+                    software_fallback = transcode_runtime.software_fallback_active,
+                    fallback_transitions = transcode_runtime.fallback_transitions,
+                    hw_encodes = transcode_runtime.hw_encode_count,
+                    sw_encodes = transcode_runtime.sw_encode_count,
                     "Optimize completed"
                 );
 

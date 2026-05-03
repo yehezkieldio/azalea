@@ -57,6 +57,7 @@ ffmpeg_timeout_secs = 600
 queue_backpressure_timeout_ms = 1000
 download_timeout_secs = 60
 download_write_buffer_bytes = 1048576
+upload_ready_buffer_max_bytes = 8388608
 upload_timeout_secs = 120
 min_disk_space_bytes = 524288000
 max_download_bytes = 524288000

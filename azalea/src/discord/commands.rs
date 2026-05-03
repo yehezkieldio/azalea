@@ -284,10 +284,11 @@ async fn format_status(app: &App) -> String {
     let dedup_entries = app.engine.dedup.cache_entries();
     let pending_writes = app.engine.dedup.pending_writes_len().await;
     let resolver_stats = app.engine.resolver.cache_stats();
-    let active_backend = app.engine.transcode_runtime.active_backend();
-    let configured_backend = app.engine.transcode_runtime.configured_backend();
-    let hw_encode_count = app.engine.transcode_runtime.hw_encode_count();
-    let sw_encode_count = app.engine.transcode_runtime.sw_encode_count();
+    let transcode_runtime = app.engine.transcode_runtime.snapshot();
+    let active_backend = transcode_runtime.active_backend;
+    let configured_backend = transcode_runtime.configured_backend;
+    let hw_encode_count = transcode_runtime.hw_encode_count;
+    let sw_encode_count = transcode_runtime.sw_encode_count;
     let total_encodes = hw_encode_count + sw_encode_count;
     let hwacc_stats = if total_encodes == 0 {
         "HW accel stats: no completed encodes yet".to_string()
@@ -303,11 +304,10 @@ async fn format_status(app: &App) -> String {
     } else {
         format!(
             "HW accel avg encode time: {} ms hw / {} ms sw",
-            app.engine.transcode_runtime.hw_avg_duration_ms(),
-            app.engine.transcode_runtime.sw_avg_duration_ms()
+            transcode_runtime.hw_avg_duration_ms, transcode_runtime.sw_avg_duration_ms
         )
     };
-    let transcode_backend = if app.engine.transcode_runtime.software_fallback_active() {
+    let transcode_backend = if transcode_runtime.software_fallback_active {
         format!(
             "{} (runtime fallback from {})",
             active_backend.encoder(),
@@ -320,9 +320,10 @@ async fn format_status(app: &App) -> String {
     };
 
     format!(
-        "Azalea is online.\nUptime: {}s\nTranscode backend: {}\n{}\n{}\nQueue depth: {}\nTotal runs: {} ({} ok / {} failed)\nDedup cache: {} entries ({} pending writes)\nResolver cache: {} ok / {} negative",
+        "Azalea is online.\nUptime: {}s\nTranscode backend: {}\nHW fallback transitions: {}\n{}\n{}\nQueue depth: {}\nTotal runs: {} ({} ok / {} failed)\nDedup cache: {} entries ({} pending writes)\nResolver cache: {} ok / {} negative",
         uptime.as_secs(),
         transcode_backend,
+        transcode_runtime.fallback_transitions,
         hwacc_stats,
         hwacc_durations,
         queue_depth,
@@ -379,8 +380,9 @@ fn format_config(app: &App) -> String {
     let config = &app.engine.config;
 
     format!(
-        "Config summary:\nmax_upload_bytes={}\nconcurrency: pipeline={} download={} upload={} transcode={} ytdlp={}\nquality_preset={:?} hw_accel={:?}",
+        "Config summary:\nmax_upload_bytes={}\nupload_ready_buffer_max_bytes={}\nconcurrency: pipeline={} download={} upload={} transcode={} ytdlp={}\nquality_preset={:?} hw_accel={:?}",
         config.transcode.max_upload_bytes,
+        config.pipeline.upload_ready_buffer_max_bytes,
         config.concurrency.pipeline,
         config.concurrency.download,
         config.concurrency.upload,
@@ -544,6 +546,7 @@ mod tests {
         let status = format_status(&app).await;
 
         assert!(status.contains("Transcode backend: h264_qsv (qsv)"));
+        assert!(status.contains("HW fallback transitions: 0"));
         assert!(status.contains("HW accel stats: no completed encodes yet"));
         assert!(status.contains("HW accel avg encode time: n/a"));
     }
@@ -558,6 +561,7 @@ mod tests {
         let status = format_status(&app).await;
 
         assert!(status.contains("Transcode backend: libx264 (runtime fallback from vaapi)"));
+        assert!(status.contains("HW fallback transitions: 1"));
         assert!(status.contains("HW accel stats: 1 hw / 1 sw encodes (50.0% hw usage)"));
         assert!(status.contains("HW accel avg encode time: 120 ms hw / 240 ms sw"));
     }

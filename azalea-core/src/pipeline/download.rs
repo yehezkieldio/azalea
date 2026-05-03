@@ -349,13 +349,17 @@ fn bounded_upload_ready_buffer(
     config: &EngineSettings,
 ) -> Option<Vec<u8>> {
     let max_upload_bytes = config.transcode.max_upload_bytes;
-    if total_size.is_some_and(|size| size > max_upload_bytes) {
+    let buffer_limit = config
+        .pipeline
+        .upload_ready_buffer_max_bytes
+        .min(max_upload_bytes);
+    if buffer_limit == 0 || total_size.is_some_and(|size| size > buffer_limit) {
         return None;
     }
 
     let capacity = total_size
         .unwrap_or(0)
-        .min(max_upload_bytes)
+        .min(buffer_limit)
         .try_into()
         .unwrap_or(0);
     // Retain pass-through bytes only for under-limit candidates. This bounds
@@ -715,12 +719,27 @@ mod tests {
     fn upload_ready_buffer_is_only_allocated_for_under_limit_candidates() {
         let config = EngineSettings::default();
 
-        let bounded = bounded_upload_ready_buffer(Some(config.transcode.max_upload_bytes), &config);
+        let bounded = bounded_upload_ready_buffer(
+            Some(config.pipeline.upload_ready_buffer_max_bytes),
+            &config,
+        );
         assert!(bounded.is_some());
 
-        let oversized =
-            bounded_upload_ready_buffer(Some(config.transcode.max_upload_bytes + 1), &config);
+        let oversized = bounded_upload_ready_buffer(
+            Some(config.pipeline.upload_ready_buffer_max_bytes + 1),
+            &config,
+        );
         assert!(oversized.is_none());
+    }
+
+    #[test]
+    fn upload_ready_buffer_respects_memory_cap_below_upload_limit() {
+        let mut config = EngineSettings::default();
+        config.pipeline.upload_ready_buffer_max_bytes = 1024;
+
+        let bounded = bounded_upload_ready_buffer(Some(1024), &config);
+        assert_eq!(bounded.map(|buffer| buffer.capacity()), Some(1024));
+        assert_eq!(bounded_upload_ready_buffer(Some(1025), &config), None);
     }
 
     #[tokio::test]

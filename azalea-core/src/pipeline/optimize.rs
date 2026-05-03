@@ -21,7 +21,8 @@ use crate::pipeline::errors::{Error, TranscodeStage};
 use crate::pipeline::ffmpeg;
 use crate::pipeline::quality::{BitrateParams, Ladder, SplitTranscodePlan};
 use crate::pipeline::types::{
-    DownloadedFile, MediaType, PreparedPart, PreparedUpload, Progress, ResolvedMedia,
+    AudioCodec, DownloadedFile, MediaType, PreparedPart, PreparedUpload, Progress, ResolvedMedia,
+    VideoCodec,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -412,7 +413,9 @@ fn build_strategy_plan(
 }
 
 fn remux_is_plausible(downloaded: &DownloadedFile) -> bool {
-    ffmpeg::mp4_stream_copy_viable(downloaded.facts) && !downloaded.facts.container.is_mp4_family()
+    !downloaded.facts.container.is_mp4_family()
+        && (ffmpeg::mp4_stream_copy_viable(downloaded.facts)
+            || stream_copy_preflight_worth_trying(downloaded))
 }
 
 fn single_transcode_is_plausible(duration: f64, config: &EngineSettings) -> bool {
@@ -422,8 +425,18 @@ fn single_transcode_is_plausible(duration: f64, config: &EngineSettings) -> bool
     }
 }
 
-fn split_parallel_is_plausible(num_segments: u32, config: &EngineSettings) -> bool {
-    config.concurrency.transcode > 1 && num_segments >= config.pipeline.parallel_segment_threshold
+fn split_parallel_is_plausible(
+    num_segments: u32,
+    effective_transcode_concurrency: u32,
+    config: &EngineSettings,
+) -> bool {
+    effective_transcode_concurrency > 1
+        && num_segments >= config.pipeline.parallel_segment_threshold
+}
+
+fn stream_copy_preflight_worth_trying(downloaded: &DownloadedFile) -> bool {
+    matches!(downloaded.facts.video_codec, VideoCodec::Other)
+        || matches!(downloaded.facts.audio_codec, AudioCodec::Other)
 }
 
 async fn optimize_image(
@@ -646,6 +659,9 @@ async fn transcode(
         .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
 
     let params = BitrateParams::compute(&ctx.config.transcode, duration)?;
+    let effective_transcode_concurrency = ctx
+        .runtime
+        .effective_transcode_concurrency(ctx.config.concurrency.transcode);
     execute_with_hwacc_fallback(
         &ctx.config.binaries.ffmpeg,
         Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
@@ -660,7 +676,7 @@ async fn transcode(
                 params.audio_bitrate_kbps,
                 max_height,
                 active_settings,
-                ctx.config.concurrency.transcode,
+                effective_transcode_concurrency,
             )
         },
     )
@@ -680,7 +696,14 @@ async fn split_video(
         ._dir_guard
         .take()
         .ok_or_else(|| Error::Io(std::io::Error::other("missing temp dir guard")))?;
-    let use_parallel = split_parallel_is_plausible(plan.estimated_segments, ctx.config);
+    let effective_transcode_concurrency = ctx
+        .runtime
+        .effective_transcode_concurrency(ctx.config.concurrency.transcode);
+    let use_parallel = split_parallel_is_plausible(
+        plan.estimated_segments,
+        effective_transcode_concurrency,
+        ctx.config,
+    );
 
     tracing::info!(
         segment_duration_secs = plan.segment_duration,
@@ -688,6 +711,7 @@ async fn split_video(
         video_bitrate_kbps = plan.bitrate.video_bitrate_kbps,
         audio_bitrate_kbps = plan.bitrate.audio_bitrate_kbps,
         transcode_concurrency = ctx.config.concurrency.transcode,
+        effective_transcode_concurrency,
         parallel = use_parallel,
         "Splitting media"
     );
@@ -805,6 +829,9 @@ async fn split_serial(
     let output_pattern = downloaded
         .path
         .with_file_name(format!("{}_seg%03d.mp4", stem));
+    let effective_transcode_concurrency = ctx
+        .runtime
+        .effective_transcode_concurrency(ctx.config.concurrency.transcode);
 
     execute_with_hwacc_fallback(
         &ctx.config.binaries.ffmpeg,
@@ -820,7 +847,7 @@ async fn split_serial(
                 segment_params.video_bitrate_kbps,
                 segment_params.audio_bitrate_kbps,
                 active_settings,
-                ctx.config.concurrency.transcode,
+                effective_transcode_concurrency,
             )
         },
     )
@@ -883,7 +910,9 @@ async fn split_parallel(
         transcode_runtime: ctx.runtime.clone(),
     });
     let transcode_permits = Arc::clone(&ctx.permits.transcode);
-    let transcode_concurrency = ctx.config.concurrency.transcode;
+    let effective_transcode_concurrency = ctx
+        .runtime
+        .effective_transcode_concurrency(ctx.config.concurrency.transcode);
     let segment_video_kbps = segment_params.video_bitrate_kbps;
     let segment_audio_kbps = segment_params.audio_bitrate_kbps;
 
@@ -901,7 +930,7 @@ async fn split_parallel(
             Arc::clone(&transcode_permits),
             Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
             Arc::clone(&parallel_transcode),
-            transcode_concurrency,
+            effective_transcode_concurrency,
             segment_video_kbps,
             segment_audio_kbps,
         );
@@ -1508,6 +1537,26 @@ mod tests {
     }
 
     #[test]
+    fn strategy_plan_attempts_remux_when_codec_facts_are_unknown() {
+        let config = EngineSettings::default();
+        let downloaded = downloaded_file(
+            "unknown.bin",
+            20 * 1024 * 1024,
+            60.0,
+            MediaFacts {
+                container: MediaContainer::Unknown,
+                video_codec: VideoCodec::Other,
+                audio_codec: AudioCodec::Other,
+                bitrate_kbps: None,
+            },
+        );
+
+        let plan = build_strategy_plan(&downloaded, 60.0, Some(720), Some(480), &config);
+
+        assert_eq!(plan.strategies[0], Some(TranscodeStrategy::Remux));
+    }
+
+    #[test]
     fn strategy_plan_skips_full_transcodes_for_long_oversized_video() {
         let config = EngineSettings::default();
         let downloaded = downloaded_file(
@@ -1547,7 +1596,7 @@ mod tests {
         let mut config = EngineSettings::default();
         config.concurrency.transcode = 4;
 
-        assert!(split_parallel_is_plausible(6, &config));
+        assert!(split_parallel_is_plausible(6, 4, &config));
     }
 
     #[test]
@@ -1555,7 +1604,7 @@ mod tests {
         let mut config = EngineSettings::default();
         config.concurrency.transcode = 1;
 
-        assert!(!split_parallel_is_plausible(6, &config));
+        assert!(!split_parallel_is_plausible(6, 1, &config));
     }
 
     #[test]
@@ -1563,7 +1612,7 @@ mod tests {
         let mut config = EngineSettings::default();
         config.concurrency.transcode = 4;
 
-        assert!(!split_parallel_is_plausible(1, &config));
+        assert!(!split_parallel_is_plausible(1, 4, &config));
     }
 
     #[test]
