@@ -413,83 +413,6 @@ pub fn transcode_segment_args(
     args
 }
 
-pub fn split_args(
-    input: &Path,
-    pattern: &Path,
-    segment_duration: f64,
-    video_kbps: u32,
-    audio_kbps: u32,
-    config: &TranscodeSettings,
-    transcode_concurrency: u32,
-) -> Args {
-    debug!(
-        hardware_acceleration = ?config.hardware_acceleration,
-        encoder = config.hardware_acceleration.encoder(),
-        "Building ffmpeg split args"
-    );
-    let mut args = Args::new();
-    args.push("-y".into());
-
-    push_hw_device_input_args(&mut args, config, true);
-
-    args.push("-i".into());
-    args.push(input.as_os_str().into());
-
-    if let Some(filter) = video_filter(None, config.hardware_acceleration) {
-        args.push("-vf".into());
-        args.push(filter.into());
-    }
-
-    args.push("-c:v".into());
-    args.push(config.hardware_acceleration.encoder().into());
-
-    push_video_encoding_args(&mut args, config, video_kbps, transcode_concurrency);
-
-    args.push("-c:a".into());
-    args.push("aac".into());
-    args.push("-b:a".into());
-    args.push(format!("{}k", audio_kbps).into());
-    args.push("-ac".into());
-    args.push("2".into());
-    args.push("-force_key_frames".into());
-    args.push(format!("expr:gte(t,n_forced*{segment_duration:.1})").into());
-
-    args.extend([
-        "-f".into(),
-        "segment".into(),
-        "-segment_time".into(),
-        format!("{:.1}", segment_duration).into(),
-        "-reset_timestamps".into(),
-        "1".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-    ]);
-    args.push(pattern.as_os_str().into());
-    args
-}
-
-/// Build args to split without re-encoding.
-pub fn split_copy_args(input: &Path, pattern: &Path, segment_duration: f64) -> Args {
-    let mut args = Args::new();
-    args.push("-y".into());
-    args.push("-i".into());
-    args.push(input.as_os_str().into());
-    args.push("-c".into());
-    args.push("copy".into());
-    args.push("-f".into());
-    args.push("segment".into());
-    args.push("-segment_time".into());
-    args.push(format!("{:.1}", segment_duration).into());
-    args.push("-reset_timestamps".into());
-    args.push("1".into());
-    args.push("-avoid_negative_ts".into());
-    args.push("make_zero".into());
-    args.push("-movflags".into());
-    args.push("+faststart".into());
-    args.push(pattern.as_os_str().into());
-    args
-}
-
 pub async fn execute(
     ffmpeg_path: &Path,
     args: &[OsString],
@@ -719,39 +642,6 @@ mod tests {
     }
 
     #[test]
-    fn split_copy_args_include_segment_settings() {
-        let args = split_copy_args(Path::new("input.mp4"), Path::new("seg%03d.mp4"), 11.5);
-        let as_text = to_strings(&args);
-        assert!(as_text.windows(2).any(|w| w == ["-f", "segment"]));
-        assert!(as_text.windows(2).any(|w| w == ["-segment_time", "11.5"]));
-        assert!(
-            as_text
-                .windows(2)
-                .any(|w| w == ["-avoid_negative_ts", "make_zero"])
-        );
-    }
-
-    #[test]
-    fn split_args_force_keyframes_at_segment_boundaries() {
-        let args = split_args(
-            Path::new("input.mp4"),
-            Path::new("seg%03d.mp4"),
-            11.5,
-            900,
-            128,
-            &TranscodeSettings::default(),
-            2,
-        );
-        let as_text = to_strings(&args);
-
-        assert!(
-            as_text
-                .windows(2)
-                .any(|w| w == ["-force_key_frames", "expr:gte(t,n_forced*11.5)"])
-        );
-    }
-
-    #[test]
     fn transcode_segment_args_seek_and_reset_segment_timestamps() {
         let args = transcode_segment_args(
             Path::new("input.mp4"),
@@ -858,28 +748,6 @@ mod tests {
         assert!(as_text.windows(2).any(|w| w == ["-bitrate_limit", "1"]));
         assert!(as_text.windows(2).any(|w| w == ["-low_delay_brc", "1"]));
         assert_eq!(flag_count(&as_text, "-b:a"), 1);
-    }
-
-    #[test]
-    fn split_args_configure_amf_quality_controls() {
-        let args = split_args(
-            Path::new("input.mp4"),
-            Path::new("seg%03d.mp4"),
-            11.5,
-            900,
-            128,
-            &TranscodeSettings {
-                hardware_acceleration: HardwareAcceleration::Amf,
-                quality_preset: crate::config::QualityPreset::Balanced,
-                ..TranscodeSettings::default()
-            },
-            2,
-        );
-        let as_text = to_strings(&args);
-
-        assert!(as_text.windows(2).any(|w| w == ["-c:v", "h264_amf"]));
-        assert!(as_text.windows(2).any(|w| w == ["-rc", "vbr_latency"]));
-        assert!(as_text.windows(2).any(|w| w == ["-quality", "balanced"]));
     }
 
     #[test]

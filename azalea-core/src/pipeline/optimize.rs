@@ -856,35 +856,66 @@ async fn split_serial(
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy();
-    let output_pattern = downloaded
-        .path
-        .with_file_name(format!("{}_seg%03d.mp4", stem));
+    let prefix = format!("{}_seg", stem);
     let effective_transcode_concurrency = ctx
         .runtime
         .effective_transcode_concurrency(ctx.config.concurrency.transcode);
 
-    execute_with_hwacc_fallback(
-        &ctx.config.binaries.ffmpeg,
-        Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
-        TranscodeStage::Split,
-        &split_job.settings,
-        ctx.runtime,
-        |active_settings| {
-            ffmpeg::split_args(
-                &downloaded.path,
-                &output_pattern,
-                split_job.segment_duration,
-                split_job.bitrate.video_bitrate_kbps,
-                split_job.bitrate.audio_bitrate_kbps,
-                active_settings,
-                effective_transcode_concurrency,
-            )
-        },
-    )
-    .await?;
+    let mut segments = Vec::with_capacity(split_job.estimated_segments as usize);
+    for idx in 0..split_job.estimated_segments {
+        let output_path = downloaded
+            .path
+            .with_file_name(format!("{prefix}{idx:03}.mp4"));
+        let result = execute_with_hwacc_fallback(
+            &ctx.config.binaries.ffmpeg,
+            Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
+            TranscodeStage::Split,
+            &split_job.settings,
+            ctx.runtime,
+            |active_settings| {
+                ffmpeg::transcode_segment_args(
+                    &downloaded.path,
+                    &output_path,
+                    idx as f64 * split_job.segment_duration,
+                    split_job.segment_duration,
+                    split_job.bitrate.video_bitrate_kbps,
+                    split_job.bitrate.audio_bitrate_kbps,
+                    active_settings,
+                    effective_transcode_concurrency,
+                )
+            },
+        )
+        .await;
 
-    let prefix = format!("{}_seg", stem);
-    let segments = collect_segments(&downloaded.path, &prefix).await?;
+        if let Err(error) = result {
+            cleanup_segment_prefix(&downloaded.path, &prefix).await;
+            return Err(error);
+        }
+
+        let size = match fs::metadata(&output_path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                cleanup_segment_prefix(&downloaded.path, &prefix).await;
+                return Err(error.into());
+            }
+        };
+        if size == 0 {
+            cleanup_segment_prefix(&downloaded.path, &prefix).await;
+            return Err(Error::TranscodeFailed {
+                stage: TranscodeStage::Split,
+                exit_code: None,
+                stderr_tail: "split produced an empty segment".to_string(),
+            });
+        }
+        segments.push(SegmentOutput {
+            path: output_path,
+            size,
+        });
+        send_progress_best_effort(
+            &progress.progress_tx,
+            Progress::Transcoding(segments.len(), split_job.estimated_segments as usize),
+        );
+    }
 
     if segments.is_empty() {
         return Err(Error::TranscodeFailed {
@@ -1294,29 +1325,6 @@ fn into_prepared_parts(
         .collect()
 }
 
-async fn collect_segments(path: &Path, prefix: &str) -> Result<Vec<SegmentOutput>, Error> {
-    let parent_dir = path.parent().unwrap_or(Path::new("."));
-    let mut segments = Vec::new();
-
-    // Scan the temp directory for segment files matching the prefix.
-    let mut entries = fs::read_dir(parent_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && name.starts_with(prefix)
-            && name.ends_with(".mp4")
-        {
-            let size = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-            if size > 0 {
-                segments.push(SegmentOutput { path, size });
-            }
-        }
-    }
-
-    segments.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(segments)
-}
-
 fn segments_fit_limit(segments: &[SegmentOutput], config: &EngineSettings) -> bool {
     for segment in segments {
         if segment.size > config.transcode.max_upload_bytes {
@@ -1456,6 +1464,13 @@ mod tests {
 
     fn split_oversize_script() -> String {
         "#!/bin/sh\ncopy_mode=0\npattern=''\nlast_mp4=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n    *.mp4)\n      last_mp4=\"$arg\"\n      ;;\n  esac\ndone\nif [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  if [ \"$copy_mode\" -eq 1 ]; then\n    printf 'raw0' > \"${prefix}000.mp4\"\n    printf 'raw1' > \"${prefix}001.mp4\"\n  else\n    printf 'ok' > \"${prefix}000.mp4\"\n    printf '0123456789ABCDEF' > \"${prefix}001.mp4\"\n  fi\n  exit 0\nfi\nif [ -n \"$last_mp4\" ]; then\n  case \"$last_mp4\" in\n    *seg000.mp4)\n      printf 'ok' > \"$last_mp4\"\n      ;;\n    *)\n      printf '0123456789ABCDEF' > \"$last_mp4\"\n      ;;\n  esac\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 1\n".to_string()
+    }
+
+    fn split_arg_log_script(log_path: &Path) -> String {
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nlast_mp4=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    *.mp4)\n      last_mp4=\"$arg\"\n      ;;\n  esac\ndone\nif [ -n \"$last_mp4\" ]; then\n  printf 'ok' > \"$last_mp4\"\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 1\n",
+            log_path.display()
+        )
     }
 
     fn assert_split_oversize(err: Error) {
@@ -1789,6 +1804,78 @@ mod tests {
 
         temp_files.shutdown().await;
         let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn split_serial_transcodes_each_segment_directly() {
+        let temp_files = TempFileCleanup::new();
+        let temp_dir = unique_temp_path("split-serial-direct-dir");
+        let script_path = unique_temp_path("split-serial-direct-ffmpeg.sh");
+        let log_path = unique_temp_path("split-serial-direct.log");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        write_executable(&script_path, &split_arg_log_script(&log_path));
+
+        let input_path = temp_dir.join("input.mp4");
+        fs::write(&input_path, b"input").expect("write input");
+
+        let mut config = EngineSettings::default();
+        config.binaries.ffmpeg = script_path.clone();
+        config.storage.temp_dir = temp_dir.clone();
+        config.transcode.max_upload_bytes = 1024;
+        config.transcode.ffmpeg_timeout_secs = 1;
+
+        let permits = Permits::new(&config.concurrency);
+        let runtime = TranscodeRuntime::new(HardwareAcceleration::None);
+        let ctx = TranscodeContext {
+            permits: &permits,
+            config: &config,
+            runtime: &runtime,
+        };
+        let downloaded = downloaded_file_at(
+            input_path.clone(),
+            32,
+            30.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+            &temp_files,
+        );
+        let dir_guard = temp_files.guard(temp_dir.clone());
+        let split_job = SplitTranscodeJob {
+            segment_duration: 10.0,
+            estimated_segments: 2,
+            bitrate: BitrateParams {
+                video_bitrate_kbps: 500,
+                audio_bitrate_kbps: 128,
+            },
+            settings: config.transcode.clone(),
+        };
+
+        let upload = split_serial(
+            downloaded,
+            &split_job,
+            &temp_files,
+            &ctx,
+            SplitTranscodeProgress::new(None, 2),
+            dir_guard,
+        )
+        .await
+        .expect("serial split should transcode both segments");
+
+        assert_eq!(upload.len(), 2);
+        let args = fs::read_to_string(&log_path).expect("read ffmpeg args");
+        assert!(args.contains("-ss 0.000"));
+        assert!(args.contains("-ss 10.000"));
+        assert!(args.contains("-t 10.000"));
+        assert!(!args.contains("%03d"));
+
+        temp_files.shutdown().await;
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_file(log_path);
         let _ = fs::remove_dir_all(temp_dir);
     }
 
