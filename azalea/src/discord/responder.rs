@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use twilight_http::Client;
+use twilight_http::api_error::ApiError;
+use twilight_http::error::{Error as TwilightError, ErrorType};
+use twilight_http::response::StatusCode;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ErrorNotificationPolicy {
@@ -166,13 +169,21 @@ pub async fn send_interaction_error(
 
     match error_notification_policy(error) {
         ErrorNotificationPolicy::SilentDelete => {
-            let _ = interaction.delete_response(token).await;
+            if let Err(error) = interaction.delete_response(token).await
+                && !is_unknown_interaction(&error)
+            {
+                tracing::warn!(error = %error, "Failed to delete interaction response");
+            }
         }
         ErrorNotificationPolicy::VisibleError => {
-            let _ = interaction
+            if let Err(error) = interaction
                 .update_response(token)
                 .content(Some(error.user_message()))
-                .await;
+                .await
+                && !is_unknown_interaction(&error)
+            {
+                tracing::warn!(error = %error, "Failed to update interaction response");
+            }
         }
     }
 }
@@ -187,9 +198,23 @@ pub async fn cleanup_interaction_response(
         .interaction(application_id.into())
         .delete_response(token)
         .await
+        && !is_unknown_interaction(&error)
     {
         tracing::warn!(error = %error, "Failed to delete interaction response");
     }
+}
+
+fn is_unknown_interaction(error: &TwilightError) -> bool {
+    let ErrorType::Response {
+        status,
+        error: ApiError::General(api_error),
+        ..
+    } = error.kind()
+    else {
+        return false;
+    };
+
+    *status == StatusCode::NOT_FOUND && api_error.code == 10062
 }
 
 /// Remove the temporary "processing" message after completion.

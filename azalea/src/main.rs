@@ -952,11 +952,12 @@ async fn run_pipeline_worker(
             "Forced shutdown requested; aborting pipeline jobs"
         );
         join_set.abort_all();
-    }
-
-    while let Some(result) = join_set.join_next().await {
-        if let Err(error) = result {
-            log_join_error(error);
+        drain_aborted_pipeline_jobs(&mut join_set, &log_join_error).await;
+    } else {
+        while let Some(result) = join_set.join_next().await {
+            if let Err(error) = result {
+                log_join_error(error);
+            }
         }
     }
 
@@ -969,6 +970,28 @@ async fn run_pipeline_worker(
         peak_queue_depth = app.queue_peak_depth(),
         "Pipeline worker shutting down"
     );
+}
+
+async fn drain_aborted_pipeline_jobs(
+    join_set: &mut JoinSet<()>,
+    log_join_error: &impl Fn(tokio::task::JoinError),
+) {
+    let deadline = Duration::from_secs(SHUTDOWN_STEP_TIMEOUT_SECS);
+    let drain = async {
+        while let Some(result) = join_set.join_next().await {
+            if let Err(error) = result {
+                log_join_error(error);
+            }
+        }
+    };
+
+    if tokio::time::timeout(deadline, drain).await.is_err() {
+        tracing::warn!(
+            remaining_jobs = join_set.len(),
+            timeout_secs = SHUTDOWN_STEP_TIMEOUT_SECS,
+            "Timed out waiting for aborted pipeline jobs"
+        );
+    }
 }
 
 /// Install a panic hook that best-effort flushes persistence to disk.
