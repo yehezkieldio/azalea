@@ -171,7 +171,7 @@ fn video_filter(
         )),
         (HardwareAcceleration::Vaapi, None) => Some("format=nv12|vaapi,hwupload".into()),
         (HardwareAcceleration::Qsv, Some(height)) => Some(format!(
-            "format=nv12,hwupload=extra_hw_frames=64,scale_qsv=-2:{height}"
+            "format=nv12,hwupload=extra_hw_frames=64,scale_qsv=-1:{height}"
         )),
         (HardwareAcceleration::Qsv, None) => {
             Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv".into())
@@ -821,7 +821,7 @@ mod tests {
         assert!(as_text.windows(2).any(|w| {
             w.first() == Some(&"-vf".to_string())
                 && w.get(1)
-                    .is_some_and(|value| value.contains("scale_qsv=-2:720"))
+                    .is_some_and(|value| value.contains("scale_qsv=-1:720"))
         }));
     }
 
