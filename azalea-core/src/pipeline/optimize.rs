@@ -787,15 +787,12 @@ impl SplitTranscodeProgress {
         );
     }
 
-    fn advance(&self, done: usize) {
+    fn finish_with_actual_total(&self, actual_segments: usize) {
+        let actual_segments = actual_segments.max(1);
         send_progress_best_effort(
             &self.progress_tx,
-            Progress::Transcoding(done, self.total_segments),
+            Progress::Transcoding(actual_segments, actual_segments),
         );
-    }
-
-    fn finish(&self) {
-        self.advance(self.total_segments);
     }
 }
 
@@ -866,7 +863,7 @@ async fn split_serial(
 
     let segments = ensure_split_segments_fit_limit(segments, ctx.config).await?;
     let segments_len = segments.len();
-    progress.finish();
+    progress.finish_with_actual_total(segments_len);
     let parts = into_prepared_parts(segments, temp_files);
     tracing::info!(segments = segments_len, "Serial split completed");
     Ok(PreparedUpload::split(parts, dir_guard))
@@ -920,10 +917,12 @@ async fn split_parallel(
     let mut finished = 0;
     let mut last_heartbeat = Instant::now();
 
-    for idx in 0..total_segments {
+    let max_active_segments = (effective_transcode_concurrency as usize).max(1);
+    let mut next_segment = 0usize;
+    while next_segment < total_segments && join_set.len() < max_active_segments {
         spawn_parallel_segment_task(
             &mut join_set,
-            idx,
+            next_segment,
             &downloaded.path,
             &stem,
             segment_duration,
@@ -934,6 +933,7 @@ async fn split_parallel(
             segment_video_kbps,
             segment_audio_kbps,
         );
+        next_segment += 1;
     }
 
     while finished < total_segments {
@@ -958,6 +958,22 @@ async fn split_parallel(
                     &progress_tx,
                     Progress::Transcoding(finished, total_segments),
                 );
+                while next_segment < total_segments && join_set.len() < max_active_segments {
+                    spawn_parallel_segment_task(
+                        &mut join_set,
+                        next_segment,
+                        &downloaded.path,
+                        &stem,
+                        segment_duration,
+                        Arc::clone(&transcode_permits),
+                        Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
+                        Arc::clone(&parallel_transcode),
+                        effective_transcode_concurrency,
+                        segment_video_kbps,
+                        segment_audio_kbps,
+                    );
+                    next_segment += 1;
+                }
             }
             Ok(Some(Ok(Err(e)))) => {
                 join_set.abort_all();
@@ -1777,6 +1793,16 @@ mod tests {
         send_progress_best_effort(&progress_tx, Progress::Transcoding(3, 3));
 
         assert_eq!(rx.recv().await, Some(Progress::Optimizing));
+        assert_eq!(rx.recv().await, Some(Progress::Transcoding(3, 3)));
+    }
+
+    #[tokio::test]
+    async fn split_progress_finish_uses_actual_segment_total() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let progress = SplitTranscodeProgress::new(Some(tx), 5);
+
+        progress.finish_with_actual_total(3);
+
         assert_eq!(rx.recv().await, Some(Progress::Transcoding(3, 3)));
     }
 

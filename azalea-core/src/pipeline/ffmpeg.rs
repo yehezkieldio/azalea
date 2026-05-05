@@ -373,10 +373,10 @@ pub fn transcode_segment_args(
 
     push_hw_device_input_args(&mut args, config, true);
 
-    args.push("-i".into());
-    args.push(input.as_os_str().into());
     args.push("-ss".into());
     args.push(format!("{start_secs:.3}").into());
+    args.push("-i".into());
+    args.push(input.as_os_str().into());
     args.push("-t".into());
     args.push(format!("{duration_secs:.3}").into());
 
@@ -758,6 +758,12 @@ mod tests {
         let as_text = to_strings(&args);
 
         assert!(as_text.windows(2).any(|w| w == ["-ss", "12.500"]));
+        let seek_index = as_text.iter().position(|arg| arg == "-ss");
+        let input_index = as_text.iter().position(|arg| arg == "-i");
+        assert!(matches!(
+            (seek_index, input_index),
+            (Some(seek_index), Some(input_index)) if seek_index < input_index
+        ));
         assert!(as_text.windows(2).any(|w| w == ["-t", "10.000"]));
         assert!(
             as_text

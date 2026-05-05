@@ -178,6 +178,7 @@ pub async fn download(
             .await?;
         let mut file = BufWriter::with_capacity(config.pipeline.download_write_buffer_bytes, file);
         let mut downloaded = 0u64;
+        let upload_ready_buffer_limit = upload_ready_buffer_limit(config);
         let mut upload_ready_bytes = bounded_upload_ready_buffer(total_size, config);
         let mut last_log = std::time::Instant::now();
         let log_interval = Duration::from_secs(5);
@@ -189,7 +190,7 @@ pub async fn download(
 
             let next_downloaded = downloaded.saturating_add(chunk.len() as u64);
             if let Some(bytes) = upload_ready_bytes.as_mut() {
-                if next_downloaded <= config.transcode.max_upload_bytes {
+                if next_downloaded <= upload_ready_buffer_limit {
                     bytes.extend_from_slice(&chunk);
                 } else {
                     upload_ready_bytes = None;
@@ -348,11 +349,7 @@ fn bounded_upload_ready_buffer(
     total_size: Option<u64>,
     config: &EngineSettings,
 ) -> Option<Vec<u8>> {
-    let max_upload_bytes = config.transcode.max_upload_bytes;
-    let buffer_limit = config
-        .pipeline
-        .upload_ready_buffer_max_bytes
-        .min(max_upload_bytes);
+    let buffer_limit = upload_ready_buffer_limit(config);
     if buffer_limit == 0 || total_size.is_some_and(|size| size > buffer_limit) {
         return None;
     }
@@ -365,6 +362,13 @@ fn bounded_upload_ready_buffer(
     // Retain pass-through bytes only for under-limit candidates. This bounds
     // extra memory to one upload-sized buffer per eligible in-flight job.
     Some(Vec::with_capacity(capacity))
+}
+
+fn upload_ready_buffer_limit(config: &EngineSettings) -> u64 {
+    config
+        .pipeline
+        .upload_ready_buffer_max_bytes
+        .min(config.transcode.max_upload_bytes)
 }
 
 async fn fetch_with_redirects(
@@ -680,6 +684,7 @@ mod tests {
     use super::{
         FetchStep, MAX_REDIRECTS, bounded_upload_ready_buffer, content_length_header_bytes,
         estimate_bitrate_kbps, fetch_with_redirects_inner, parse_bitrate_kbps,
+        upload_ready_buffer_limit,
     };
     use crate::config::EngineSettings;
     use crate::pipeline::errors::{DownloadError, Error};
@@ -740,6 +745,16 @@ mod tests {
         let bounded = bounded_upload_ready_buffer(Some(1024), &config);
         assert_eq!(bounded.map(|buffer| buffer.capacity()), Some(1024));
         assert_eq!(bounded_upload_ready_buffer(Some(1025), &config), None);
+    }
+
+    #[test]
+    fn upload_ready_streaming_limit_uses_memory_cap_not_upload_cap() {
+        let mut config = EngineSettings::default();
+        config.transcode.max_upload_bytes = 8 * 1024;
+        config.pipeline.upload_ready_buffer_max_bytes = 1024;
+
+        assert_eq!(upload_ready_buffer_limit(&config), 1024);
+        assert!(bounded_upload_ready_buffer(None, &config).is_some());
     }
 
     #[tokio::test]
