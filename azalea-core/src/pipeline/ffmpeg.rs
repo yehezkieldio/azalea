@@ -263,6 +263,10 @@ fn push_video_encoding_args(
             args.push(format!("{}k", video_kbps_clamped).into());
             args.push("-bufsize".into());
             args.push(format!("{}k", video_buf_kbps).into());
+            args.push("-bitrate_limit".into());
+            args.push("1".into());
+            args.push("-low_delay_brc".into());
+            args.push("1".into());
         }
         HardwareAcceleration::Amf => {
             let quality = match config.quality_preset {
@@ -682,6 +686,10 @@ mod tests {
             .collect()
     }
 
+    fn flag_count(args: &[String], flag: &str) -> usize {
+        args.iter().filter(|arg| arg.as_str() == flag).count()
+    }
+
     #[test]
     fn remux_args_include_copy_faststart_and_output() {
         let args = remux_args(Path::new("in.mp4"), Path::new("out.mp4"), 4);
@@ -823,6 +831,33 @@ mod tests {
                 && w.get(1)
                     .is_some_and(|value| value.contains("scale_qsv=-1:720"))
         }));
+        assert!(as_text.windows(2).any(|w| w == ["-bitrate_limit", "1"]));
+        assert!(as_text.windows(2).any(|w| w == ["-low_delay_brc", "1"]));
+    }
+
+    #[test]
+    fn transcode_segment_args_configure_qsv_bitrate_control() {
+        let args = transcode_segment_args(
+            Path::new("input.mp4"),
+            Path::new("seg001.mp4"),
+            0.0,
+            120.0,
+            278,
+            128,
+            &TranscodeSettings {
+                hardware_acceleration: HardwareAcceleration::Qsv,
+                ..TranscodeSettings::default()
+            },
+            2,
+        );
+        let as_text = to_strings(&args);
+
+        assert!(as_text.windows(2).any(|w| w == ["-c:v", "h264_qsv"]));
+        assert!(as_text.windows(2).any(|w| w == ["-b:v", "278k"]));
+        assert!(as_text.windows(2).any(|w| w == ["-maxrate", "278k"]));
+        assert!(as_text.windows(2).any(|w| w == ["-bitrate_limit", "1"]));
+        assert!(as_text.windows(2).any(|w| w == ["-low_delay_brc", "1"]));
+        assert_eq!(flag_count(&as_text, "-b:a"), 1);
     }
 
     #[test]
