@@ -1,7 +1,7 @@
 <div align="center">
 <img src="assets/avatar.png" align="center" width="120px" height="120px" />
 <h3>Azalea</h3>
-<p>Discord bot for X media: detects & reuploads links automatically</p>
+<p>Discord bot for X media: resolves, optimizes, and uploads links from /media</p>
 
 <!-- <a href="https://deepwiki.com/yehezkieldio/azalea"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a> -->
 
@@ -23,10 +23,11 @@ Azalea is a Discord bot that fetches X (formerly Twitter) media directly into yo
 ## Features
 
 - **Dual Resolver with Automatic Fallback**: Resolves media via the VxTwitter API first; falls back to yt-dlp automatically if that request fails or returns incomplete data. Maximizes reliability and compatibility with various X content and account types.
-- **Size-Aware Transcoding**: Applies the cheapest viable strategy to bring a file under Discord's upload limit: pass-through, remux, transcode, or segment split. Re-encoding is performed only when strictly necessary. Performance-optimized presets balance speed and quality for typical X video content.
-- **Hardware-Accelerated Encoding**: Offloads H.264 encoding to VAAPI, NVENC, VideoToolbox, QSV, or AMF when available on the host with a compatible FFmpeg build, with libx264 as a software fallback.
+- **Size-Aware Transcoding**: Applies the cheapest viable strategy to bring a file under Discord's upload limit: pass-through, remux, full-file transcode, or split-transcode. Re-encoding is performed only when strictly necessary. Performance-optimized presets balance speed and quality for typical X video content.
+- **Hardware-Accelerated Encoding**: Offloads H.264 encoding to VAAPI, NVENC, VideoToolbox, QSV, or AMF when available on the host with a compatible FFmpeg build, with runtime fallback to libx264 if a configured hardware encoder fails.
 - **Persistent Deduplication**: Tracks processed media URLs across restarts using a Redb-backed cache. Identical requests within the configured TTL window are served immediately without re-downloading or re-transcoding.
 - **Rate Limiting**: Per-user and per-channel sliding-window rate limits prevent abuse and protect Discord API quotas. Limits and window durations are configurable independently for users and channels.
+- **Operator Diagnostics**: `/status`, `/stats`, structured logs, and Redb-backed metrics expose queue depth, resolver cache health, stage timing, upload timing, active encoder backend, and hardware fallback counts.
 
 ## Pipeline
 
@@ -34,8 +35,8 @@ Each `/media` invocation runs through a fixed sequence of stages:
 
 1. **Resolve**: The URL is submitted to the cached resolver chain. VxTwitter is tried first; yt-dlp is invoked as a fallback if that fails or returns incomplete metadata. Results are cached with a configurable TTL to avoid redundant outbound requests.
 2. **Download**: The resolved media URL is SSRF-validated, checked against the allowlist, and streamed to a temporary file under a configured size cap. Disk space is verified before writing begins.
-3. **Optimize**: A strategy ladder selects the cheapest path to meet Discord's upload limit: pass-through (already fits) → remux (container swap only) → transcode (re-encode with H.264) → segment split (sequential chunks). Hardware acceleration is applied at the transcode step when configured.
-4. **Upload**: Prepared files are uploaded to Discord as native attachments. Segments are posted sequentially by default to preserve order, or can be batched into a single message. A progress message is updated during long operations and cleaned up on completion.
+3. **Optimize**: A strategy ladder selects the cheapest path to meet Discord's upload limit: pass-through (already fits) → remux (container swap only) → balanced transcode → aggressive transcode → split-transcode. Split output is generated as upload-safe H.264 segments with reset timestamps and fast-start metadata. Hardware acceleration is applied at transcode steps when configured, with runtime fallback to software encoding.
+4. **Upload**: Prepared files are uploaded to Discord as native attachments. Multiple media parts are batched by default when possible, with deterministic ordering; batching can be disabled to send one segment per message. Progress responses are updated during long operations and cleaned up on completion.
 5. **Persistence**: Deduplication entries and pipeline metrics are flushed to Redb in background tasks. Temp files are removed by RAII guards regardless of outcome.
 
 ## Building from Source
@@ -82,6 +83,7 @@ worker_threads = 4
 download = 4
 upload = 2
 transcode = 1
+ytdlp = 1
 pipeline = 8
 
 [transcode]
@@ -90,6 +92,8 @@ hardware_acceleration = "none" # none | vaapi | nvenc | videotoolbox | qsv | amf
 max_upload_bytes = 8388608     # 8 MiB (Discord free tier default)
 
 [pipeline]
+upload_ready_buffer_max_bytes = 8388608
+batch_upload_multiple_media = true
 user_rate_limit_requests = 10
 user_rate_limit_window_secs = 60
 channel_rate_limit_requests = 20
@@ -215,10 +219,14 @@ Selected environment variables:
 | ------------------------------------------ | ----------------------------------------- | --------------------- |
 | `DISCORD_TOKEN`                            | — (env/`.env` only)                       | required              |
 | `APPLICATION_ID` / `AZALEA_APPLICATION_ID` | `application_id`                          | required              |
-| `AZALEA_HARDWARE_ACCELERATION`             | `transcode.hardware_acceleration`         | `none`                |
-| `AZALEA_MAX_UPLOAD_BYTES`                  | `transcode.max_upload_bytes`              | `8388608`             |
 | `AZALEA_QUALITY_PRESET`                    | `transcode.quality_preset`                | `fast`                |
+| `AZALEA_HARDWARE_ACCELERATION`             | `transcode.hardware_acceleration`         | `none`                |
+| `AZALEA_FFMPEG_THREADS`                    | `transcode.ffmpeg_threads`                | `0` (auto)            |
+| `AZALEA_MAX_UPLOAD_BYTES`                  | `transcode.max_upload_bytes`              | `8388608`             |
 | `AZALEA_VAAPI_DEVICE`                      | `transcode.vaapi_device`                  | `/dev/dri/renderD128` on Unix, empty on non-Unix |
+| `AZALEA_UPLOAD_READY_BUFFER_MAX_BYTES`     | `pipeline.upload_ready_buffer_max_bytes`  | `8388608`             |
+| `AZALEA_MAX_DOWNLOAD_BYTES`                | `pipeline.max_download_bytes`             | `524288000`           |
+| `AZALEA_BATCH_UPLOAD_MULTIPLE_MEDIA`       | `pipeline.batch_upload_multiple_media`    | `true`                |
 | `AZALEA_TEMP_DIR`                          | `storage.temp_dir`                        | system temp dir + `azalea` |
 | `AZALEA_DEDUP_PERSISTENT`                  | `storage.dedup_persistent`                | `true`                |
 | `AZALEA_DEDUP_TTL_HOURS`                   | `storage.dedup_ttl_hours`                 | `24`                  |
@@ -230,12 +238,15 @@ Selected environment variables:
 | `AZALEA_FFPROBE` / `AZALEA_FFPROBE_PATH`   | `binaries.ffprobe`                        | `ffprobe`             |
 | `AZALEA_YTDLP_PATH`                        | `binaries.ytdlp`                          | `yt-dlp`              |
 
-The full list of environment variables is documented in `azalea.config.toml`.
+For the full configuration surface, run `cargo run -p azalea --bin generate-config` or inspect `azalea.schema.json`.
 
 ## Operations and Observability
 
 - **Deduplication**: Processed media URLs are stored in `azalea-dedup.redb`. Requests for the same URL within the TTL window are resolved immediately without re-downloading. The store is flushed to disk periodically and survives restarts when `dedup_persistent = true`.
 - **Metrics**: Pipeline metrics are persisted to `azalea-metrics.redb` and flushed in a background task.
+- **Runtime status**: `/status` reports uptime, queue depth, dedup and resolver cache sizes, active transcode backend, hardware/software encode counts, average encode durations, and hardware fallback transitions.
+- **Stage stats**: `/stats` reports current and peak queue depth plus average stage timings for resolve, download, optimize, and upload since startup or the last successful metrics flush.
+- **Upload timing**: Upload logs split latency into attachment preparation, Discord HTTP send, response parsing, cleanup, payload bytes, request count, and effective throughput.
 - **Temp files**: All temporary files are managed by RAII guards and removed on completion or failure, including on panics.
 - **Session resume**: Gateway session state is written to `azalea-resume-info.json` on shutdown and used to resume the WebSocket session on restart, reducing reconnect latency.
 - **Logging**: Log output is controlled by `RUST_LOG`.
