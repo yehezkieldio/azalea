@@ -79,3 +79,44 @@ Serial split kept the old segment-muxer path, so low-concurrency runs could stil
 
 - Make `split_serial(...)` transcode each output segment directly from the original input, matching the parallel path's timestamp/keyframe hygiene.
 - Delete the unused segment-muxer and copy-split ffmpeg helpers so production cannot fall back to the stale path.
+
+## 2026-05-05 Long Split Oversize Follow-Up
+
+### Observations
+
+- The failing long video was 167.872s at 1280x720 and split into two direct software segments after QSV was disabled for the 278 kbps split budget.
+- Both segment transcodes completed, then `ensure_split_segments_fit_limit(...)` rejected the output with `split segment exceeded upload limit`.
+- The computed budget was 278 kbps video plus 128 kbps audio for a 120s segment, which should fit under 8 MiB.
+- The software encoder args used budget caps but previously lacked `-b:v`, and direct segment args forced keyframes with `expr:gte(t,0)`.
+
+### Hypotheses
+
+#### H1: Software x264 is not using average bitrate mode
+- Supports: the software path used CRF with peak caps; CRF is not an upload-size budget.
+- Conflicts: not enough to explain a 2x overshoot after adding `-b:v` in isolation.
+- Test: add an args regression that software transcode emits `-b:v` and no `-crf`.
+
+#### H2: Direct segment keyframe expression forces every frame as a keyframe
+- Supports: `expr:gte(t,0)` is true for every frame timestamp at or after zero, causing all-I-frame output.
+- Conflicts: none after synthetic ffmpeg smoke reproduced the oversized bitrate.
+- Test: encode 120s of 720p `testsrc2` at 278k/128k with `-force_key_frames 0` and verify output stays below 8 MiB.
+
+#### H3: The planner's bitrate math is too optimistic
+- Supports: the output exceeded the cap.
+- Conflicts: after correcting keyframes, a 120s 720p synthetic motion sample produced a 6,221,661 byte output.
+- Test: keep existing split budget tests and live smoke the encoder args.
+
+### Experiments
+
+- H1 partially confirmed: software output should be ABR for upload-budgeted transcodes, so `libx264` now receives `-b:v` and no `-crf`.
+- H2 confirmed: a 20s synthetic smoke with `expr:gte(t,0)` produced about 2.0 MB, while `-force_key_frames 0` produced about 1.06 MB with the same bitrate settings.
+- A full 120s synthetic 1280x720 smoke at 278k video and 128k audio produced 6,221,661 bytes, below the 8,388,608 byte cap.
+
+### Root Cause
+
+Direct segment transcodes forced every frame to be a keyframe, and software fallback used quality-oriented x264 settings instead of strict average bitrate control, so long motion-heavy segments could exceed Discord's upload cap.
+
+### Fix
+
+- Use ABR for software x264 budgeted transcodes by emitting `-b:v` and removing `-crf`.
+- Change direct segment keyframe forcing from `expr:gte(t,0)` to `0`, which forces only the segment's first frame.

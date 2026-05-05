@@ -200,7 +200,6 @@ fn push_video_encoding_args(
     match config.hardware_acceleration {
         HardwareAcceleration::None => {
             let threads = config.effective_ffmpeg_threads(transcode_concurrency);
-            let crf = config.quality_preset.crf();
             let preset = config.quality_preset.ffmpeg_preset();
             let x264_params = if preset == "ultrafast" || preset == "superfast" {
                 format!("threads={}", threads)
@@ -211,8 +210,8 @@ fn push_video_encoding_args(
 
             args.push("-preset".into());
             args.push(preset.into());
-            args.push("-crf".into());
-            args.push(crf.to_string().into());
+            args.push("-b:v".into());
+            args.push(format!("{}k", video_kbps_clamped).into());
             args.push("-maxrate".into());
             args.push(format!("{}k", video_kbps_clamped).into());
             args.push("-bufsize".into());
@@ -401,7 +400,7 @@ pub fn transcode_segment_args(
     args.push("-ac".into());
     args.push("2".into());
     args.push("-force_key_frames".into());
-    args.push("expr:gte(t,0)".into());
+    args.push("0".into());
     args.push("-reset_timestamps".into());
     args.push("1".into());
     args.push("-avoid_negative_ts".into());
@@ -642,6 +641,27 @@ mod tests {
     }
 
     #[test]
+    fn software_transcode_uses_average_bitrate_for_upload_budget() {
+        let args = transcode_segment_args(
+            Path::new("input.mp4"),
+            Path::new("seg001.mp4"),
+            0.0,
+            120.0,
+            278,
+            128,
+            &TranscodeSettings::default(),
+            2,
+        );
+        let as_text = to_strings(&args);
+
+        assert!(as_text.windows(2).any(|w| w == ["-c:v", "libx264"]));
+        assert!(as_text.windows(2).any(|w| w == ["-b:v", "278k"]));
+        assert!(as_text.windows(2).any(|w| w == ["-maxrate", "278k"]));
+        assert!(as_text.windows(2).any(|w| w == ["-bufsize", "556k"]));
+        assert!(!as_text.iter().any(|arg| arg == "-crf"));
+    }
+
+    #[test]
     fn transcode_segment_args_seek_and_reset_segment_timestamps() {
         let args = transcode_segment_args(
             Path::new("input.mp4"),
@@ -663,11 +683,7 @@ mod tests {
             (Some(seek_index), Some(input_index)) if seek_index < input_index
         ));
         assert!(as_text.windows(2).any(|w| w == ["-t", "10.000"]));
-        assert!(
-            as_text
-                .windows(2)
-                .any(|w| w == ["-force_key_frames", "expr:gte(t,0)"])
-        );
+        assert!(as_text.windows(2).any(|w| w == ["-force_key_frames", "0"]));
         assert!(as_text.windows(2).any(|w| w == ["-reset_timestamps", "1"]));
         assert!(
             as_text
