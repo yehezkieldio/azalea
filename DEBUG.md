@@ -37,3 +37,4 @@ The QSV segment encoder was given bitrate targets but not the QSV bitrate-contro
 
 - Add QSV bitrate-control flags to generated ffmpeg args.
 - Add argument-level regression tests for QSV rate-control and direct segment audio bitrate flags.
+- Add a split-transcode guard so QSV does not encode segments whose planned video bitrate is below `transcode.min_bitrate_kbps`; those low-bitrate split chunks use `libx264` instead.
