@@ -7,7 +7,31 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.4.3 (May 5, 2026)
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`8e3a79b`](https://github.com/yehezkieldio/azalea/commit/8e3a79b747648b6e277bfa1ee1c4453be490b736) Add agent skills
+
+### <!-- 3 -->🚀 New Features
+- [`722cb44`](https://github.com/yehezkieldio/azalea/commit/722cb4420e2b799036ca98e607a094be5e866a96) **pipeline**: Add upload_ready_buffer_max_bytes setting
+- [`cd4afea`](https://github.com/yehezkieldio/azalea/commit/cd4afea69e0c62171da0fad9793409e22b4f3e57) Add upload_ready_buffer_max_bytes and hw fallback transitions
+- [`04cfd1b`](https://github.com/yehezkieldio/azalea/commit/04cfd1b59fd463942496668684afa48eb58d8a50) **pipeline**: Add transcode_segment_args builder and segment tests
+
+### <!-- 4 -->🐛 Bug Fixes
+- [`10d8d74`](https://github.com/yehezkieldio/azalea/commit/10d8d74cdaa6fe60a39136f3d58e9420d2618f87) **quality**: Make SplitTranscodePlan resolution-aware for 720p
+- [`ac33393`](https://github.com/yehezkieldio/azalea/commit/ac333933d126d1f7fbbc579654797858eb792b37) **pipeline**: Use -b:v and force only first segment keyframe
+- [`3231b63`](https://github.com/yehezkieldio/azalea/commit/3231b63eb6d1901e4e253ecd2a76a40f56322a5d) **pipeline**: Transcode serial split segments directly per segment
+- [`c1244c8`](https://github.com/yehezkieldio/azalea/commit/c1244c83e464e740dc8a8aad0ae53282f974c621) Guard unknown interaction errors and drain aborted jobs with timeout
+- [`f85b42a`](https://github.com/yehezkieldio/azalea/commit/f85b42aa8d9aff8959a2ae980154f8cd5a8eba47) **pipeline**: Preserve explicit software encoder in hw fallback
+- [`fcd57f7`](https://github.com/yehezkieldio/azalea/commit/fcd57f747fb12de419376f94e7e6c810bd1b5c50) **pipeline**: Guard qsv split for low bitrate using software encoder
+- [`9233a34`](https://github.com/yehezkieldio/azalea/commit/9233a343a856bde739f58c6931aa2cd9289b2857) **pipeline**: Add qsv bitrate-control flags to ffmpeg args
+- [`2a02eea`](https://github.com/yehezkieldio/azalea/commit/2a02eeaea5b84849f9709242c7002b67a4daa4c7) **pipeline**: Adjust scale_qsv qsv scaling from -2 to -1
+- [`d7847a8`](https://github.com/yehezkieldio/azalea/commit/d7847a8ba40ae48d3da0fddfc8f9aad851d05d59) **pipeline**: Cap upload buffer and use actual segment total
+
 ## 0.4.2 (April 16, 2026)
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`19f3b6a`](https://github.com/yehezkieldio/azalea/commit/19f3b6a0741196dc0fa65b1931852787b04c321a) **release**: 0.4.2
 
 ### <!-- 3 -->🚀 New Features
 - [`30dd999`](https://github.com/yehezkieldio/azalea/commit/30dd999439f4c67fb563aef5eabe548635241a97) **azalea**: Add cancellation token for forced pipeline shutdown
