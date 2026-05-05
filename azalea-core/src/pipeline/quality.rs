@@ -30,6 +30,8 @@ pub struct SplitTranscodePlan {
     pub bitrate: BitrateParams,
 }
 
+const MAX_SPLIT_ATTACHMENTS_PER_BATCH: u32 = 10;
+
 impl BitrateParams {
     /// Compute bitrate targets given duration and size constraints.
     ///
@@ -115,22 +117,56 @@ impl BitrateParams {
 }
 
 impl SplitTranscodePlan {
-    /// Compute a single split-transcode plan from the source duration.
+    /// Compute a split-transcode plan from the source duration and resolution.
     ///
-    /// The planner uses the actual segment duration that will be handed to
-    /// ffmpeg, so short media can spend the full segment budget on one part
-    /// instead of being budgeted as if it were already at the max segment cap.
-    pub fn compute(config: &TranscodeSettings, media_duration: f64) -> Result<Self, Error> {
+    /// The planner spends extra attachments before accepting a bitrate that
+    /// would force a visible downshift for the source height.
+    pub fn compute(
+        config: &TranscodeSettings,
+        media_duration: f64,
+        source_height: Option<u32>,
+    ) -> Result<Self, Error> {
         validate_duration(media_duration, TranscodeStage::Split)?;
-        let segment_duration = media_duration.min(config.max_single_video_duration_secs as f64);
-        let bitrate = BitrateParams::compute_for_split(config, segment_duration)?;
+        let max_segment_duration = media_duration.min(config.max_single_video_duration_secs as f64);
+        let min_segments = (media_duration / max_segment_duration).ceil().max(1.0) as u32;
+        let max_segments = MAX_SPLIT_ATTACHMENTS_PER_BATCH.max(min_segments);
 
-        Ok(Self {
-            segment_duration,
-            estimated_segments: (media_duration / segment_duration).ceil() as u32,
-            bitrate,
+        let mut fallback = None;
+        for segments in min_segments..=max_segments {
+            let segment_duration = media_duration / segments as f64;
+            let bitrate = BitrateParams::compute_for_split(config, segment_duration)?;
+            let plan = Self {
+                segment_duration,
+                estimated_segments: segments,
+                bitrate,
+            };
+            fallback = Some(plan);
+
+            if split_plan_preserves_source_height(config, source_height, bitrate) {
+                return Ok(plan);
+            }
+        }
+
+        fallback.ok_or_else(|| Error::TranscodeFailed {
+            stage: TranscodeStage::Split,
+            exit_code: None,
+            stderr_tail: "split plan could not be computed".to_string(),
         })
     }
+}
+
+fn split_plan_preserves_source_height(
+    config: &TranscodeSettings,
+    source_height: Option<u32>,
+    bitrate: BitrateParams,
+) -> bool {
+    Ladder::recommend(
+        source_height,
+        bitrate.video_bitrate_kbps,
+        config.quality_preset,
+    )
+    .target_height
+    .is_none()
 }
 
 fn validate_duration(duration: f64, stage: TranscodeStage) -> Result<(), Error> {
@@ -416,7 +452,7 @@ mod tests {
             ..TranscodeSettings::default()
         };
 
-        let plan = SplitTranscodePlan::compute(&config, 60.0)
+        let plan = SplitTranscodePlan::compute(&config, 60.0, None)
             .expect("short input should produce a split-transcode plan");
 
         assert_eq!(plan.segment_duration, 60.0);
@@ -437,13 +473,24 @@ mod tests {
             ..TranscodeSettings::default()
         };
 
-        let plan = SplitTranscodePlan::compute(&config, 300.0)
+        let plan = SplitTranscodePlan::compute(&config, 300.0, None)
             .expect("long input should produce a split-transcode plan");
 
-        assert_eq!(plan.segment_duration, 120.0);
-        assert_eq!(plan.estimated_segments, 3);
+        assert_eq!(plan.segment_duration, 60.0);
+        assert_eq!(plan.estimated_segments, 5);
         assert_eq!(plan.bitrate.audio_bitrate_kbps, 128);
-        assert_eq!(plan.bitrate.video_bitrate_kbps, 538);
+        assert_eq!(plan.bitrate.video_bitrate_kbps, 1_205);
+    }
+
+    #[test]
+    fn split_transcode_plan_uses_more_segments_to_preserve_720p() {
+        let plan = SplitTranscodePlan::compute(&TranscodeSettings::default(), 167.872, Some(720))
+            .expect("default config should produce a split-transcode plan");
+
+        assert_eq!(plan.estimated_segments, 4);
+        assert!(plan.segment_duration > 41.0);
+        assert!(plan.segment_duration < 42.0);
+        assert!(plan.bitrate.video_bitrate_kbps >= 1_000);
     }
 
     #[test]

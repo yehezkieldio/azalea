@@ -352,7 +352,9 @@ fn build_strategy_plan(
 ) -> StrategyPlan {
     let remux_viable = remux_is_plausible(downloaded);
     let single_transcode_viable = single_transcode_is_plausible(duration, config);
-    let split_transcode = SplitTranscodePlan::compute(&config.transcode, duration).ok();
+    let source_height = downloaded.resolution.map(|(_, height)| height);
+    let split_transcode =
+        SplitTranscodePlan::compute(&config.transcode, duration, source_height).ok();
 
     let remux = if remux_viable {
         Some(TranscodeStrategy::Remux)
@@ -1575,8 +1577,8 @@ mod tests {
         let split_transcode = plan
             .split_transcode
             .expect("split-transcode plan should be computed");
-        assert_eq!(split_transcode.segment_duration, 60.0);
-        assert_eq!(split_transcode.estimated_segments, 1);
+        assert_eq!(split_transcode.segment_duration, 20.0);
+        assert_eq!(split_transcode.estimated_segments, 3);
     }
 
     #[test]
@@ -1660,8 +1662,8 @@ mod tests {
         let split_transcode = plan
             .split_transcode
             .expect("split-transcode plan should be computed");
-        assert_eq!(split_transcode.segment_duration, 120.0);
-        assert_eq!(split_transcode.estimated_segments, 6);
+        assert_eq!(split_transcode.segment_duration, 72.0);
+        assert_eq!(split_transcode.estimated_segments, 10);
     }
 
     #[test]

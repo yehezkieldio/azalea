@@ -120,3 +120,43 @@ Direct segment transcodes forced every frame to be a keyframe, and software fall
 
 - Use ABR for software x264 budgeted transcodes by emitting `-b:v` and removing `-crf`.
 - Change direct segment keyframe forcing from `expr:gte(t,0)` to `0`, which forces only the segment's first frame.
+
+## 2026-05-05 Split Pixelation Follow-Up
+
+### Observations
+
+- The 167.872s 1280x720 run succeeded with two parts, but each part had only a 278 kbps video budget.
+- The upload payload was 8,504,632 bytes across both files, so the size fix worked by compressing aggressively under the per-file cap.
+- 278 kbps is below the 720p ladder floor; changing QSV/VAAPI/software cannot create more bits inside the same 120s segment.
+- Discord accepts up to 10 attachments per upload request in this code path, and current batching already supports multiple parts.
+
+### Hypotheses
+
+#### H1: The split planner optimizes for fewest parts instead of preserving visible resolution
+- Supports: it always used the max 120s segment duration before computing bitrate.
+- Conflicts: fewer parts are faster to upload and less noisy in Discord.
+- Test: for the reported 167.872s 720p input, compute a quality-aware split plan and verify it raises bitrate above the 720p floor.
+
+#### H2: Hardware encoder mixing would improve the current two-part output
+- Supports: QSV may be faster than software for supported bitrates.
+- Conflicts: the logged budget is 278 kbps; encoder choice cannot make that enough for 720p.
+- Test: inspect planner math before adding backend complexity.
+
+#### H3: Downscaling would be better than more parts
+- Supports: 278 kbps can be acceptable at lower resolution.
+- Conflicts: the source is 720p and the uploader can batch more parts; preserving resolution is preferable while staying under attachment limits.
+- Test: use more segments first; downscale remains the fallback when even 10 parts cannot preserve the source height.
+
+### Experiments
+
+- H1 confirmed: quality-aware planning chooses four roughly 42s parts for the reported 167.872s 720p input, raising the video budget above 1000 kbps.
+- The existing parallel split threshold is 4, so this case should use parallel segment transcodes with the current transcode concurrency of 2.
+
+### Root Cause
+
+Split planning minimized attachment count by using 120s chunks, which starved 720p segments to 278 kbps and made successful uploads visibly pixelated.
+
+### Fix
+
+- Make `SplitTranscodePlan` resolution-aware and spend up to one Discord batch of attachments to preserve the source-height bitrate tier.
+- Pass downloaded source height into split planning.
