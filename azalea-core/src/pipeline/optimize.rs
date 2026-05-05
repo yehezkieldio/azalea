@@ -1169,7 +1169,7 @@ where
     F: Fn(&TranscodeSettings) -> ffmpeg::Args,
 {
     let started_at = Instant::now();
-    let active_settings = transcode_runtime.effective_settings(base_settings);
+    let active_settings = encode_settings_for_attempt(base_settings, transcode_runtime);
     let args = build_args(&active_settings);
 
     match ffmpeg::execute(ffmpeg_path, &args, timeout, stage).await {
@@ -1184,7 +1184,7 @@ where
         }
         Err(error) if should_retry_with_software(&error, active_settings.hardware_acceleration) => {
             let latched = transcode_runtime.activate_software_fallback();
-            let retry_settings = transcode_runtime.effective_settings(base_settings);
+            let retry_settings = encode_settings_for_attempt(base_settings, transcode_runtime);
             let Some(retry_timeout) = remaining_timeout_budget(started_at, timeout) else {
                 tracing::warn!(
                     ?stage,
@@ -1221,6 +1221,17 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+fn encode_settings_for_attempt(
+    base_settings: &TranscodeSettings,
+    transcode_runtime: &TranscodeRuntime,
+) -> TranscodeSettings {
+    if !base_settings.hardware_acceleration.is_hardware() {
+        return base_settings.clone();
+    }
+
+    transcode_runtime.effective_settings(base_settings)
 }
 
 fn elapsed_ms(started_at: Instant) -> u64 {
@@ -1928,6 +1939,57 @@ mod tests {
         assert_eq!(runtime.hw_encode_count(), 0);
         assert_eq!(runtime.sw_encode_count(), 1);
         assert!(runtime.sw_avg_duration_ms() <= outcome.duration_ms);
+
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_file(log_path);
+    }
+
+    #[tokio::test]
+    async fn explicit_software_attempt_is_not_overridden_by_runtime_hardware() {
+        let script_path = unique_temp_path("ffmpeg-explicit-software.sh");
+        let log_path = unique_temp_path("ffmpeg-explicit-software.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \" $* \" in\n  *\" libx264 \"*)\n    exit 0\n    ;;\nesac\nprintf '%s\\n' 'expected software encoder' >&2\nexit 2\n",
+            log_path.display()
+        );
+        fs::write(&script_path, script).expect("write ffmpeg stub");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("stat ffmpeg stub")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod ffmpeg stub");
+
+        let runtime = TranscodeRuntime::new(HardwareAcceleration::Qsv);
+        let settings = TranscodeSettings {
+            hardware_acceleration: HardwareAcceleration::None,
+            ..TranscodeSettings::default()
+        };
+
+        let outcome = execute_with_hwacc_fallback(
+            &script_path,
+            Duration::from_secs(1),
+            TranscodeStage::Split,
+            &settings,
+            &runtime,
+            |active_settings| {
+                let mut args = pipeline::ffmpeg::Args::new();
+                args.push("-c:v".into());
+                args.push(active_settings.hardware_acceleration.encoder().into());
+                args
+            },
+        )
+        .await
+        .expect("explicit software encode should succeed");
+
+        let invocations = fs::read_to_string(&log_path).expect("read ffmpeg invocation log");
+        assert!(invocations.contains("libx264"));
+        assert!(!invocations.contains("h264_qsv"));
+        assert_eq!(outcome.encoder_used, "libx264");
+        assert_eq!(outcome.backend_used, HardwareAcceleration::None);
+        assert!(!outcome.used_hardware);
+        assert_eq!(runtime.active_backend(), HardwareAcceleration::Qsv);
+        assert_eq!(runtime.hw_encode_count(), 0);
+        assert_eq!(runtime.sw_encode_count(), 1);
 
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_file(log_path);
