@@ -71,6 +71,7 @@ struct ParallelSegmentTranscodeContext {
 struct SplitTranscodeJob {
     segment_duration: f64,
     estimated_segments: u32,
+    transcode_concurrency: u32,
     bitrate: BitrateParams,
     settings: TranscodeSettings,
 }
@@ -110,8 +111,6 @@ pub async fn optimize(
         resolution = ?downloaded.resolution.or(resolved.resolution),
         "Optimizing media"
     );
-    validate_input_exists(&downloaded.path).await?;
-
     let max_upload_bytes = config.transcode.max_upload_bytes;
     tracing::trace!(max_upload_bytes, "Transcode limits");
     if downloaded.size <= max_upload_bytes {
@@ -128,6 +127,9 @@ pub async fn optimize(
             limit_bytes = max_upload_bytes,
             "Upload ready without re-encode"
         );
+        if downloaded.upload_ready_bytes.is_none() {
+            validate_input_exists(&downloaded.path).await?;
+        }
         let dir_guard = downloaded
             ._dir_guard
             .take()
@@ -144,6 +146,8 @@ pub async fn optimize(
         };
         return Ok(PreparedUpload::single(prepared_part, dir_guard));
     }
+
+    validate_input_exists(&downloaded.path).await?;
 
     let min_space = config.pipeline.min_disk_space_bytes;
     let required = min_space.saturating_add(downloaded.size.saturating_mul(2));
@@ -479,16 +483,16 @@ async fn optimize_image(
         .with_extension(format!("opt.{}", output_ext));
     let size_ratio = downloaded.size as f64 / config.transcode.max_upload_bytes as f64;
 
-    let (quality_levels, scale_factors): (Vec<u32>, Vec<f64>) = if size_ratio < 1.2 {
-        (vec![85, 75], vec![1.0])
+    let (quality_levels, scale_factors): (&[u32], &[f64]) = if size_ratio < 1.2 {
+        (&[85, 75], &[1.0])
     } else if size_ratio < 2.0 {
-        (vec![75, 65, 50], vec![1.0, 0.85])
+        (&[75, 65, 50], &[1.0, 0.85])
     } else {
-        (vec![65, 50, 35], vec![0.85, 0.65, 0.5])
+        (&[65, 50, 35], &[0.85, 0.65, 0.5])
     };
 
-    for &scale in &scale_factors {
-        for &quality in &quality_levels {
+    for &scale in scale_factors {
+        for &quality in quality_levels {
             tracing::trace!(quality, scale, "Attempting image compression");
             let mut args = ffmpeg::Args::new();
             args.push("-y".into());
@@ -708,20 +712,20 @@ async fn split_video(
     let effective_transcode_concurrency = ctx
         .runtime
         .effective_transcode_concurrency(ctx.config.concurrency.transcode);
+    let split_settings = split_transcode_settings(&ctx.config.transcode, &plan.bitrate);
     let split_job = SplitTranscodeJob {
         segment_duration: plan.segment_duration,
         estimated_segments: plan.estimated_segments,
+        transcode_concurrency: split_transcode_concurrency(
+            &split_settings,
+            effective_transcode_concurrency,
+        ),
         bitrate: plan.bitrate,
-        settings: split_transcode_settings(&ctx.config.transcode, &plan.bitrate),
-    };
-    let split_transcode_concurrency = if split_job.settings.hardware_acceleration.is_hardware() {
-        effective_transcode_concurrency
-    } else {
-        1
+        settings: split_settings,
     };
     let use_parallel = split_parallel_is_plausible(
         split_job.estimated_segments,
-        split_transcode_concurrency,
+        split_job.transcode_concurrency,
         ctx.config,
     );
 
@@ -732,6 +736,7 @@ async fn split_video(
         audio_bitrate_kbps = split_job.bitrate.audio_bitrate_kbps,
         transcode_concurrency = ctx.config.concurrency.transcode,
         effective_transcode_concurrency,
+        split_transcode_concurrency = split_job.transcode_concurrency,
         split_encoder = split_job.settings.hardware_acceleration.encoder(),
         parallel = use_parallel,
         "Splitting media"
@@ -776,6 +781,24 @@ fn split_transcode_settings(
         split_settings.hardware_acceleration = HardwareAcceleration::None;
     }
     split_settings
+}
+
+fn split_transcode_concurrency(
+    settings: &TranscodeSettings,
+    effective_transcode_concurrency: u32,
+) -> u32 {
+    if settings.hardware_acceleration.is_hardware() {
+        return effective_transcode_concurrency.max(1);
+    }
+
+    let ffmpeg_threads = settings.effective_ffmpeg_threads(effective_transcode_concurrency.max(1));
+    let cpus = std::thread::available_parallelism()
+        .map(|value| value.get() as u32)
+        .unwrap_or(1);
+
+    (cpus / ffmpeg_threads.max(1))
+        .max(1)
+        .min(effective_transcode_concurrency.max(1))
 }
 
 fn send_progress_best_effort(progress_tx: &Option<mpsc::Sender<Progress>>, stage: Progress) {
@@ -859,10 +882,6 @@ async fn split_serial(
         .unwrap_or_default()
         .to_string_lossy();
     let prefix = format!("{}_seg", stem);
-    let effective_transcode_concurrency = ctx
-        .runtime
-        .effective_transcode_concurrency(ctx.config.concurrency.transcode);
-
     let mut segments = Vec::with_capacity(split_job.estimated_segments as usize);
     for idx in 0..split_job.estimated_segments {
         let output_path = downloaded
@@ -883,7 +902,7 @@ async fn split_serial(
                     split_job.bitrate.video_bitrate_kbps,
                     split_job.bitrate.audio_bitrate_kbps,
                     active_settings,
-                    effective_transcode_concurrency,
+                    split_job.transcode_concurrency,
                 )
             },
         )
@@ -971,9 +990,6 @@ async fn split_parallel(
         transcode_runtime: ctx.runtime.clone(),
     });
     let transcode_permits = Arc::clone(&ctx.permits.transcode);
-    let effective_transcode_concurrency = ctx
-        .runtime
-        .effective_transcode_concurrency(ctx.config.concurrency.transcode);
     let segment_video_kbps = split_job.bitrate.video_bitrate_kbps;
     let segment_audio_kbps = split_job.bitrate.audio_bitrate_kbps;
 
@@ -981,7 +997,7 @@ async fn split_parallel(
     let mut finished = 0;
     let mut last_heartbeat = Instant::now();
 
-    let max_active_segments = (effective_transcode_concurrency as usize).max(1);
+    let max_active_segments = (split_job.transcode_concurrency as usize).max(1);
     let mut next_segment = 0usize;
     while next_segment < total_segments && join_set.len() < max_active_segments {
         spawn_parallel_segment_task(
@@ -993,7 +1009,7 @@ async fn split_parallel(
             Arc::clone(&transcode_permits),
             Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
             Arc::clone(&parallel_transcode),
-            effective_transcode_concurrency,
+            split_job.transcode_concurrency,
             segment_video_kbps,
             segment_audio_kbps,
         );
@@ -1032,7 +1048,7 @@ async fn split_parallel(
                         Arc::clone(&transcode_permits),
                         Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
                         Arc::clone(&parallel_transcode),
-                        effective_transcode_concurrency,
+                        split_job.transcode_concurrency,
                         segment_video_kbps,
                         segment_audio_kbps,
                     );
@@ -1064,42 +1080,6 @@ async fn split_parallel(
                     elapsed_since_last_completion_ms = last_heartbeat.elapsed().as_millis() as u64,
                     "Parallel segment transcode still running"
                 );
-            }
-        }
-    }
-
-    while let Some(res) = join_set.join_next().await {
-        match res {
-            Ok(Ok((index, segment))) => {
-                let slot = final_segments
-                    .get_mut(index)
-                    .ok_or_else(|| Error::TranscodeFailed {
-                        stage: TranscodeStage::Split,
-                        exit_code: None,
-                        stderr_tail: "parallel split reported an out-of-range segment".to_string(),
-                    })?;
-                *slot = Some(segment);
-                finished += 1;
-                send_progress_best_effort(
-                    &progress_tx,
-                    Progress::Transcoding(finished, total_segments),
-                );
-            }
-            Ok(Err(e)) => {
-                join_set.abort_all();
-                while join_set.join_next().await.is_some() {}
-                cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
-                return Err(e);
-            }
-            Err(e) => {
-                join_set.abort_all();
-                while join_set.join_next().await.is_some() {}
-                cleanup_segment_prefix(&downloaded.path, &output_prefix).await;
-                return Err(Error::TranscodeFailed {
-                    stage: TranscodeStage::Split,
-                    exit_code: None,
-                    stderr_tail: format!("segment task panicked: {}", e),
-                });
             }
         }
     }
@@ -1404,7 +1384,8 @@ mod tests {
         BitrateParams, SplitTranscodeJob, SplitTranscodeProgress, TranscodeContext,
         TranscodeStrategy, build_strategy_plan, execute_with_hwacc_fallback, optimize,
         predict_resolution, remaining_timeout_budget, send_progress_best_effort, split_parallel,
-        split_parallel_is_plausible, split_serial, split_transcode_settings,
+        split_parallel_is_plausible, split_serial, split_transcode_concurrency,
+        split_transcode_settings,
     };
     use crate::concurrency::Permits;
     use crate::config::{EngineSettings, HardwareAcceleration, QualityPreset, TranscodeSettings};
@@ -1753,6 +1734,19 @@ mod tests {
     }
 
     #[test]
+    fn software_split_concurrency_is_bounded_by_thread_budget() {
+        let settings = TranscodeSettings {
+            hardware_acceleration: HardwareAcceleration::None,
+            ffmpeg_threads: 2,
+            ..TranscodeSettings::default()
+        };
+
+        let concurrency = split_transcode_concurrency(&settings, 8);
+
+        assert!((1..=8).contains(&concurrency));
+    }
+
+    #[test]
     fn aggressive_predict_resolution_downshifts_when_fast_path_would_preserve_480p() {
         let config = EngineSettings::default();
 
@@ -1807,6 +1801,7 @@ mod tests {
         let split_job = SplitTranscodeJob {
             segment_duration: 10.0,
             estimated_segments: 2,
+            transcode_concurrency: 1,
             bitrate: segment_params,
             settings: config.transcode.clone(),
         };
@@ -1872,6 +1867,7 @@ mod tests {
         let split_job = SplitTranscodeJob {
             segment_duration: 10.0,
             estimated_segments: 2,
+            transcode_concurrency: 1,
             bitrate: BitrateParams {
                 video_bitrate_kbps: 500,
                 audio_bitrate_kbps: 128,
@@ -1948,6 +1944,7 @@ mod tests {
         let split_job = SplitTranscodeJob {
             segment_duration: 10.0,
             estimated_segments: 2,
+            transcode_concurrency: 2,
             bitrate: segment_params,
             settings: config.transcode.clone(),
         };
@@ -2006,6 +2003,7 @@ mod tests {
         let split_job = SplitTranscodeJob {
             segment_duration: 10.0,
             estimated_segments: 2,
+            transcode_concurrency: 2,
             bitrate: BitrateParams {
                 video_bitrate_kbps: 500,
                 audio_bitrate_kbps: 128,

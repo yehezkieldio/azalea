@@ -24,6 +24,8 @@ use crate::pipeline::types::{
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicU64};
 use std::time::{Duration, Instant};
@@ -48,6 +50,7 @@ pub async fn download(
     reserved_download_bytes: &Arc<AtomicU64>,
     temp_files: &TempFileCleanup,
     config: &EngineSettings,
+    pinned_clients: &PinnedMediaClientCache,
 ) -> Result<DownloadedFile, Error> {
     tracing::trace!(
         request_id = job.request_id.0,
@@ -90,7 +93,7 @@ pub async fn download(
         // SSRF guardrails: validate and canonicalize before any network I/O.
         let validated_url = validate_media_url(resolved.url.as_ref()).await?;
 
-        let response = fetch_with_redirects(config, validated_url.url)
+        let response = fetch_with_redirects(config, pinned_clients, validated_url)
             .instrument(tracing::info_span!("download.redirects"))
             .await?;
 
@@ -122,11 +125,22 @@ pub async fn download(
             });
         }
 
-        let reserve_bytes = header_content_length
-            .or(total_size)
-            .filter(|size| *size > 0)
-            .or_else(|| (max_download > 0).then_some(max_download))
-            .unwrap_or(0);
+        let should_probe = must_probe
+            || resolved.duration.is_none()
+            || resolved.resolution.is_none()
+            || (resolved.media_type == MediaType::Video
+                && total_size.is_some_and(|size| size > config.transcode.max_upload_bytes));
+        let memory_only = can_keep_download_memory_only(total_size, should_probe, config);
+
+        let reserve_bytes = if memory_only {
+            0
+        } else {
+            header_content_length
+                .or(total_size)
+                .filter(|size| *size > 0)
+                .or_else(|| (max_download > 0).then_some(max_download))
+                .unwrap_or(0)
+        };
         tracing::trace!(reserve_bytes, "Reserving disk budget for download");
         let _download_reservation = if reserve_bytes > 0 {
             Some(
@@ -148,37 +162,15 @@ pub async fn download(
         };
 
         let mut stream = response.bytes_stream();
-        // Preallocate to reduce fragmentation and avoid repeated growth syscalls.
-        let preallocated = if let Some(total) = total_size.filter(|size| *size > 0) {
-            let path = output_path.clone();
-            match tokio::task::spawn_blocking(move || preallocate_file(&path, total)).await {
-                Ok(Ok(())) => true,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "Failed to preallocate download file");
-                    false
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Preallocation task failed");
-                    false
-                }
-            }
+        let mut upload_ready_bytes = bounded_upload_ready_buffer(total_size, config);
+        let mut file = if memory_only {
+            None
         } else {
-            false
+            Some(open_download_file(&output_path, total_size, config).await?)
         };
-        if preallocated {
-            tracing::trace!(path = %output_path.display(), "Preallocated download file");
-        }
 
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(!preallocated)
-            .open(&output_path)
-            .await?;
-        let mut file = BufWriter::with_capacity(config.pipeline.download_write_buffer_bytes, file);
         let mut downloaded = 0u64;
         let upload_ready_buffer_limit = upload_ready_buffer_limit(config);
-        let mut upload_ready_bytes = bounded_upload_ready_buffer(total_size, config);
         let mut last_log = std::time::Instant::now();
         let log_interval = Duration::from_secs(5);
 
@@ -193,15 +185,19 @@ pub async fn download(
                     bytes.extend_from_slice(&chunk);
                 } else {
                     upload_ready_bytes = None;
+                    if file.is_none() {
+                        file = Some(open_download_file(&output_path, total_size, config).await?);
+                    }
                 }
             }
 
             downloaded = next_downloaded;
 
             if max_download > 0 && downloaded > max_download {
-                // Drop the partially written file to avoid leaving oversized artifacts.
-                drop(file);
-                let _ = fs::remove_file(&output_path).await;
+                if let Some(file) = file.take() {
+                    drop(file);
+                    let _ = fs::remove_file(&output_path).await;
+                }
                 return Err(Error::DownloadFailed {
                     source: DownloadError::TooLarge {
                         size_mb: downloaded / 1024 / 1024,
@@ -210,14 +206,15 @@ pub async fn download(
                 });
             }
 
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| Error::DownloadFailed {
-                    source: DownloadError::WriteFailed(e),
-                })?;
+            if let Some(file) = file.as_mut() {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| Error::DownloadFailed {
+                        source: DownloadError::WriteFailed(e),
+                    })?;
+            }
 
             if last_log.elapsed() >= log_interval {
-                // Periodic progress logs keep visibility without flooding logs.
                 let percent = total_size
                     .map(|total| (downloaded as f64 / total as f64 * 100.0) as u32)
                     .unwrap_or(0);
@@ -231,7 +228,6 @@ pub async fn download(
         }
 
         if downloaded == 0 {
-            // Empty bodies are treated as invalid media even if the HTTP status was OK.
             return Err(Error::DownloadFailed {
                 source: DownloadError::EmptyResponse,
             });
@@ -240,33 +236,15 @@ pub async fn download(
         if let Some(total) = total_size
             && downloaded != total
         {
-            // Mismatch suggests an interrupted stream; treat as a hard failure.
             tracing::warn!(expected = total, downloaded, "Download size mismatch");
             return Err(Error::DownloadFailed {
                 source: DownloadError::WriteFailed(std::io::Error::other("download incomplete")),
             });
         }
 
-        // Explicitly set final length in case the preallocation overshot.
-        file.flush().await.map_err(|e| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(e),
-        })?;
-        let mut file = file.into_inner();
-        file.set_len(downloaded)
-            .await
-            .map_err(|e| Error::DownloadFailed {
-                source: DownloadError::WriteFailed(e),
-            })?;
-
-        file.flush().await.map_err(|e| Error::DownloadFailed {
-            source: DownloadError::WriteFailed(e),
-        })?;
-
-        let should_probe = must_probe
-            || resolved.duration.is_none()
-            || resolved.resolution.is_none()
-            || (resolved.media_type == MediaType::Video
-                && downloaded > config.transcode.max_upload_bytes);
+        if let Some(file) = file {
+            finish_download_file(file, downloaded).await?;
+        }
 
         let mut duration = resolved.duration;
         let mut resolution = resolved.resolution;
@@ -300,8 +278,6 @@ pub async fn download(
                 }
             }
         } else {
-            // Prefer resolver metadata when Content-Length is known and
-            // optimization preflight does not need additional facts.
             tracing::trace!("Using metadata from resolver");
         }
 
@@ -313,6 +289,7 @@ pub async fn download(
             duration_ms = download_start.elapsed().as_millis(),
             size_bytes = downloaded,
             path = %output_path.display(),
+            memory_only,
             "Download finished"
         );
 
@@ -344,6 +321,58 @@ pub async fn download(
     }
 }
 
+async fn open_download_file(
+    output_path: &Path,
+    total_size: Option<u64>,
+    config: &EngineSettings,
+) -> Result<BufWriter<fs::File>, Error> {
+    let preallocated = if let Some(total) = total_size.filter(|size| *size > 0) {
+        let path = output_path.to_path_buf();
+        match tokio::task::spawn_blocking(move || preallocate_file(&path, total)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "Failed to preallocate download file");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Preallocation task failed");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if preallocated {
+        tracing::trace!(path = %output_path.display(), "Preallocated download file");
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(!preallocated)
+        .open(output_path)
+        .await?;
+    Ok(BufWriter::with_capacity(
+        config.pipeline.download_write_buffer_bytes,
+        file,
+    ))
+}
+
+async fn finish_download_file(mut file: BufWriter<fs::File>, downloaded: u64) -> Result<(), Error> {
+    file.flush().await.map_err(|e| Error::DownloadFailed {
+        source: DownloadError::WriteFailed(e),
+    })?;
+    let mut file = file.into_inner();
+    file.set_len(downloaded)
+        .await
+        .map_err(|e| Error::DownloadFailed {
+            source: DownloadError::WriteFailed(e),
+        })?;
+    file.flush().await.map_err(|e| Error::DownloadFailed {
+        source: DownloadError::WriteFailed(e),
+    })
+}
+
 fn bounded_upload_ready_buffer(
     total_size: Option<u64>,
     config: &EngineSettings,
@@ -363,6 +392,15 @@ fn bounded_upload_ready_buffer(
     Some(Vec::with_capacity(capacity))
 }
 
+fn can_keep_download_memory_only(
+    total_size: Option<u64>,
+    should_probe: bool,
+    config: &EngineSettings,
+) -> bool {
+    !should_probe
+        && total_size.is_some_and(|size| size > 0 && size <= upload_ready_buffer_limit(config))
+}
+
 fn upload_ready_buffer_limit(config: &EngineSettings) -> u64 {
     config
         .pipeline
@@ -370,52 +408,66 @@ fn upload_ready_buffer_limit(config: &EngineSettings) -> u64 {
         .min(config.transcode.max_upload_bytes)
 }
 
-async fn fetch_with_redirects(
-    config: &EngineSettings,
-    start_url: reqwest::Url,
-) -> Result<reqwest::Response, Error> {
-    fetch_with_redirects_inner(
-        start_url,
-        |current| async move {
-            let validated = validate_media_url(current.as_str()).await?;
-            let client = pinned_media_client(config, &validated)?;
-            let response = client
-                .get(validated.url.clone())
-                .send()
-                .await
-                .map_err(|e| Error::DownloadFailed {
-                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
-                })?;
+#[derive(Clone)]
+pub struct PinnedMediaClientCache {
+    clients: moka::future::Cache<PinnedMediaClientKey, reqwest::Client>,
+}
 
-            if !response.status().is_redirection() {
-                return Ok(FetchStep::Complete(response));
-            }
+impl PinnedMediaClientCache {
+    pub fn new(config: &EngineSettings) -> Self {
+        let max_capacity = config
+            .http
+            .pool_max_idle_per_host
+            .saturating_mul(32)
+            .max(64) as u64;
+        Self {
+            clients: moka::future::Cache::builder()
+                .max_capacity(max_capacity)
+                .time_to_live(Duration::from_secs(
+                    config.http.pool_idle_timeout_secs.max(1),
+                ))
+                .build(),
+        }
+    }
 
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .ok_or_else(|| Error::DownloadFailed {
-                    source: DownloadError::WriteFailed(std::io::Error::other(
-                        "redirect missing location header",
-                    )),
-                })?
-                .to_str()
-                .map_err(|e| Error::DownloadFailed {
-                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
-                })?;
+    async fn client(
+        &self,
+        config: &EngineSettings,
+        target: &ValidatedMediaUrl,
+    ) -> Result<reqwest::Client, Error> {
+        let key = PinnedMediaClientKey::from(target);
+        if let Some(client) = self.clients.get(&key).await {
+            return Ok(client);
+        }
 
-            Ok(FetchStep::Redirect {
-                base: response.url().clone(),
-                location: location.into(),
-            })
-        },
-        |next| async move {
-            validate_media_url(next.as_str())
-                .await
-                .map(|validated| validated.url)
-        },
-    )
-    .await
+        let client = pinned_media_client(config, target)?;
+        self.clients.insert(key, client.clone()).await;
+        Ok(client)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PinnedMediaClientKey {
+    host: String,
+    addrs: Vec<SocketAddr>,
+}
+
+impl From<&ValidatedMediaUrl> for PinnedMediaClientKey {
+    fn from(target: &ValidatedMediaUrl) -> Self {
+        let mut addrs = target.addrs.clone();
+        addrs.sort_unstable();
+        Self {
+            host: target.host.clone(),
+            addrs,
+        }
+    }
+}
+
+impl Hash for PinnedMediaClientKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.host.hash(state);
+        self.addrs.hash(state);
+    }
 }
 
 fn pinned_media_client(
@@ -452,6 +504,50 @@ fn pinned_media_client(
     })
 }
 
+async fn fetch_with_redirects(
+    config: &EngineSettings,
+    pinned_clients: &PinnedMediaClientCache,
+    start_url: ValidatedMediaUrl,
+) -> Result<reqwest::Response, Error> {
+    fetch_with_redirects_inner(
+        start_url,
+        |validated| async move {
+            let client = pinned_clients.client(config, &validated).await?;
+            let response = client
+                .get(validated.url.clone())
+                .send()
+                .await
+                .map_err(|e| Error::DownloadFailed {
+                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
+                })?;
+
+            if !response.status().is_redirection() {
+                return Ok(FetchStep::Complete(response));
+            }
+
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| Error::DownloadFailed {
+                    source: DownloadError::WriteFailed(std::io::Error::other(
+                        "redirect missing location header",
+                    )),
+                })?
+                .to_str()
+                .map_err(|e| Error::DownloadFailed {
+                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
+                })?;
+
+            Ok(FetchStep::Redirect {
+                base: response.url().clone(),
+                location: location.into(),
+            })
+        },
+        |next| async move { validate_media_url(next.as_str()).await },
+    )
+    .await
+}
+
 const MAX_REDIRECTS: usize = 5;
 
 enum FetchStep<T> {
@@ -463,19 +559,19 @@ enum FetchStep<T> {
 }
 
 async fn fetch_with_redirects_inner<T, Fetch, FetchFuture, Validate, ValidateFuture>(
-    start_url: reqwest::Url,
+    start_url: ValidatedMediaUrl,
     mut fetch: Fetch,
     mut validate_redirect: Validate,
 ) -> Result<T, Error>
 where
-    Fetch: FnMut(reqwest::Url) -> FetchFuture,
+    Fetch: FnMut(ValidatedMediaUrl) -> FetchFuture,
     FetchFuture: Future<Output = Result<FetchStep<T>, Error>>,
     Validate: FnMut(reqwest::Url) -> ValidateFuture,
-    ValidateFuture: Future<Output = Result<reqwest::Url, Error>>,
+    ValidateFuture: Future<Output = Result<ValidatedMediaUrl, Error>>,
 {
     let mut current = start_url;
     for hop in 0..=MAX_REDIRECTS {
-        tracing::trace!(hop, url = %current, "Fetching media URL");
+        tracing::trace!(hop, url = %current.url, "Fetching media URL");
         match fetch(current.clone()).await? {
             FetchStep::Complete(response) => return Ok(response),
             FetchStep::Redirect { base, location } => {
@@ -721,15 +817,25 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::{
-        FetchStep, MAX_REDIRECTS, bounded_upload_ready_buffer, content_length_header_bytes,
-        estimate_bitrate_kbps, fetch_with_redirects_inner, parse_bitrate_kbps,
-        upload_ready_buffer_limit,
+        FetchStep, MAX_REDIRECTS, bounded_upload_ready_buffer, can_keep_download_memory_only,
+        content_length_header_bytes, estimate_bitrate_kbps, fetch_with_redirects_inner,
+        parse_bitrate_kbps, upload_ready_buffer_limit,
     };
     use crate::config::EngineSettings;
     use crate::pipeline::errors::{DownloadError, Error};
+    use crate::pipeline::ssrf::ValidatedMediaUrl;
     use reqwest::Url;
     use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
+
+    fn validated(url: Url) -> ValidatedMediaUrl {
+        ValidatedMediaUrl {
+            host: url.host_str().unwrap_or("pbs.twimg.com").to_string(),
+            url,
+            addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443)],
+        }
+    }
 
     #[test]
     fn parses_content_length_header_bytes() {
@@ -796,6 +902,17 @@ mod tests {
         assert!(bounded_upload_ready_buffer(None, &config).is_some());
     }
 
+    #[test]
+    fn memory_only_download_requires_known_under_limit_size_and_no_probe() {
+        let mut config = EngineSettings::default();
+        config.pipeline.upload_ready_buffer_max_bytes = 1024;
+
+        assert!(can_keep_download_memory_only(Some(1024), false, &config));
+        assert!(!can_keep_download_memory_only(Some(1025), false, &config));
+        assert!(!can_keep_download_memory_only(None, false, &config));
+        assert!(!can_keep_download_memory_only(Some(1024), true, &config));
+    }
+
     #[tokio::test]
     async fn fetch_with_redirects_returns_depth_error_at_limit() {
         let start_url = Url::parse("https://pbs.twimg.com/media/start.mp4").expect("valid url");
@@ -803,7 +920,7 @@ mod tests {
         let validations = Arc::new(Mutex::new(Vec::new()));
 
         let err = fetch_with_redirects_inner(
-            start_url,
+            validated(start_url),
             {
                 let fetches = Arc::clone(&fetches);
                 move |current| {
@@ -812,10 +929,10 @@ mod tests {
                         fetches
                             .lock()
                             .expect("fetch log should not be poisoned")
-                            .push(current.as_str().to_string());
+                            .push(current.url.as_str().to_string());
 
                         Ok(FetchStep::<()>::Redirect {
-                            base: current,
+                            base: current.url,
                             location: format!(
                                 "/media/hop-{}",
                                 fetches
@@ -836,7 +953,7 @@ mod tests {
                         .expect("validation log should not be poisoned")
                         .push(next.to_string());
                     let parsed = next;
-                    async move { Ok(parsed) }
+                    async move { Ok(validated(parsed)) }
                 }
             },
         )
@@ -868,7 +985,7 @@ mod tests {
         let validations = Arc::new(Mutex::new(Vec::new()));
 
         let err = fetch_with_redirects_inner(
-            start_url,
+            validated(start_url),
             {
                 let fetches = Arc::clone(&fetches);
                 move |current| {
@@ -876,7 +993,7 @@ mod tests {
                     async move {
                         let mut fetches = fetches.lock().expect("fetch log should not be poisoned");
                         let hop = fetches.len();
-                        fetches.push(current.as_str().to_string());
+                        fetches.push(current.url.as_str().to_string());
 
                         let location = match hop {
                             0 => "https://video.twimg.com/media/next.mp4",
@@ -887,7 +1004,7 @@ mod tests {
                         };
 
                         Ok(FetchStep::<()>::Redirect {
-                            base: current,
+                            base: current.url,
                             location: location.into(),
                         })
                     }
@@ -906,7 +1023,7 @@ mod tests {
                             source: DownloadError::SsrfBlocked("ip literal rejected".to_string()),
                         })
                     } else {
-                        Ok(next)
+                        Ok(validated(next))
                     };
 
                     async move { result }

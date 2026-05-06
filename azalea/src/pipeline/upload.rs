@@ -352,6 +352,15 @@ fn file_size_checked_from_metadata(
         "Reading upload file"
     );
 
+    upload_size_checked(file_size, max_upload_bytes, part_number, total)
+}
+
+fn upload_size_checked(
+    file_size: u64,
+    max_upload_bytes: u64,
+    part_number: usize,
+    total: usize,
+) -> Result<u64, Error> {
     if file_size > max_upload_bytes {
         return Err(Error::UploadFailed {
             part: part_number,
@@ -425,8 +434,7 @@ async fn build_attachment(
     attachment_id: u64,
 ) -> Result<Attachment, Error> {
     if let Some(upload_ready_bytes) = part.upload_ready_bytes() {
-        let file_size = file_size_checked_from_metadata(
-            part.path(),
+        let file_size = upload_size_checked(
             part.size(),
             config.transcode.max_upload_bytes,
             part_number,

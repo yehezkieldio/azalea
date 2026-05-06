@@ -17,7 +17,7 @@
 use crate::concurrency::Permits;
 use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings, USER_AGENT};
 use crate::media::TempFileCleanup;
-use crate::pipeline::ResolverChain;
+use crate::pipeline::{ResolverChain, download::PinnedMediaClientCache};
 use crate::storage::{DedupCache, Metrics};
 use std::sync::{
     Arc,
@@ -195,6 +195,7 @@ pub struct Engine {
     pub config: EngineSettings,
     pub transcode_runtime: TranscodeRuntime,
     pub http: reqwest::Client,
+    pub pinned_media_clients: PinnedMediaClientCache,
     pub permits: Permits,
     pub reserved_download_bytes: Arc<AtomicU64>,
     pub dedup: DedupCache,
@@ -217,6 +218,7 @@ impl Engine {
     /// memory-only mode to preserve pipeline availability.
     pub fn new(config: EngineSettings) -> anyhow::Result<Self> {
         let http = build_http_client(&config)?;
+        let pinned_media_clients = PinnedMediaClientCache::new(&config);
         let transcode_runtime = TranscodeRuntime::new(config.transcode.hardware_acceleration);
         let permits = Permits::new(&config.concurrency);
         let reserved_download_bytes = Arc::new(AtomicU64::new(0));
@@ -229,6 +231,7 @@ impl Engine {
             config,
             transcode_runtime,
             http,
+            pinned_media_clients,
             permits,
             reserved_download_bytes,
             dedup,
