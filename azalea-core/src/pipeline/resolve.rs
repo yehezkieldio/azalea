@@ -23,7 +23,6 @@ use crate::config::{PipelineSettings, StorageSettings, USER_AGENT};
 use crate::media::{TweetId, TweetLink};
 use crate::pipeline::errors::{Error, ResolveError};
 use crate::pipeline::process::{JsonSubprocessError, run_json_subprocess};
-use crate::pipeline::ssrf::validate_media_url;
 use crate::pipeline::types::{MediaType, ResolvedMedia, sanitize_extension};
 use moka::future::Cache;
 use serde::Deserialize;
@@ -283,9 +282,7 @@ impl VxTwitter {
                 {
                     sanitize_extension(&ext)
                 } else {
-                    sanitize_extension(
-                        &infer_extension(&media.media_type, &media.url, Some(http)).await,
-                    )
+                    sanitize_extension(&infer_extension(&media.media_type, &media.url))
                 };
                 let is_image = matches!(media.media_type.as_ref(), "image" | "photo");
 
@@ -601,11 +598,7 @@ fn extension_from_vxtwitter_metadata(media_type: &str, url: &str) -> Option<Box<
     }
 }
 
-async fn infer_extension(
-    media_type: &str,
-    url: &str,
-    client: Option<&reqwest::Client>,
-) -> Box<str> {
+fn infer_extension(media_type: &str, url: &str) -> Box<str> {
     if let Some(ext) = url.split('.').next_back() {
         let ext = ext.split('?').next().unwrap_or(ext);
         match ext {
@@ -614,39 +607,12 @@ async fn infer_extension(
         }
     }
 
-    // Best-effort HEAD request when the URL doesn't include an extension.
-    if let Some(client) = client
-        && let Ok(validated_url) = validate_media_url(url).await
-        && let Ok(response) =
-            tokio::time::timeout(Duration::from_secs(2), client.head(validated_url).send()).await
-        && let Ok(resp) = response
-        && let Some(content_type) = resp.headers().get("content-type")
-        && let Ok(ct_str) = content_type.to_str()
-    {
-        return extension_from_mime_type(ct_str);
-    }
-
     match media_type {
         "video" => "mp4".into(),
         "gif" => "gif".into(),
         "image" | "photo" => "jpg".into(),
         _ => "mp4".into(),
     }
-}
-
-fn extension_from_mime_type(mime_type: &str) -> Box<str> {
-    let mime_base = mime_type.split(';').next().unwrap_or(mime_type).trim();
-    match mime_base {
-        "video/mp4" => "mp4",
-        "video/webm" => "webm",
-        "video/quicktime" => "mov",
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        _ => mime_base.split('/').nth(1).unwrap_or("mp4"),
-    }
-    .into()
 }
 
 fn should_negative_cache(error: &ResolveError) -> bool {

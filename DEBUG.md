@@ -160,3 +160,47 @@ Split planning minimized attachment count by using 120s chunks, which starved 72
 
 - Make `SplitTranscodePlan` resolution-aware and spend up to one Discord batch of attachments to preserve the source-height bitrate tier.
 - Pass downloaded source height into split planning.
+
+## 2026-05-06 Audit Findings Follow-Up
+
+### Observations
+
+- Parallel split recorded segment file length but did not reject zero-byte outputs before returning `PreparedUpload`.
+- Serial split already rejected `size == 0`.
+- Media download validated DNS answers before fetch, but reqwest performed its own DNS resolution during send.
+- The resolver's extension-inference HEAD probe used the same validate-then-client pattern.
+
+### Hypotheses
+
+#### H1: Parallel split misses the zero-byte segment invariant
+- Supports: `split_serial` rejects empty files; `spawn_parallel_segment_task` only read metadata length.
+- Conflicts: existing tests covered oversize segments, not empty successful outputs.
+- Test: fake ffmpeg success that creates empty parallel outputs.
+
+#### H2: Upload layer catches zero-byte segments later
+- Supports: upload validates maximum file size.
+- Conflicts: empty files are below the maximum and can be read successfully.
+- Test: inspect upload preparation size checks.
+
+#### H3: SSRF validation has a DNS time-of-check/time-of-use gap
+- Supports: validation used `lookup_host`, then request send used the shared client resolver.
+- Conflicts: host allowlist limits the exploit surface but does not bind the checked IPs to the connection.
+- Test: route media fetches through a reqwest client seeded with the validated socket addresses.
+
+### Experiments
+
+- H1 confirmed by source inspection and a regression test with a zero-byte-output ffmpeg stub.
+- H2 rejected: upload size checks do not reject zero-byte payloads.
+- H3 confirmed by reqwest API inspection; `ClientBuilder::resolve_to_addrs` can pin the validated host to the checked socket addresses while preserving TLS hostname verification.
+
+### Root Cause
+
+Parallel split lacked the serial path's non-empty output invariant, and media fetches did not bind the DNS answers accepted by SSRF validation to the actual HTTP connection.
+
+### Fix
+
+- Reject zero-byte parallel split outputs inside `spawn_parallel_segment_task`.
+- Add a parallel split regression test for empty segment outputs and cleanup.
+- Return validated socket addresses from SSRF validation.
+- Build media download clients with `resolve_to_addrs` for the validated host.
+- Remove the resolver's extension-inference HEAD probe so it cannot keep the old DNS validation race.

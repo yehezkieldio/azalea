@@ -11,12 +11,12 @@
 //! 3. Probe metadata via ffprobe if missing.
 
 use crate::concurrency::Permits;
-use crate::config::EngineSettings;
+use crate::config::{EngineSettings, USER_AGENT};
 use crate::media::TempFileCleanup;
 use crate::pipeline::disk::{ensure_disk_space, reserve_download_bytes};
 use crate::pipeline::errors::{DownloadError, Error};
 use crate::pipeline::process::{JsonSubprocessError, run_json_subprocess};
-use crate::pipeline::ssrf::validate_media_url;
+use crate::pipeline::ssrf::{ValidatedMediaUrl, validate_media_url};
 use crate::pipeline::types::{
     AudioCodec, DownloadedFile, Job, MediaContainer, MediaFacts, MediaType, ResolvedMedia,
     VideoCodec, sanitize_extension,
@@ -44,7 +44,6 @@ use tracing::Instrument as _;
 pub async fn download(
     resolved: &ResolvedMedia,
     job: &Job,
-    http: &reqwest::Client,
     permits: &Permits,
     reserved_download_bytes: &Arc<AtomicU64>,
     temp_files: &TempFileCleanup,
@@ -91,7 +90,7 @@ pub async fn download(
         // SSRF guardrails: validate and canonicalize before any network I/O.
         let validated_url = validate_media_url(resolved.url.as_ref()).await?;
 
-        let response = fetch_with_redirects(http, validated_url)
+        let response = fetch_with_redirects(config, validated_url.url)
             .instrument(tracing::info_span!("download.redirects"))
             .await?;
 
@@ -372,19 +371,21 @@ fn upload_ready_buffer_limit(config: &EngineSettings) -> u64 {
 }
 
 async fn fetch_with_redirects(
-    http: &reqwest::Client,
+    config: &EngineSettings,
     start_url: reqwest::Url,
 ) -> Result<reqwest::Response, Error> {
     fetch_with_redirects_inner(
         start_url,
         |current| async move {
-            let response =
-                http.get(current.clone())
-                    .send()
-                    .await
-                    .map_err(|e| Error::DownloadFailed {
-                        source: DownloadError::WriteFailed(std::io::Error::other(e)),
-                    })?;
+            let validated = validate_media_url(current.as_str()).await?;
+            let client = pinned_media_client(config, &validated)?;
+            let response = client
+                .get(validated.url.clone())
+                .send()
+                .await
+                .map_err(|e| Error::DownloadFailed {
+                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
+                })?;
 
             if !response.status().is_redirection() {
                 return Ok(FetchStep::Complete(response));
@@ -408,9 +409,47 @@ async fn fetch_with_redirects(
                 location: location.into(),
             })
         },
-        |next| async move { validate_media_url(next.as_str()).await },
+        |next| async move {
+            validate_media_url(next.as_str())
+                .await
+                .map(|validated| validated.url)
+        },
     )
     .await
+}
+
+fn pinned_media_client(
+    config: &EngineSettings,
+    target: &ValidatedMediaUrl,
+) -> Result<reqwest::Client, Error> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(config.http.timeout_secs))
+        .pool_max_idle_per_host(config.http.pool_max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(config.http.pool_idle_timeout_secs))
+        .connect_timeout(Duration::from_secs(config.http.connect_timeout_secs))
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .http2_max_frame_size(config.http.http2_max_frame_size_bytes)
+        .deflate(true)
+        .gzip(true)
+        .brotli(true)
+        .user_agent(USER_AGENT)
+        .resolve_to_addrs(&target.host, &target.addrs);
+
+    builder = if config.http.http2_adaptive_window {
+        builder.http2_adaptive_window(true)
+    } else {
+        builder
+            .http2_initial_stream_window_size(config.http.http2_initial_stream_window_size_bytes)
+            .http2_initial_connection_window_size(
+                config.http.http2_initial_connection_window_size_bytes,
+            )
+    };
+
+    builder.build().map_err(|e| Error::DownloadFailed {
+        source: DownloadError::WriteFailed(std::io::Error::other(e)),
+    })
 }
 
 const MAX_REDIRECTS: usize = 5;

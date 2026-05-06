@@ -12,7 +12,7 @@
 //! ## References
 //! - SSRF guidance: <https://owasp.org/www-community/attacks/Server_Side_Request_Forgery>
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use reqwest::Url;
 use tokio::net::lookup_host;
@@ -29,15 +29,25 @@ const ALLOWED_MEDIA_HOSTS: [&str; 4] = [
     "abs.twimg.com",
 ];
 
-pub(crate) async fn validate_media_url(url: &str) -> Result<Url, Error> {
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedMediaUrl {
+    pub(crate) url: Url,
+    pub(crate) host: String,
+    pub(crate) addrs: Vec<SocketAddr>,
+}
+
+pub(crate) async fn validate_media_url(url: &str) -> Result<ValidatedMediaUrl, Error> {
     let (parsed, host, port) = validate_url_structure(url)?;
-    // Resolve DNS and validate each resolved address.
     let addrs = lookup_host((host.as_str(), port))
         .await
         .map_err(|e| validation_error(e.to_string()))?;
+    let addrs = validate_resolved_addrs(addrs)?;
 
-    validate_resolved_ips(addrs.map(|addr| addr.ip()))?;
-    Ok(parsed)
+    Ok(ValidatedMediaUrl {
+        url: parsed,
+        host,
+        addrs,
+    })
 }
 
 fn validate_url_structure(url: &str) -> Result<(Url, String, u16), Error> {
@@ -82,6 +92,25 @@ fn validate_url_structure(url: &str) -> Result<(Url, String, u16), Error> {
     Ok((parsed, host, port))
 }
 
+fn validate_resolved_addrs(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, Error> {
+    let mut validated = Vec::new();
+    for addr in addrs {
+        if is_blocked_ip(addr.ip()) {
+            return Err(validation_error("resolved to blocked ip"));
+        }
+        validated.push(addr);
+    }
+
+    if validated.is_empty() {
+        return Err(validation_error("dns lookup returned no addresses"));
+    }
+
+    Ok(validated)
+}
+
+#[cfg(test)]
 fn validate_resolved_ips(ips: impl IntoIterator<Item = IpAddr>) -> Result<(), Error> {
     let mut resolved_any = false;
     for ip in ips {

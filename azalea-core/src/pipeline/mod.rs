@@ -142,7 +142,6 @@ pub async fn run(
                 let downloaded = download::download(
                     resolved.as_ref(),
                     &job,
-                    &engine.http,
                     &engine.permits,
                     &engine.reserved_download_bytes,
                     &engine.temp_files,

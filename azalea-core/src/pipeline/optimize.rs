@@ -1174,6 +1174,13 @@ fn spawn_parallel_segment_task(
         drop(permit);
         result?;
         let size = fs::metadata(&output_path).await?.len();
+        if size == 0 {
+            return Err(Error::TranscodeFailed {
+                stage: TranscodeStage::Split,
+                exit_code: None,
+                stderr_tail: "split produced an empty segment".to_string(),
+            });
+        }
         tracing::info!(
             segment_index = idx,
             size_bytes = size,
@@ -1468,6 +1475,10 @@ mod tests {
         "#!/bin/sh\ncopy_mode=0\npattern=''\nlast_mp4=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    copy)\n      copy_mode=1\n      ;;\n    *%03d.mp4)\n      pattern=\"$arg\"\n      ;;\n    *.mp4)\n      last_mp4=\"$arg\"\n      ;;\n  esac\ndone\nif [ -n \"$pattern\" ]; then\n  prefix=${pattern%%%03d.mp4}\n  if [ \"$copy_mode\" -eq 1 ]; then\n    printf 'raw0' > \"${prefix}000.mp4\"\n    printf 'raw1' > \"${prefix}001.mp4\"\n  else\n    printf 'ok' > \"${prefix}000.mp4\"\n    printf '0123456789ABCDEF' > \"${prefix}001.mp4\"\n  fi\n  exit 0\nfi\nif [ -n \"$last_mp4\" ]; then\n  case \"$last_mp4\" in\n    *seg000.mp4)\n      printf 'ok' > \"$last_mp4\"\n      ;;\n    *)\n      printf '0123456789ABCDEF' > \"$last_mp4\"\n      ;;\n  esac\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 1\n".to_string()
     }
 
+    fn split_empty_script() -> String {
+        "#!/bin/sh\nlast_mp4=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    *.mp4)\n      last_mp4=\"$arg\"\n      ;;\n  esac\ndone\nif [ -n \"$last_mp4\" ]; then\n  : > \"$last_mp4\"\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 1\n".to_string()
+    }
+
     fn split_arg_log_script(log_path: &Path) -> String {
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nlast_mp4=''\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    *.mp4)\n      last_mp4=\"$arg\"\n      ;;\n  esac\ndone\nif [ -n \"$last_mp4\" ]; then\n  printf 'ok' > \"$last_mp4\"\n  exit 0\nfi\nprintf 'unexpected args\\n' >&2\nexit 1\n",
@@ -1482,6 +1493,17 @@ mod tests {
                 stderr_tail,
                 ..
             } => assert_eq!(stderr_tail, "split segment exceeded upload limit"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    fn assert_split_empty(err: Error) {
+        match err {
+            Error::TranscodeFailed {
+                stage: TranscodeStage::Split,
+                stderr_tail,
+                ..
+            } => assert_eq!(stderr_tail, "split produced an empty segment"),
             other => panic!("unexpected error: {other:?}"),
         }
     }
@@ -1935,6 +1957,67 @@ mod tests {
             .expect_err("oversize split segment must fail");
 
         assert_split_oversize(err);
+        assert!(!temp_dir.join("input_seg000.mp4").exists());
+        assert!(!temp_dir.join("input_seg001.mp4").exists());
+
+        temp_files.shutdown().await;
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn split_parallel_rejects_empty_segments_and_cleans_up() {
+        let temp_files = TempFileCleanup::new();
+        let temp_dir = unique_temp_path("split-parallel-empty-dir");
+        let script_path = unique_temp_path("split-parallel-empty-ffmpeg.sh");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        write_executable(&script_path, &split_empty_script());
+
+        let input_path = temp_dir.join("input.mp4");
+        fs::write(&input_path, b"input").expect("write input");
+
+        let mut config = EngineSettings::default();
+        config.binaries.ffmpeg = script_path.clone();
+        config.storage.temp_dir = temp_dir.clone();
+        config.transcode.max_upload_bytes = 1024;
+        config.transcode.ffmpeg_timeout_secs = 1;
+        config.concurrency.transcode = 2;
+
+        let permits = Permits::new(&config.concurrency);
+        let runtime = TranscodeRuntime::new(HardwareAcceleration::None);
+        let ctx = TranscodeContext {
+            permits: &permits,
+            config: &config,
+            runtime: &runtime,
+        };
+        let downloaded = downloaded_file_at(
+            input_path.clone(),
+            32,
+            30.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(1_400),
+            },
+            &temp_files,
+        );
+        let dir_guard = temp_files.guard(temp_dir.clone());
+        let split_job = SplitTranscodeJob {
+            segment_duration: 10.0,
+            estimated_segments: 2,
+            bitrate: BitrateParams {
+                video_bitrate_kbps: 500,
+                audio_bitrate_kbps: 128,
+            },
+            settings: config.transcode.clone(),
+        };
+
+        let err = split_parallel(downloaded, &split_job, &temp_files, &ctx, None, dir_guard)
+            .await
+            .expect_err("empty split segment must fail");
+
+        assert_split_empty(err);
         assert!(!temp_dir.join("input_seg000.mp4").exists());
         assert!(!temp_dir.join("input_seg001.mp4").exists());
 
