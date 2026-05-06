@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::Instrument as _;
 use twilight_http::Client;
 use twilight_http::api_error::ApiError;
@@ -161,26 +161,40 @@ async fn upload_parts_sequential(
     let total_files = parts.len();
     let mut first_message_id = None;
     let mut metrics = Metrics::default();
+    let prepare_limit = config
+        .pipeline
+        .attachment_prepare_concurrency
+        .min(total_files.max(1));
+    let mut next_to_prepare = 0usize;
+    let mut prepared = (0..total_files).map(|_| None).collect::<Vec<_>>();
+    let prepare_ctx = AttachmentPrepareContext {
+        parts,
+        config,
+        tweet_id,
+        total_files,
+        progress_tx,
+    };
 
-    for (index, part) in parts.iter().enumerate() {
-        if let Some(tx) = progress_tx {
-            let stage = if total_files > 1 {
-                Progress::UploadingSegment(index + 1, total_files)
-            } else {
-                Progress::Uploading
-            };
-            let _ = tx.send(stage).await;
-        }
+    while next_to_prepare < total_files && next_to_prepare < prepare_limit {
+        queue_attachment_preparation(&mut prepared, &prepare_ctx, next_to_prepare, 0).await?;
+        next_to_prepare += 1;
+    }
 
+    for index in 0..total_files {
         let prepare_start = std::time::Instant::now();
         let attachment =
-            build_attachment(part, config, tweet_id, index + 1, total_files, 0).await?;
+            take_prepared_attachment(&mut prepared, index, index + 1, total_files).await?;
         metrics.attachment_prepare_ms = metrics
             .attachment_prepare_ms
             .saturating_add(prepare_start.elapsed().as_millis() as u64);
         metrics.payload_bytes = metrics
             .payload_bytes
             .saturating_add(attachment_payload_bytes(std::slice::from_ref(&attachment)));
+
+        if next_to_prepare < total_files {
+            queue_attachment_preparation(&mut prepared, &prepare_ctx, next_to_prepare, 0).await?;
+            next_to_prepare += 1;
+        }
 
         let ctx = UploadRetryContext {
             discord,
@@ -241,6 +255,108 @@ async fn upload_parts_sequential(
         },
         metrics,
     ))
+}
+
+enum PreparedAttachment {
+    Ready(Attachment),
+    Pending(JoinHandle<Result<Attachment, Error>>),
+}
+
+struct AttachmentPrepareContext<'a> {
+    parts: &'a [PreparedPart],
+    config: &'a EngineSettings,
+    tweet_id: TweetId,
+    total_files: usize,
+    progress_tx: Option<&'a mpsc::Sender<Progress>>,
+}
+
+async fn queue_attachment_preparation(
+    prepared: &mut [Option<PreparedAttachment>],
+    ctx: &AttachmentPrepareContext<'_>,
+    slot: usize,
+    attachment_id: u64,
+) -> Result<(), Error> {
+    let part = ctx.parts.get(slot).ok_or_else(|| Error::UploadFailed {
+        part: slot + 1,
+        total: ctx.total_files,
+        source: Box::new(std::io::Error::other(
+            "attachment preparation index out of range",
+        )),
+    })?;
+    let part_number = slot + 1;
+    if let Some(tx) = ctx.progress_tx {
+        let stage = if ctx.total_files > 1 {
+            Progress::UploadingSegment(part_number, ctx.total_files)
+        } else {
+            Progress::Uploading
+        };
+        let _ = tx.send(stage).await;
+    }
+
+    let prepared_attachment = if part.upload_ready_bytes().is_some() {
+        PreparedAttachment::Ready(
+            build_attachment(
+                part,
+                ctx.config,
+                ctx.tweet_id,
+                part_number,
+                ctx.total_files,
+                attachment_id,
+            )
+            .await?,
+        )
+    } else {
+        let file_path = part.path().to_path_buf();
+        let file_size = part.size();
+        let max_upload_bytes = ctx.config.transcode.max_upload_bytes;
+        let tweet_id = ctx.tweet_id;
+        let total_files = ctx.total_files;
+        PreparedAttachment::Pending(tokio::spawn(async move {
+            build_attachment_from_path(
+                file_path,
+                file_size,
+                max_upload_bytes,
+                tweet_id,
+                part_number,
+                total_files,
+                attachment_id,
+            )
+            .await
+        }))
+    };
+
+    let target = prepared.get_mut(slot).ok_or_else(|| Error::UploadFailed {
+        part: part_number,
+        total: ctx.total_files,
+        source: Box::new(std::io::Error::other("attachment slot out of range")),
+    })?;
+    *target = Some(prepared_attachment);
+    Ok(())
+}
+
+async fn take_prepared_attachment(
+    prepared: &mut [Option<PreparedAttachment>],
+    slot: usize,
+    part_number: usize,
+    total_files: usize,
+) -> Result<Attachment, Error> {
+    let prepared_attachment = prepared
+        .get_mut(slot)
+        .and_then(Option::take)
+        .ok_or_else(|| Error::UploadFailed {
+            part: part_number,
+            total: total_files,
+            source: Box::new(std::io::Error::other(
+                "attachment preparation produced incomplete upload",
+            )),
+        })?;
+
+    match prepared_attachment {
+        PreparedAttachment::Ready(attachment) => Ok(attachment),
+        PreparedAttachment::Pending(handle) => handle
+            .await
+            .map_err(|e| Error::Core(azalea_core::pipeline::Error::Io(std::io::Error::other(e))))?,
+    }
 }
 
 async fn upload_parts_batched(
