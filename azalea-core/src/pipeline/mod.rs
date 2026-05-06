@@ -1,7 +1,9 @@
 //! End-to-end media pipeline stages.
 //!
 //! The pipeline runs resolve → download → optimize with metrics and
-//! deduplication woven throughout. Each stage owns its own concurrency permits.
+//! deduplication woven throughout. Stage functions own their permits locally so
+//! borrows stay short and queued work cannot accidentally hold multiple stage
+//! limits while waiting.
 //!
 //! ## Data flow explanation
 //! [`run`] orchestrates stage progression and emits [`types::Progress`] updates
@@ -54,6 +56,14 @@ fn warn_if_slow(stage: Stage, duration_ms: u64, threshold_ms: u64) {
     }
 }
 
+async fn send_progress(progress: Option<&mpsc::Sender<Progress>>, stage: Progress) {
+    if let Some(tx) = progress
+        && tx.send(stage).await.is_err()
+    {
+        tracing::debug!("Progress channel closed before stage update");
+    }
+}
+
 /// Execute the pipeline up to the optimized media output, emitting progress updates.
 ///
 /// ## Preconditions
@@ -94,11 +104,7 @@ pub async fn run(
             let resolve_span = tracing::info_span!("resolve");
             let resolved = async {
                 let resolve_start = Instant::now();
-                if let Some(tx) = &progress
-                    && tx.send(Progress::Resolving).await.is_err()
-                {
-                    tracing::debug!("Progress channel closed before resolve stage update");
-                }
+                send_progress(progress.as_ref(), Progress::Resolving).await;
 
                 tracing::trace!("Starting resolve stage");
                 let resolved = engine
@@ -132,11 +138,7 @@ pub async fn run(
             let download_span = tracing::info_span!("download");
             let downloaded = async {
                 let download_start = Instant::now();
-                if let Some(tx) = &progress
-                    && tx.send(Progress::Downloading).await.is_err()
-                {
-                    tracing::debug!("Progress channel closed before download stage update");
-                }
+                send_progress(progress.as_ref(), Progress::Downloading).await;
 
                 tracing::trace!("Starting download stage");
                 let downloaded = download::download(
@@ -182,11 +184,7 @@ pub async fn run(
             let optimize_span = tracing::info_span!("optimize");
             let prepared = async {
                 let optimize_start = Instant::now();
-                if let Some(tx) = &progress
-                    && tx.send(Progress::Optimizing).await.is_err()
-                {
-                    tracing::debug!("Progress channel closed before optimize stage update");
-                }
+                send_progress(progress.as_ref(), Progress::Optimizing).await;
 
                 tracing::trace!("Starting optimize stage");
                 let prepared = optimize::optimize(

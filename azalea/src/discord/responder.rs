@@ -109,7 +109,7 @@ pub fn spawn_progress_updates(
             if should_send_progress(&stage, last_sent_at, debounce) {
                 update_progress(&client, &metrics, channel_id, message_id, &stage).await;
                 last_sent_at = std::time::Instant::now();
-                last_sent_stage = Some(stage.clone());
+                last_sent_stage = Some(stage);
                 pending_stage = None;
             } else if pending_stage.as_ref() != Some(&stage) {
                 // Keep only the most recent deferred stage so shutdown can flush it.

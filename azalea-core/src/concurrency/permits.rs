@@ -1,11 +1,8 @@
 //! Permit configuration used by pipeline stages.
 //!
-//! ## Preconditions
-//! - [`ConcurrencySettings`] should already be validated (see
-//!   [`crate::config::EngineSettings::validate`]).
-//!
-//! ## Postconditions
-//! - All semaphores are created with a non-zero initial permit count.
+//! Settings are validated before startup, but semaphore construction still
+//! clamps every value to one permit. That keeps tests and defensive callers from
+//! creating a permanently closed stage by accident.
 //!
 //! ## Usage footguns
 //! - Holding a permit across a long-running CPU task can starve other stages.
@@ -14,13 +11,7 @@ use crate::config::ConcurrencySettings;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// All concurrency permits in one place.
-///
-/// ## Invariants
-/// Each semaphore contains at least one permit, even if config requested 0.
-///
-/// ## Concurrency assumptions
-/// Clones share the same underlying semaphore to coordinate across tasks.
+/// Shared semaphores for every bounded pipeline stage.
 #[derive(Clone, Debug)]
 pub struct Permits {
     pub download: Arc<Semaphore>,
@@ -32,9 +23,6 @@ pub struct Permits {
 
 impl Permits {
     /// Build semaphores from configuration, clamping to at least one permit.
-    ///
-    /// ## Rationale
-    /// Clamping avoids a total deadlock when a configuration value is 0.
     pub fn new(config: &ConcurrencySettings) -> Self {
         Self {
             download: Arc::new(Semaphore::new(config.download.max(1) as usize)),

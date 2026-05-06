@@ -1,18 +1,10 @@
 //! # Module overview
-//! Runtime wiring for the media engine, tying together config, caches, HTTP, and
-//! pipeline helpers.
+//! Runtime wiring for the media engine.
 //!
-//! ## Architecture decision
-//! The engine owns long-lived singletons (HTTP client, caches, permits) so
-//! pipeline stages can remain stateless and data-oriented.
-//!
-//! ## Data flow
-//! [`Engine::new`] consumes [`crate::config::EngineSettings`] and produces the
-//! shared state used by [`crate::pipeline::run`].
-//!
-//! ## Trade-offs
-//! Centralizing ownership simplifies lifetimes at the cost of a larger, shared
-//! object; this is a deliberate choice to keep pipeline stages pure.
+//! `Engine` owns the long-lived handles shared by otherwise stateless pipeline
+//! stages: HTTP, caches, permits, metrics, temp cleanup, and runtime transcode
+//! state. Centralizing those handles keeps stage APIs concrete and avoids
+//! storing cross-stage borrows.
 
 use crate::concurrency::Permits;
 use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings, USER_AGENT};
@@ -180,16 +172,8 @@ fn average_duration_ms(duration_sum_ms: u64, count: u64) -> u64 {
 
 /// Shared engine state used by pipeline stages.
 ///
-/// ## Invariants
-/// - `http` is configured with bounded pools and timeouts.
-/// - `dedup` and `metrics` either persist or gracefully degrade based on config.
-///
-/// ## Load-bearing comments
-/// Engine is `Clone` because subsystems are internally reference-counted; all
-/// pipeline workers share the same underlying state.
-///
-/// ## Concurrency assumptions
-/// All contained handles are `Clone`-safe and expected to be shared across tasks.
+/// Clones share the same underlying caches, semaphores, metrics, and fallback
+/// state; they are handles, not independent engines.
 #[derive(Clone)]
 pub struct Engine {
     pub config: EngineSettings,
@@ -207,15 +191,8 @@ pub struct Engine {
 impl Engine {
     /// Build the engine and its storage-backed subsystems.
     ///
-    /// ## Preconditions
-    /// Callers should validate settings via [`EngineSettings::validate`].
-    ///
-    /// ## Postconditions
-    /// All subsystems are ready for concurrent pipeline execution.
-    ///
-    /// ## Constraint documentation
-    /// If persistence paths are unavailable, dedup/metrics still operate in
-    /// memory-only mode to preserve pipeline availability.
+    /// Dedup and metrics degrade to memory-only behavior when configured
+    /// persistence is unavailable so media processing can still continue.
     pub fn new(config: EngineSettings) -> anyhow::Result<Self> {
         let http = build_http_client(&config)?;
         let pinned_media_clients = PinnedMediaClientCache::new(&config);
