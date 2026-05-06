@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "cargo-workflows": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/cargo-workflows/SKILL.md",
+      "computedHash": "14a5bc62c6206505c027201b5c075916a0987ca528428ecb6f2d7f10272b4685"
+    },
     "debug-hypothesis": {
       "source": "lichamnesia/lich-skills",
       "sourceType": "github",
@@ -13,11 +19,35 @@
       "skillPath": ".claude/skills/ffmpeg/SKILL.md",
       "computedHash": "51fa05bc18bb2691e622aefd1d8ec6d4d96a9e9c44cdf599003c9d6003d11a07"
     },
+    "rust-async-internals": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-async-internals/SKILL.md",
+      "computedHash": "426642b578012af58d08dbbf5c5297dd88251eece4e468d348aefb64c55f094b"
+    },
     "rust-async-patterns": {
       "source": "wshobson/agents",
       "sourceType": "github",
       "skillPath": "plugins/systems-programming/skills/rust-async-patterns/SKILL.md",
       "computedHash": "1e68b5edfa95069e54af75acf2a34634a5d0266021fa4af3b9706eaec5b6207e"
+    },
+    "rust-build-times": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-build-times/SKILL.md",
+      "computedHash": "80825b76fc15facc5a1f609eb8356c957758fb75feef4248d913b61d897ccefd"
+    },
+    "rust-unsafe": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-unsafe/SKILL.md",
+      "computedHash": "0f98528d2805553c7264c19c006b582cf2bccfc501932feabbde284fed5a412c"
+    },
+    "rustc-basics": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rustc-basics/SKILL.md",
+      "computedHash": "4adaaf43e27841c15ccb529d17c537e575e5238af0e11886aa7ef7c9f4800b03"
     }
   }
 }
