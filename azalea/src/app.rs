@@ -89,7 +89,47 @@ impl App {
         depth
     }
 
+    /// Record a job that left the queue before the worker guard took ownership.
+    pub fn record_enqueue_cancelled(&self) {
+        let _ = self
+            .queue_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+
     pub fn queue_peak_depth(&self) -> usize {
         self.queue_peak_depth.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn test_app() -> App {
+        let mut config = AppConfig {
+            application_id: crate::config::ApplicationId::new(1),
+            ..Default::default()
+        };
+        config.engine.storage.dedup_persistent = false;
+        config.engine.storage.metrics_enabled = false;
+        let discord = DiscordClient::builder()
+            .token("test-token".to_owned())
+            .build();
+        App::new(config, discord).expect("test app should build")
+    }
+
+    #[tokio::test]
+    async fn enqueue_cancellation_restores_queue_depth() {
+        let app = test_app();
+
+        assert_eq!(app.record_queued_job(), 1);
+        app.record_enqueue_cancelled();
+
+        assert_eq!(app.queue_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(app.queue_peak_depth(), 1);
     }
 }

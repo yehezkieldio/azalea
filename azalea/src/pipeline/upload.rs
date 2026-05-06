@@ -540,6 +540,28 @@ async fn build_attachments(
                 let _ = tx.send(stage).await;
             }
 
+            if part.upload_ready_bytes().is_some() {
+                let attachment = build_attachment(
+                    part,
+                    config,
+                    tweet_id,
+                    part_number,
+                    total_files,
+                    slot as u64,
+                )
+                .await?;
+                let Some(target) = attachments.get_mut(slot) else {
+                    return Err(Error::UploadFailed {
+                        part: part_number,
+                        total: total_files,
+                        source: Box::new(std::io::Error::other("attachment slot out of range")),
+                    });
+                };
+                *target = Some(attachment);
+                next_to_spawn += 1;
+                continue;
+            }
+
             let file_path = part.path().to_path_buf();
             let file_size = part.size();
             join_set.spawn(async move {
@@ -1060,6 +1082,40 @@ mod tests {
         assert_eq!(attachment.filename, "tweet_7.mp4");
         assert_eq!(attachment.file, payload);
         assert_eq!(attachment.id, 0);
+    }
+
+    #[tokio::test]
+    async fn build_attachments_preserves_in_memory_payloads_without_reopening_files() {
+        let first_path = unique_temp_file_path("missing-batch-upload-fast-path-1.mp4");
+        let second_path = unique_temp_file_path("missing-batch-upload-fast-path-2.mp4");
+        cleanup_file(&first_path);
+        cleanup_file(&second_path);
+        let first_payload = b"in-memory-batch-upload-one";
+        let second_payload = b"in-memory-batch-upload-two";
+        let config = EngineSettings::default();
+        let parts = vec![
+            prepared_part_with_upload_ready_bytes(&first_path, first_payload),
+            prepared_part_with_upload_ready_bytes(&second_path, second_payload),
+        ];
+
+        let attachments =
+            match build_attachments(&parts, &config, TweetId(8), 0, parts.len(), None).await {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    panic!("memory-backed batch payloads should not reopen files: {error}")
+                }
+            };
+
+        assert_eq!(attachments.len(), 2);
+        let [first, second] = attachments.as_slice() else {
+            panic!("expected exactly two attachments");
+        };
+        assert_eq!(first.filename, "tweet_8_part1.mp4");
+        assert_eq!(second.filename, "tweet_8_part2.mp4");
+        assert_eq!(first.id, 0);
+        assert_eq!(second.id, 1);
+        assert_eq!(first.file, first_payload);
+        assert_eq!(second.file, second_payload);
     }
 
     #[test]

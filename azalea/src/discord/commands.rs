@@ -123,6 +123,7 @@ pub async fn handle_interaction(
             )
             .await?;
 
+            app.record_queued_job();
             let enqueue = tokio::time::timeout(
                 Duration::from_millis(app.engine.config.pipeline.queue_backpressure_timeout_ms),
                 job_sender.send(job),
@@ -130,10 +131,9 @@ pub async fn handle_interaction(
             .await;
 
             match enqueue {
-                Ok(Ok(())) => {
-                    app.record_queued_job();
-                }
+                Ok(Ok(())) => {}
                 Ok(Err(_)) => {
+                    app.record_enqueue_cancelled();
                     update_response_content(
                         &app.discord,
                         app.config.application_id,
@@ -143,6 +143,7 @@ pub async fn handle_interaction(
                     .await?;
                 }
                 Err(_) => {
+                    app.record_enqueue_cancelled();
                     update_response_content(
                         &app.discord,
                         app.config.application_id,
