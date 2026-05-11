@@ -78,14 +78,14 @@ pub async fn run(
     engine: &Engine,
     progress: Option<mpsc::Sender<Progress>>,
 ) -> Result<PreparedUpload, Error> {
-    let pipeline_span = tracing::info_span!(
-        "pipeline",
-        req = job.request_id.0,
-        tweet_id = job.tweet_url.tweet_id.0
-    );
+    let pipeline_span = tracing::info_span!("pipeline");
 
     async {
-        tracing::info!("Pipeline started");
+        tracing::info!(
+            req = job.request_id.0,
+            tweet_id = job.tweet_url.tweet_id.0,
+            "Pipeline started"
+        );
         let pipeline_start = Instant::now();
 
         tracing::trace!("Checking in-memory dedup admission cache");
@@ -239,12 +239,19 @@ pub async fn run(
             Ok(prepared) => {
                 tracing::info!(
                     elapsed_ms = pipeline_start.elapsed().as_millis(),
+                    req = job.request_id.0,
+                    tweet_id = job.tweet_url.tweet_id.0,
                     "Pipeline finished"
                 );
                 Ok(prepared)
             }
             Err(err) => {
-                tracing::warn!(error = %err, "Pipeline failed; clearing in-flight dedup marker");
+                tracing::warn!(
+                    req = job.request_id.0,
+                    tweet_id = job.tweet_url.tweet_id.0,
+                    error = %err,
+                    "Pipeline failed; clearing in-flight dedup marker"
+                );
                 engine
                     .dedup
                     .clear_inflight(job.scope_id, job.tweet_url.tweet_id)
