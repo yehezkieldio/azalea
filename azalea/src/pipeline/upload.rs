@@ -216,7 +216,6 @@ async fn upload_parts_sequential(
         config,
         tweet_id,
         total_files,
-        progress_tx,
     };
     let prepare_byte_budget = attachment_prepare_byte_budget(config);
 
@@ -275,6 +274,7 @@ async fn upload_parts_sequential(
             total: total_files,
         };
 
+        send_upload_progress(progress_tx, index + 1, total_files).await;
         let (response, http_send_ms) = send_with_retry(&ctx, std::slice::from_ref(&attachment))
             .instrument(tracing::info_span!(
                 "upload_part",
@@ -339,7 +339,6 @@ struct AttachmentPrepareContext<'a> {
     config: &'a EngineSettings,
     tweet_id: TweetId,
     total_files: usize,
-    progress_tx: Option<&'a mpsc::Sender<Progress>>,
 }
 
 async fn queue_attachment_preparation(
@@ -356,14 +355,6 @@ async fn queue_attachment_preparation(
         )),
     })?;
     let part_number = slot + 1;
-    if let Some(tx) = ctx.progress_tx {
-        let stage = if ctx.total_files > 1 {
-            Progress::UploadingSegment(part_number, ctx.total_files)
-        } else {
-            Progress::Uploading
-        };
-        let _ = tx.send(stage).await;
-    }
 
     let prepared_attachment = if part.upload_ready_bytes().is_some() {
         PreparedAttachment::Ready(
@@ -448,15 +439,8 @@ async fn upload_parts_batched(
         let batch_start = batch_index * MAX_ATTACHMENTS_PER_REQUEST;
         let batch_end = batch_start + batch_parts.len();
         let prepare_start = std::time::Instant::now();
-        let attachments = build_attachments(
-            batch_parts,
-            config,
-            tweet_id,
-            batch_start,
-            total_files,
-            progress_tx,
-        )
-        .await?;
+        let attachments =
+            build_attachments(batch_parts, config, tweet_id, batch_start, total_files).await?;
         metrics.attachment_prepare_ms = metrics
             .attachment_prepare_ms
             .saturating_add(prepare_start.elapsed().as_millis() as u64);
@@ -470,6 +454,7 @@ async fn upload_parts_batched(
             total: total_files,
         };
 
+        send_upload_progress(progress_tx, batch_end, total_files).await;
         let (response, http_send_ms) = send_with_retry(&ctx, &attachments)
             .instrument(tracing::info_span!(
                 "upload_batch",
@@ -525,6 +510,22 @@ async fn upload_parts_batched(
         },
         metrics,
     ))
+}
+
+async fn send_upload_progress(
+    progress_tx: Option<&mpsc::Sender<Progress>>,
+    part_number: usize,
+    total_files: usize,
+) {
+    let Some(tx) = progress_tx else {
+        return;
+    };
+    let stage = if total_files > 1 {
+        Progress::UploadingSegment(part_number, total_files)
+    } else {
+        Progress::Uploading
+    };
+    let _ = tx.send(stage).await;
 }
 
 fn file_size_checked_from_metadata(
@@ -703,7 +704,6 @@ async fn build_attachments(
     tweet_id: TweetId,
     start_part_index: usize,
     total_files: usize,
-    progress_tx: Option<&mpsc::Sender<Progress>>,
 ) -> Result<Vec<Attachment>, Error> {
     let max_upload_bytes = config.transcode.max_upload_bytes;
     let concurrency_limit = config
@@ -727,15 +727,6 @@ async fn build_attachments(
             };
             let slot = next_to_spawn;
             let part_number = start_part_index + slot + 1;
-            if let Some(tx) = progress_tx {
-                let stage = if total_files > 1 {
-                    Progress::UploadingSegment(part_number, total_files)
-                } else {
-                    Progress::Uploading
-                };
-                let _ = tx.send(stage).await;
-            }
-
             if part.upload_ready_bytes().is_some() {
                 let attachment = build_attachment(
                     part,
@@ -1241,7 +1232,7 @@ mod tests {
         ];
 
         let attachments =
-            match build_attachments(&parts, &config, TweetId(42), 0, parts.len(), None).await {
+            match build_attachments(&parts, &config, TweetId(42), 0, parts.len()).await {
                 Ok(attachments) => attachments,
                 Err(error) => panic!("attachments should build: {error}"),
             };
@@ -1294,13 +1285,13 @@ mod tests {
             prepared_part_with_upload_ready_bytes(&second_path, second_payload),
         ];
 
-        let attachments =
-            match build_attachments(&parts, &config, TweetId(8), 0, parts.len(), None).await {
-                Ok(attachments) => attachments,
-                Err(error) => {
-                    panic!("memory-backed batch payloads should not reopen files: {error}")
-                }
-            };
+        let attachments = match build_attachments(&parts, &config, TweetId(8), 0, parts.len()).await
+        {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                panic!("memory-backed batch payloads should not reopen files: {error}")
+            }
+        };
 
         assert_eq!(attachments.len(), 2);
         let [first, second] = attachments.as_slice() else {
@@ -1356,6 +1347,36 @@ mod tests {
         assert!(can_queue_attachment_prepare(0, 80, 64));
         assert!(!can_queue_attachment_prepare(40, 40, 64));
         assert!(can_queue_attachment_prepare(24, 40, 64));
+    }
+
+    #[tokio::test]
+    async fn send_upload_progress_reports_actual_send_stage() {
+        let (tx, mut rx) = mpsc::channel(2);
+
+        send_upload_progress(Some(&tx), 2, 4).await;
+
+        assert_eq!(rx.recv().await, Some(Progress::UploadingSegment(2, 4)));
+    }
+
+    #[tokio::test]
+    async fn attachment_preparation_does_not_emit_upload_progress() {
+        let path = unique_temp_file_path("prepare-no-progress.mp4");
+        cleanup_file(&path);
+        let config = EngineSettings::default();
+        let parts = [prepared_part_with_upload_ready_bytes(&path, b"payload")];
+        let mut prepared = [None];
+        let prepare_ctx = AttachmentPrepareContext {
+            parts: &parts,
+            config: &config,
+            tweet_id: TweetId(99),
+            total_files: 1,
+        };
+        let (_tx, mut rx) = mpsc::channel::<Progress>(1);
+
+        let result = queue_attachment_preparation(&mut prepared, &prepare_ctx, 0, 0).await;
+
+        assert!(result.is_ok());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
