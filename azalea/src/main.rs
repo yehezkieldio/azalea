@@ -732,6 +732,12 @@ async fn run_pipeline_worker(
         }
         let permit = match tokio::select! {
             _ = force_shutdown.cancelled() => {
+                if job.dedup_reserved {
+                    app.engine
+                        .dedup
+                        .clear_inflight(job.channel_id.get(), job.tweet_url.tweet_id)
+                        .await;
+                }
                 drop(queue_guard);
                 break 'worker;
             }
@@ -740,6 +746,12 @@ async fn run_pipeline_worker(
             Ok(permit) => permit,
             Err(_) => {
                 tracing::warn!("Pipeline semaphore closed");
+                if job.dedup_reserved {
+                    app.engine
+                        .dedup
+                        .clear_inflight(job.channel_id.get(), job.tweet_url.tweet_id)
+                        .await;
+                }
                 drop(queue_guard);
                 break;
             }

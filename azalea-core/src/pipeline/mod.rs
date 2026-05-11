@@ -89,10 +89,11 @@ pub async fn run(
         let pipeline_start = Instant::now();
 
         tracing::trace!("Checking in-memory dedup admission cache");
-        if !engine
-            .dedup
-            .reserve_inflight(job.scope_id, job.tweet_url.tweet_id)
-            .await
+        if !job.inflight_reserved
+            && !engine
+                .dedup
+                .reserve_inflight(job.scope_id, job.tweet_url.tweet_id)
+                .await
         {
             // The queue-level admission check is intentionally best-effort; the
             // pipeline still rechecks here so queued duplicates cannot do work.

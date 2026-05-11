@@ -107,6 +107,9 @@ pub async fn handle_interaction(
             .await?;
         }
         CommandResponse::Deferred(job) => {
+            let reserved_dedup = job
+                .dedup_reserved
+                .then_some((job.channel_id.get(), job.tweet_url.tweet_id));
             respond(
                 &app.discord,
                 app.config.application_id,
@@ -134,6 +137,9 @@ pub async fn handle_interaction(
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     app.record_enqueue_cancelled();
+                    if let Some((scope_id, tweet_id)) = reserved_dedup {
+                        app.engine.dedup.clear_inflight(scope_id, tweet_id).await;
+                    }
                     update_response_content(
                         &app.discord,
                         app.config.application_id,
@@ -144,6 +150,9 @@ pub async fn handle_interaction(
                 }
                 Err(_) => {
                     app.record_enqueue_cancelled();
+                    if let Some((scope_id, tweet_id)) = reserved_dedup {
+                        app.engine.dedup.clear_inflight(scope_id, tweet_id).await;
+                    }
                     update_response_content(
                         &app.discord,
                         app.config.application_id,
@@ -224,12 +233,12 @@ async fn handle_media_command(
         );
     }
 
-    // Admission checks are served from in-memory dedup state; persistence is
-    // hydrated at startup and written via background flush.
-    if app
+    // Reserve before deferring so duplicate slash commands can be rejected while
+    // the original job is still queued.
+    if !app
         .engine
         .dedup
-        .is_duplicate(channel_id.get(), tweet_url.tweet_id)
+        .reserve_inflight(channel_id.get(), tweet_url.tweet_id)
         .await
     {
         return CommandResponse::Immediate(
@@ -237,15 +246,18 @@ async fn handle_media_command(
         );
     }
 
-    CommandResponse::Deferred(Job::new(
-        RequestId(app.next_request_id()),
-        channel_id,
-        interaction_id,
-        None,
-        Some(InteractionResponseHandle::new(token.to_owned())),
-        author_id,
-        tweet_url,
-    ))
+    CommandResponse::Deferred(
+        Job::new(
+            RequestId(app.next_request_id()),
+            channel_id,
+            interaction_id,
+            None,
+            Some(InteractionResponseHandle::new(token.to_owned())),
+            author_id,
+            tweet_url,
+        )
+        .with_dedup_reserved(),
+    )
 }
 
 /// Issue a single interaction response and propagate errors.
@@ -538,6 +550,52 @@ mod tests {
             response,
             "please provide exactly one tweet URL per command.",
         );
+    }
+
+    #[tokio::test]
+    async fn handle_media_command_reserves_dedup_before_deferring() {
+        let app = test_app();
+        let channel_id = Some(ChannelId::new(28));
+        let author_id = Some(UserId::new(46));
+        let options = [url_option("https://x.com/rustlang/status/123")];
+
+        let first = handle_media_command(
+            &app,
+            channel_id,
+            author_id,
+            InteractionId::new(15),
+            "test-token",
+            &options,
+        )
+        .await;
+        let job = match first {
+            CommandResponse::Deferred(job) => job,
+            CommandResponse::Immediate(content) => {
+                assert_eq!(content, "expected deferred command");
+                return;
+            }
+        };
+        assert!(job.dedup_reserved);
+        assert!(job.core().inflight_reserved);
+
+        let second = handle_media_command(
+            &app,
+            channel_id,
+            author_id,
+            InteractionId::new(16),
+            "test-token",
+            &options,
+        )
+        .await;
+        assert_immediate(
+            second,
+            "that tweet was already processed recently in this channel.",
+        );
+
+        app.engine
+            .dedup
+            .clear_inflight(job.channel_id.get(), job.tweet_url.tweet_id)
+            .await;
     }
 
     #[tokio::test]

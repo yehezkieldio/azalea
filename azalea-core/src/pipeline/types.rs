@@ -29,6 +29,7 @@ pub struct Job {
     pub scope_id: u64,
     pub job_id: u64,
     pub tweet_url: TweetLink,
+    pub inflight_reserved: bool,
 }
 
 impl Job {
@@ -39,7 +40,13 @@ impl Job {
             scope_id,
             job_id,
             tweet_url,
+            inflight_reserved: false,
         }
+    }
+
+    pub fn with_inflight_reserved(mut self) -> Self {
+        self.inflight_reserved = true;
+        self
     }
 }
 

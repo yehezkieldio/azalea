@@ -38,6 +38,7 @@ pub struct Job {
     pub interaction_response: Option<InteractionResponseHandle>,
     pub author_id: UserId,
     pub tweet_url: TweetLink,
+    pub dedup_reserved: bool,
 }
 
 impl Job {
@@ -59,7 +60,13 @@ impl Job {
             interaction_response,
             author_id,
             tweet_url,
+            dedup_reserved: false,
         }
+    }
+
+    pub fn with_dedup_reserved(mut self) -> Self {
+        self.dedup_reserved = true;
+        self
     }
 
     /// Convert to the core engine job representation.
@@ -67,12 +74,17 @@ impl Job {
     /// ## Rationale
     /// Keeps the core engine interface independent of Discord-specific IDs.
     pub fn core(&self) -> CoreJob {
-        CoreJob::new(
+        let core = CoreJob::new(
             self.request_id,
             self.channel_id.get(),
             self.trigger_id.get(),
             self.tweet_url.clone(),
-        )
+        );
+        if self.dedup_reserved {
+            core.with_inflight_reserved()
+        } else {
+            core
+        }
     }
 
     pub fn is_slash_command(&self) -> bool {
