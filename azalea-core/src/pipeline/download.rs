@@ -184,9 +184,16 @@ pub async fn download(
                 if next_downloaded <= upload_ready_buffer_limit {
                     bytes.extend_from_slice(&chunk);
                 } else {
-                    upload_ready_bytes = None;
+                    let buffered = upload_ready_bytes.take();
                     if file.is_none() {
-                        file = Some(open_download_file(&output_path, total_size, config).await?);
+                        transition_memory_download_to_file(
+                            &mut file,
+                            &output_path,
+                            total_size,
+                            config,
+                            buffered,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -356,6 +363,28 @@ async fn open_download_file(
         config.pipeline.download_write_buffer_bytes,
         file,
     ))
+}
+
+async fn transition_memory_download_to_file(
+    file: &mut Option<BufWriter<fs::File>>,
+    output_path: &Path,
+    total_size: Option<u64>,
+    config: &EngineSettings,
+    buffered: Option<Vec<u8>>,
+) -> Result<(), Error> {
+    let mut opened = open_download_file(output_path, total_size, config).await?;
+    if let Some(buffered) = buffered
+        && !buffered.is_empty()
+    {
+        opened
+            .write_all(&buffered)
+            .await
+            .map_err(|e| Error::DownloadFailed {
+                source: DownloadError::WriteFailed(e),
+            })?;
+    }
+    *file = Some(opened);
+    Ok(())
 }
 
 async fn finish_download_file(mut file: BufWriter<fs::File>, downloaded: u64) -> Result<(), Error> {
@@ -819,7 +848,8 @@ mod tests {
     use super::{
         FetchStep, MAX_REDIRECTS, bounded_upload_ready_buffer, can_keep_download_memory_only,
         content_length_header_bytes, estimate_bitrate_kbps, fetch_with_redirects_inner,
-        parse_bitrate_kbps, upload_ready_buffer_limit,
+        finish_download_file, parse_bitrate_kbps, transition_memory_download_to_file,
+        upload_ready_buffer_limit,
     };
     use crate::config::EngineSettings;
     use crate::pipeline::errors::{DownloadError, Error};
@@ -828,6 +858,8 @@ mod tests {
     use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncWriteExt;
 
     fn validated(url: Url) -> ValidatedMediaUrl {
         ValidatedMediaUrl {
@@ -835,6 +867,14 @@ mod tests {
             url,
             addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443)],
         }
+    }
+
+    fn unique_temp_file(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("azalea-download-{name}-{nanos}.bin"))
     }
 
     #[test]
@@ -911,6 +951,35 @@ mod tests {
         assert!(!can_keep_download_memory_only(Some(1025), false, &config));
         assert!(!can_keep_download_memory_only(None, false, &config));
         assert!(!can_keep_download_memory_only(Some(1024), true, &config));
+    }
+
+    #[tokio::test]
+    async fn memory_download_transition_preserves_buffered_prefix() {
+        let config = EngineSettings::default();
+        let path = unique_temp_file("overflow-prefix");
+        let mut file = None;
+
+        transition_memory_download_to_file(
+            &mut file,
+            &path,
+            Some(3),
+            &config,
+            Some(b"abc".to_vec()),
+        )
+        .await
+        .expect("transition should open disk file");
+
+        let mut file = file.expect("transition should install file sink");
+        file.write_all(b"def").await.expect("write suffix");
+        finish_download_file(file, 6)
+            .await
+            .expect("finish transitioned file");
+
+        let contents = tokio::fs::read(&path)
+            .await
+            .expect("read transitioned file");
+        assert_eq!(contents, b"abcdef");
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[tokio::test]
