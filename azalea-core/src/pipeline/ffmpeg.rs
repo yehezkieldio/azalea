@@ -34,6 +34,12 @@ const FFMPEG_SUCCESS_STDERR_TAIL_LINES: usize = 20;
 const STDERR_DRAIN_TIMEOUT_SECS: u64 = 2;
 const PROGRESS_HEARTBEAT_SECS: u64 = 30;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleLimit {
+    Width(u32),
+    Height(u32),
+}
+
 fn clamp_kbps(value: u64) -> u64 {
     value.min(MAX_FFMPEG_KBPS)
 }
@@ -162,21 +168,28 @@ fn push_hw_device_input_args(args: &mut Args, config: &TranscodeSettings, split:
 }
 
 fn video_filter(
-    height: Option<u32>,
+    scale_limit: Option<ScaleLimit>,
     hardware_acceleration: HardwareAcceleration,
 ) -> Option<String> {
-    match (hardware_acceleration, height) {
-        (HardwareAcceleration::Vaapi, Some(height)) => Some(format!(
+    match (hardware_acceleration, scale_limit) {
+        (HardwareAcceleration::Vaapi, Some(ScaleLimit::Height(height))) => Some(format!(
             "format=nv12|vaapi,hwupload,scale_vaapi=-2:{height}"
         )),
+        (HardwareAcceleration::Vaapi, Some(ScaleLimit::Width(width))) => {
+            Some(format!("format=nv12|vaapi,hwupload,scale_vaapi={width}:-2"))
+        }
         (HardwareAcceleration::Vaapi, None) => Some("format=nv12|vaapi,hwupload".into()),
-        (HardwareAcceleration::Qsv, Some(height)) => Some(format!(
+        (HardwareAcceleration::Qsv, Some(ScaleLimit::Height(height))) => Some(format!(
             "format=nv12,hwupload=extra_hw_frames=64,scale_qsv=-1:{height}"
+        )),
+        (HardwareAcceleration::Qsv, Some(ScaleLimit::Width(width))) => Some(format!(
+            "format=nv12,hwupload=extra_hw_frames=64,scale_qsv={width}:-1"
         )),
         (HardwareAcceleration::Qsv, None) => {
             Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv".into())
         }
-        (_, Some(height)) => Some(format!("scale=-2:{height}")),
+        (_, Some(ScaleLimit::Height(height))) => Some(format!("scale=-2:{height}")),
+        (_, Some(ScaleLimit::Width(width))) => Some(format!("scale={width}:-2")),
         (_, None) => None,
     }
 }
@@ -312,14 +325,14 @@ pub fn transcode_args(
     output: &Path,
     video_kbps: u32,
     audio_kbps: u32,
-    max_height: Option<u32>,
+    scale_limit: Option<ScaleLimit>,
     config: &TranscodeSettings,
     transcode_concurrency: u32,
 ) -> Args {
     debug!(
         hardware_acceleration = ?config.hardware_acceleration,
         encoder = config.hardware_acceleration.encoder(),
-        max_height,
+        ?scale_limit,
         "Building ffmpeg transcode args"
     );
     let mut args = Args::new();
@@ -330,7 +343,7 @@ pub fn transcode_args(
     args.push("-i".into());
     args.push(input.as_os_str().into());
 
-    if let Some(filter) = video_filter(max_height, config.hardware_acceleration) {
+    if let Some(filter) = video_filter(scale_limit, config.hardware_acceleration) {
         args.push("-vf".into());
         args.push(filter.into());
     }
@@ -628,7 +641,7 @@ mod tests {
             Path::new("output.mp4"),
             900,
             128,
-            Some(720),
+            Some(ScaleLimit::Height(720)),
             &TranscodeSettings::default(),
             2,
         );
@@ -638,6 +651,24 @@ mod tests {
                 && w.get(1).is_some_and(|value| value.contains("scale=-2:720"))
         }));
         assert!(as_text.windows(2).any(|w| w == ["-c:v", "libx264"]));
+    }
+
+    #[test]
+    fn transcode_args_add_scale_filter_when_width_is_set() {
+        let args = transcode_args(
+            Path::new("input.mp4"),
+            Path::new("output.mp4"),
+            900,
+            128,
+            Some(ScaleLimit::Width(360)),
+            &TranscodeSettings::default(),
+            2,
+        );
+        let as_text = to_strings(&args);
+        assert!(as_text.windows(2).any(|w| {
+            w.first() == Some(&"-vf".to_string())
+                && w.get(1).is_some_and(|value| value.contains("scale=360:-2"))
+        }));
     }
 
     #[test]
@@ -699,7 +730,7 @@ mod tests {
             Path::new("output.mp4"),
             900,
             128,
-            Some(720),
+            Some(ScaleLimit::Height(720)),
             &TranscodeSettings {
                 hardware_acceleration: HardwareAcceleration::Qsv,
                 ..TranscodeSettings::default()
@@ -739,6 +770,29 @@ mod tests {
         }));
         assert!(as_text.windows(2).any(|w| w == ["-bitrate_limit", "1"]));
         assert!(as_text.windows(2).any(|w| w == ["-low_delay_brc", "1"]));
+    }
+
+    #[test]
+    fn transcode_args_configure_qsv_width_filter() {
+        let args = transcode_args(
+            Path::new("input.mp4"),
+            Path::new("output.mp4"),
+            900,
+            128,
+            Some(ScaleLimit::Width(360)),
+            &TranscodeSettings {
+                hardware_acceleration: HardwareAcceleration::Qsv,
+                ..TranscodeSettings::default()
+            },
+            2,
+        );
+        let as_text = to_strings(&args);
+
+        assert!(as_text.windows(2).any(|w| {
+            w.first() == Some(&"-vf".to_string())
+                && w.get(1)
+                    .is_some_and(|value| value.contains("scale_qsv=360:-1"))
+        }));
     }
 
     #[test]

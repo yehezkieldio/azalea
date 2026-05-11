@@ -162,28 +162,28 @@ pub async fn optimize(
 
     let duration = downloaded.duration.or(resolved.duration).unwrap_or(60.0);
     let source_resolution = downloaded.resolution.or(resolved.resolution);
-    let balanced_height = predict_resolution(
+    let balanced_scale_limit = predict_scale_limit(
         duration,
         source_resolution,
         config,
         config.transcode.quality_preset,
     );
-    let aggressive_height =
-        predict_resolution(duration, source_resolution, config, QualityPreset::Size);
+    let aggressive_scale_limit =
+        predict_scale_limit(duration, source_resolution, config, QualityPreset::Size);
 
     tracing::trace!(
         duration_secs = duration,
         source_resolution = ?source_resolution,
-        balanced_height = balanced_height,
-        aggressive_height = aggressive_height,
+        balanced_scale_limit = ?balanced_scale_limit,
+        aggressive_scale_limit = ?aggressive_scale_limit,
         "Computed transcode targets"
     );
 
     let strategy_plan = build_strategy_plan(
         &downloaded,
         duration,
-        balanced_height,
-        aggressive_height,
+        balanced_scale_limit,
+        aggressive_scale_limit,
         config,
     );
     for strategy in strategy_plan.strategies.into_iter().flatten() {
@@ -241,7 +241,7 @@ pub async fn optimize(
                 let result = try_transcode(
                     &downloaded,
                     duration,
-                    balanced_height,
+                    balanced_scale_limit,
                     temp_files,
                     &transcode,
                     &mut dir_guard,
@@ -250,7 +250,7 @@ pub async fn optimize(
                     "optimize.strategy.transcode",
                     variant = "balanced",
                     duration_secs = duration,
-                    max_height = ?balanced_height
+                    scale_limit = ?balanced_scale_limit
                 ))
                 .await?;
                 if let Some(result) = result {
@@ -263,7 +263,7 @@ pub async fn optimize(
                 let result = try_transcode(
                     &downloaded,
                     duration,
-                    aggressive_height,
+                    aggressive_scale_limit,
                     temp_files,
                     &transcode,
                     &mut dir_guard,
@@ -272,7 +272,7 @@ pub async fn optimize(
                     "optimize.strategy.transcode",
                     variant = "aggressive",
                     duration_secs = duration,
-                    max_height = ?aggressive_height
+                    scale_limit = ?aggressive_scale_limit
                 ))
                 .await?;
                 if let Some(result) = result {
@@ -350,8 +350,8 @@ struct StrategyPlan {
 fn build_strategy_plan(
     downloaded: &DownloadedFile,
     duration: f64,
-    balanced_height: Option<u32>,
-    aggressive_height: Option<u32>,
+    balanced_scale_limit: Option<ffmpeg::ScaleLimit>,
+    aggressive_scale_limit: Option<ffmpeg::ScaleLimit>,
     config: &EngineSettings,
 ) -> StrategyPlan {
     let remux_viable = remux_is_plausible(downloaded);
@@ -375,7 +375,7 @@ fn build_strategy_plan(
     let (transcode_balanced, transcode_aggressive) = if single_transcode_viable {
         (
             Some(TranscodeStrategy::TranscodeBalanced),
-            (aggressive_height != balanced_height)
+            (aggressive_scale_limit != balanced_scale_limit)
                 .then_some(TranscodeStrategy::TranscodeAggressive),
         )
     } else {
@@ -557,40 +557,62 @@ async fn validate_input_exists(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn predict_resolution(
+fn predict_scale_limit(
     duration: f64,
     source_resolution: Option<(u32, u32)>,
     config: &EngineSettings,
     quality_preset: QualityPreset,
-) -> Option<u32> {
+) -> Option<ffmpeg::ScaleLimit> {
     let Ok(params) = BitrateParams::compute(&config.transcode, duration) else {
-        // Guardrail: fall back to a conservative height when bitrate calc fails.
-        return Some(360);
+        return Some(scale_limit_for_resolution(source_resolution, 360));
     };
 
-    let source_height = source_resolution.map(|(_, h)| h);
-    let recommendation =
-        Ladder::recommend(source_height, params.video_bitrate_kbps, quality_preset);
+    let source_display_edge = source_resolution.map(|(width, height)| width.min(height));
+    let recommendation = Ladder::recommend(
+        source_display_edge,
+        params.video_bitrate_kbps,
+        quality_preset,
+    );
 
-    recommendation.target_height
+    recommendation
+        .target_height
+        .map(|edge| scale_limit_for_resolution(source_resolution, edge))
+}
+
+fn scale_limit_for_resolution(
+    source_resolution: Option<(u32, u32)>,
+    target_edge: u32,
+) -> ffmpeg::ScaleLimit {
+    match source_resolution {
+        Some((width, height)) if height > width => ffmpeg::ScaleLimit::Width(target_edge),
+        _ => ffmpeg::ScaleLimit::Height(target_edge),
+    }
 }
 
 async fn try_transcode(
     downloaded: &DownloadedFile,
     duration: f64,
-    max_height: Option<u32>,
+    scale_limit: Option<ffmpeg::ScaleLimit>,
     temp_files: &TempFileCleanup,
     ctx: &TranscodeContext<'_>,
     dir_guard: &mut Option<TempFileGuard>,
 ) -> Result<Option<PreparedUpload>, Error> {
     let transcode_path = transcode_path(&downloaded.path);
-    match transcode(&downloaded.path, &transcode_path, duration, max_height, ctx).await {
+    match transcode(
+        &downloaded.path,
+        &transcode_path,
+        duration,
+        scale_limit,
+        ctx,
+    )
+    .await
+    {
         Ok(size) if size <= ctx.config.transcode.max_upload_bytes => {
             tracing::info!(
                 mode = "transcode",
                 size_bytes = size,
                 limit_bytes = ctx.config.transcode.max_upload_bytes,
-                max_height,
+                ?scale_limit,
                 "Transcode completed and fit upload limit"
             );
             // Success path: keep the transcode output and attach temp guards.
@@ -608,7 +630,7 @@ async fn try_transcode(
                 mode = "transcode",
                 size_bytes = size,
                 limit_bytes = ctx.config.transcode.max_upload_bytes,
-                max_height,
+                ?scale_limit,
                 "Transcode completed but still exceeded upload limit"
             );
             tracing::trace!(
@@ -661,7 +683,7 @@ async fn transcode(
     input: &Path,
     output: &Path,
     duration: f64,
-    max_height: Option<u32>,
+    scale_limit: Option<ffmpeg::ScaleLimit>,
     ctx: &TranscodeContext<'_>,
 ) -> Result<u64, Error> {
     let _permit = ctx
@@ -687,7 +709,7 @@ async fn transcode(
                 output,
                 params.video_bitrate_kbps,
                 params.audio_bitrate_kbps,
-                max_height,
+                scale_limit,
                 active_settings,
                 effective_transcode_concurrency,
             )
@@ -1383,7 +1405,7 @@ mod tests {
     use super::{
         BitrateParams, SplitTranscodeJob, SplitTranscodeProgress, TranscodeContext,
         TranscodeStrategy, build_strategy_plan, execute_with_hwacc_fallback, optimize,
-        predict_resolution, remaining_timeout_budget, send_progress_best_effort, split_parallel,
+        predict_scale_limit, remaining_timeout_budget, send_progress_best_effort, split_parallel,
         split_parallel_is_plausible, split_serial, split_transcode_concurrency,
         split_transcode_settings,
     };
@@ -1392,6 +1414,7 @@ mod tests {
     use crate::engine::TranscodeRuntime;
     use crate::media::TempFileCleanup;
     use crate::pipeline::errors::Error;
+    use crate::pipeline::ffmpeg::ScaleLimit;
     use crate::pipeline::types::{
         AudioCodec, DownloadedFile, MediaContainer, MediaFacts, MediaType, PreparedUpload,
         Progress, ResolvedMedia, VideoCodec,
@@ -1564,7 +1587,13 @@ mod tests {
             },
         );
 
-        let plan = build_strategy_plan(&downloaded, 60.0, Some(720), Some(480), &config);
+        let plan = build_strategy_plan(
+            &downloaded,
+            60.0,
+            Some(ScaleLimit::Height(720)),
+            Some(ScaleLimit::Height(480)),
+            &config,
+        );
 
         assert_eq!(
             plan.strategies,
@@ -1599,7 +1628,13 @@ mod tests {
             },
         );
 
-        let plan = build_strategy_plan(&downloaded, 60.0, Some(720), Some(480), &config);
+        let plan = build_strategy_plan(
+            &downloaded,
+            60.0,
+            Some(ScaleLimit::Height(720)),
+            Some(ScaleLimit::Height(480)),
+            &config,
+        );
 
         assert_eq!(
             plan.strategies,
@@ -1629,7 +1664,13 @@ mod tests {
             },
         );
 
-        let plan = build_strategy_plan(&downloaded, 60.0, Some(720), Some(480), &config);
+        let plan = build_strategy_plan(
+            &downloaded,
+            60.0,
+            Some(ScaleLimit::Height(720)),
+            Some(ScaleLimit::Height(480)),
+            &config,
+        );
 
         assert_eq!(plan.strategies[0], Some(TranscodeStrategy::Remux));
     }
@@ -1649,7 +1690,13 @@ mod tests {
             },
         );
 
-        let plan = build_strategy_plan(&downloaded, 720.0, Some(720), Some(480), &config);
+        let plan = build_strategy_plan(
+            &downloaded,
+            720.0,
+            Some(ScaleLimit::Height(720)),
+            Some(ScaleLimit::Height(480)),
+            &config,
+        );
 
         assert_eq!(
             plan.strategies,
@@ -1750,11 +1797,21 @@ mod tests {
     fn aggressive_predict_resolution_downshifts_when_fast_path_would_preserve_480p() {
         let config = EngineSettings::default();
 
-        let fast = predict_resolution(60.0, Some((854, 480)), &config, QualityPreset::Fast);
-        let size = predict_resolution(60.0, Some((854, 480)), &config, QualityPreset::Size);
+        let fast = predict_scale_limit(60.0, Some((854, 480)), &config, QualityPreset::Fast);
+        let size = predict_scale_limit(60.0, Some((854, 480)), &config, QualityPreset::Size);
 
         assert_eq!(fast, None);
-        assert_eq!(size, Some(240));
+        assert_eq!(size, Some(ScaleLimit::Height(240)));
+    }
+
+    #[test]
+    fn portrait_predict_scale_limit_targets_width_not_height() {
+        let config = EngineSettings::default();
+
+        let scale_limit =
+            predict_scale_limit(53.986395, Some((1080, 1920)), &config, QualityPreset::Fast);
+
+        assert_eq!(scale_limit, Some(ScaleLimit::Width(360)));
     }
 
     #[tokio::test]
