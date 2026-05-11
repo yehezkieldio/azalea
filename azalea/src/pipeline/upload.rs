@@ -30,6 +30,7 @@ use twilight_http::response::StatusCode;
 use twilight_model::http::attachment::Attachment;
 
 const MAX_ATTACHMENTS_PER_REQUEST: usize = 10;
+const MAX_ATTACHMENT_PREPARE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Metrics {
@@ -143,11 +144,53 @@ async fn upload_parts(
 }
 
 fn should_batch_upload(parts: &[PreparedPart], config: &EngineSettings) -> bool {
-    parts.len() > 1 && config.pipeline.batch_upload_multiple_media
+    parts.len() > 1
+        && config.pipeline.batch_upload_multiple_media
+        && total_part_bytes(parts) <= attachment_prepare_byte_budget(config)
 }
 
 fn batch_request_count(parts: usize) -> usize {
     parts.div_ceil(MAX_ATTACHMENTS_PER_REQUEST)
+}
+
+fn total_part_bytes(parts: &[PreparedPart]) -> u64 {
+    parts
+        .iter()
+        .fold(0u64, |total, part| total.saturating_add(part.size()))
+}
+
+fn attachment_prepare_byte_budget(config: &EngineSettings) -> u64 {
+    let configured_window = config
+        .transcode
+        .max_upload_bytes
+        .saturating_mul(config.pipeline.attachment_prepare_concurrency as u64);
+    configured_window.clamp(1, MAX_ATTACHMENT_PREPARE_BYTES)
+}
+
+fn can_queue_attachment_prepare(queued_bytes: u64, part_size: u64, budget: u64) -> bool {
+    queued_bytes == 0 || queued_bytes.saturating_add(part_size) <= budget
+}
+
+fn can_queue_next_attachment_prepare(
+    parts: &[PreparedPart],
+    slot: usize,
+    queued_bytes: u64,
+    budget: u64,
+) -> bool {
+    parts
+        .get(slot)
+        .is_some_and(|part| can_queue_attachment_prepare(queued_bytes, part.size(), budget))
+}
+
+fn part_size_for_upload(parts: &[PreparedPart], slot: usize, total: usize) -> Result<u64, Error> {
+    parts
+        .get(slot)
+        .map(PreparedPart::size)
+        .ok_or_else(|| Error::UploadFailed {
+            part: slot + 1,
+            total,
+            source: Box::new(std::io::Error::other("attachment part out of range")),
+        })
 }
 
 async fn upload_parts_sequential(
@@ -166,6 +209,7 @@ async fn upload_parts_sequential(
         .attachment_prepare_concurrency
         .min(total_files.max(1));
     let mut next_to_prepare = 0usize;
+    let mut queued_prepare_bytes = 0u64;
     let mut prepared = (0..total_files).map(|_| None).collect::<Vec<_>>();
     let prepare_ctx = AttachmentPrepareContext {
         parts,
@@ -174,9 +218,23 @@ async fn upload_parts_sequential(
         total_files,
         progress_tx,
     };
+    let prepare_byte_budget = attachment_prepare_byte_budget(config);
 
-    while next_to_prepare < total_files && next_to_prepare < prepare_limit {
+    while next_to_prepare < total_files
+        && next_to_prepare < prepare_limit
+        && can_queue_next_attachment_prepare(
+            parts,
+            next_to_prepare,
+            queued_prepare_bytes,
+            prepare_byte_budget,
+        )
+    {
         queue_attachment_preparation(&mut prepared, &prepare_ctx, next_to_prepare, 0).await?;
+        queued_prepare_bytes = queued_prepare_bytes.saturating_add(part_size_for_upload(
+            parts,
+            next_to_prepare,
+            total_files,
+        )?);
         next_to_prepare += 1;
     }
 
@@ -184,6 +242,8 @@ async fn upload_parts_sequential(
         let prepare_start = std::time::Instant::now();
         let attachment =
             take_prepared_attachment(&mut prepared, index, index + 1, total_files).await?;
+        queued_prepare_bytes =
+            queued_prepare_bytes.saturating_sub(part_size_for_upload(parts, index, total_files)?);
         metrics.attachment_prepare_ms = metrics
             .attachment_prepare_ms
             .saturating_add(prepare_start.elapsed().as_millis() as u64);
@@ -191,8 +251,20 @@ async fn upload_parts_sequential(
             .payload_bytes
             .saturating_add(attachment_payload_bytes(std::slice::from_ref(&attachment)));
 
-        if next_to_prepare < total_files {
+        if next_to_prepare < total_files
+            && can_queue_next_attachment_prepare(
+                parts,
+                next_to_prepare,
+                queued_prepare_bytes,
+                prepare_byte_budget,
+            )
+        {
             queue_attachment_preparation(&mut prepared, &prepare_ctx, next_to_prepare, 0).await?;
+            queued_prepare_bytes = queued_prepare_bytes.saturating_add(part_size_for_upload(
+                parts,
+                next_to_prepare,
+                total_files,
+            )?);
             next_to_prepare += 1;
         }
 
@@ -1249,6 +1321,41 @@ mod tests {
         assert_eq!(batch_request_count(11), 2);
         assert_eq!(batch_request_count(20), 2);
         assert_eq!(batch_request_count(21), 3);
+    }
+
+    #[test]
+    fn attachment_prepare_budget_caps_large_upload_windows() {
+        let mut config = EngineSettings::default();
+        config.transcode.max_upload_bytes = 50 * 1024 * 1024;
+        config.pipeline.attachment_prepare_concurrency = 4;
+
+        assert_eq!(attachment_prepare_byte_budget(&config), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn batch_upload_is_disabled_when_payload_exceeds_prepare_budget() {
+        let first_path = write_temp_file("large-batch-toggle-1", b"x");
+        let second_path = write_temp_file("large-batch-toggle-2", b"y");
+        let mut config = EngineSettings::default();
+        config.transcode.max_upload_bytes = 50 * 1024 * 1024;
+        config.pipeline.attachment_prepare_concurrency = 4;
+        config.pipeline.batch_upload_multiple_media = true;
+
+        let parts = vec![
+            prepared_part(&first_path, 40 * 1024 * 1024),
+            prepared_part(&second_path, 40 * 1024 * 1024),
+        ];
+
+        assert!(!should_batch_upload(&parts, &config));
+        cleanup_file(&first_path);
+        cleanup_file(&second_path);
+    }
+
+    #[test]
+    fn attachment_prepare_queue_allows_one_oversized_part_to_make_progress() {
+        assert!(can_queue_attachment_prepare(0, 80, 64));
+        assert!(!can_queue_attachment_prepare(40, 40, 64));
+        assert!(can_queue_attachment_prepare(24, 40, 64));
     }
 
     #[test]
