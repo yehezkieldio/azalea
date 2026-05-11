@@ -410,6 +410,8 @@ impl Tracker {
         let failures = self.inner.failures.load(Ordering::Relaxed);
         let error_counts = ErrorCategory::ALL
             .map(|category| (category, category.load_atomic(&self.inner.error_counts)));
+        let stage_duration_sum_ms = self.swap_stage_duration_sums();
+        let stage_count = self.swap_stage_counts();
 
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             // Snapshot values are written as a single transaction for consistency.
@@ -435,20 +437,14 @@ impl Tracker {
         .await;
 
         match result {
-            Ok(Ok(())) => {
-                // Reset stage aggregates after flush to keep averages recent.
-                for slot in self.inner.stage_duration_sum_ms.iter() {
-                    slot.store(0, Ordering::Relaxed);
-                }
-                for slot in self.inner.stage_count.iter() {
-                    slot.store(0, Ordering::Relaxed);
-                }
-            }
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "Failed to flush metrics");
+                self.restore_stage_window(stage_duration_sum_ms, stage_count);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to flush metrics");
+                self.restore_stage_window(stage_duration_sum_ms, stage_count);
             }
         }
     }
@@ -474,6 +470,35 @@ impl Tracker {
     /// Stop the periodic flush task.
     pub async fn stop_flush_task(&self) {
         self.inner.flush_worker.stop().await;
+    }
+
+    fn swap_stage_duration_sums(&self) -> [u64; 4] {
+        std::array::from_fn(|idx| {
+            self.inner
+                .stage_duration_sum_ms
+                .get(idx)
+                .map(|slot| slot.swap(0, Ordering::AcqRel))
+                .unwrap_or(0)
+        })
+    }
+
+    fn swap_stage_counts(&self) -> [u64; 4] {
+        std::array::from_fn(|idx| {
+            self.inner
+                .stage_count
+                .get(idx)
+                .map(|slot| slot.swap(0, Ordering::AcqRel))
+                .unwrap_or(0)
+        })
+    }
+
+    fn restore_stage_window(&self, duration_sum_ms: [u64; 4], sample_count: [u64; 4]) {
+        for (slot, value) in self.inner.stage_duration_sum_ms.iter().zip(duration_sum_ms) {
+            slot.fetch_add(value, Ordering::AcqRel);
+        }
+        for (slot, value) in self.inner.stage_count.iter().zip(sample_count) {
+            slot.fetch_add(value, Ordering::AcqRel);
+        }
     }
 }
 
@@ -624,6 +649,39 @@ mod tests {
         assert_eq!(
             ErrorCategory::DownloadFailed.load_atomic(&restored.inner.error_counts),
             1
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stage_window_restore_preserves_samples_recorded_after_swap() {
+        let path = unique_metrics_path("metrics-window-restore");
+        let tracker =
+            Tracker::new(&storage_config(true, path.clone())).expect("tracker should construct");
+        tracker.record_stage_duration(Stage::Upload, 100);
+
+        let duration_sum_ms = tracker.swap_stage_duration_sums();
+        let sample_count = tracker.swap_stage_counts();
+        tracker.record_stage_duration(Stage::Upload, 300);
+        tracker.restore_stage_window(duration_sum_ms, sample_count);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(
+            snapshot
+                .stage_window
+                .avg_ms
+                .get(Stage::Upload as usize)
+                .copied(),
+            Some(200)
+        );
+        assert_eq!(
+            snapshot
+                .stage_window
+                .sample_count
+                .get(Stage::Upload as usize)
+                .copied(),
+            Some(2)
         );
 
         let _ = std::fs::remove_file(path);
