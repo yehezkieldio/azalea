@@ -357,8 +357,13 @@ fn build_strategy_plan(
     let remux_viable = remux_is_plausible(downloaded);
     let single_transcode_viable = single_transcode_is_plausible(duration, config);
     let source_height = downloaded.resolution.map(|(_, height)| height);
-    let split_transcode =
-        SplitTranscodePlan::compute(&config.transcode, duration, source_height).ok();
+    let split_transcode = SplitTranscodePlan::compute(
+        &config.transcode,
+        duration,
+        source_height,
+        downloaded.facts.bitrate_kbps,
+    )
+    .ok();
 
     let remux = if remux_viable {
         Some(TranscodeStrategy::Remux)
@@ -390,6 +395,7 @@ fn build_strategy_plan(
         tracing::trace!(
             segment_duration_secs = plan.segment_duration,
             estimated_segments = plan.estimated_segments,
+            source_bitrate_kbps = downloaded.facts.bitrate_kbps,
             video_bitrate_kbps = plan.bitrate.video_bitrate_kbps,
             audio_bitrate_kbps = plan.bitrate.audio_bitrate_kbps,
             "Split-transcode plan computed"
@@ -793,7 +799,7 @@ fn split_transcode_settings(
     if matches!(settings.hardware_acceleration, HardwareAcceleration::Qsv)
         && segment_params.video_bitrate_kbps < settings.min_bitrate_kbps
     {
-        tracing::warn!(
+        tracing::info!(
             video_bitrate_kbps = segment_params.video_bitrate_kbps,
             min_bitrate_kbps = settings.min_bitrate_kbps,
             "Using software encoder for low-bitrate QSV split"

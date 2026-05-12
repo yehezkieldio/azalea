@@ -78,6 +78,7 @@ impl BitrateParams {
     pub fn compute_for_split(
         config: &TranscodeSettings,
         segment_duration: f64,
+        source_bitrate_kbps: Option<u32>,
     ) -> Result<Self, Error> {
         validate_duration(segment_duration, TranscodeStage::Split)?;
         let target_bits = (config.max_upload_bytes as f64 * config.split_target_ratio) * 8.0;
@@ -97,9 +98,15 @@ impl BitrateParams {
 
         let video_bitrate_kbps = ((usable_video_bits / segment_duration / 1000.0)
             * (1.0 - config.vbr_safety_margin)) as u32;
+        let video_bitrate_kbps = cap_video_bitrate_to_source(
+            video_bitrate_kbps.max(100),
+            source_bitrate_kbps,
+            audio_bitrate_kbps,
+            config.split_target_ratio,
+        );
 
         Ok(Self {
-            video_bitrate_kbps: video_bitrate_kbps.max(100),
+            video_bitrate_kbps,
             audio_bitrate_kbps,
         })
     }
@@ -125,6 +132,7 @@ impl SplitTranscodePlan {
         config: &TranscodeSettings,
         media_duration: f64,
         source_height: Option<u32>,
+        source_bitrate_kbps: Option<u32>,
     ) -> Result<Self, Error> {
         validate_duration(media_duration, TranscodeStage::Split)?;
         let max_segment_duration = media_duration.min(config.max_single_video_duration_secs as f64);
@@ -134,13 +142,18 @@ impl SplitTranscodePlan {
         let mut fallback = None;
         for segments in min_segments..=max_segments {
             let segment_duration = media_duration / segments as f64;
-            let bitrate = BitrateParams::compute_for_split(config, segment_duration)?;
+            let bitrate =
+                BitrateParams::compute_for_split(config, segment_duration, source_bitrate_kbps)?;
             let plan = Self {
                 segment_duration,
                 estimated_segments: segments,
                 bitrate,
             };
             fallback = Some(plan);
+
+            if split_plan_is_source_bitrate_capped(config, source_bitrate_kbps, bitrate) {
+                return Ok(plan);
+            }
 
             if split_plan_preserves_source_height(config, source_height, bitrate) {
                 return Ok(plan);
@@ -153,6 +166,41 @@ impl SplitTranscodePlan {
             stderr_tail: "split plan could not be computed".to_string(),
         })
     }
+}
+
+fn cap_video_bitrate_to_source(
+    video_bitrate_kbps: u32,
+    source_bitrate_kbps: Option<u32>,
+    audio_bitrate_kbps: u32,
+    source_target_ratio: f64,
+) -> u32 {
+    source_video_bitrate_cap(source_bitrate_kbps, audio_bitrate_kbps, source_target_ratio)
+        .map_or(video_bitrate_kbps, |cap| video_bitrate_kbps.min(cap))
+}
+
+fn source_video_bitrate_cap(
+    source_bitrate_kbps: Option<u32>,
+    audio_bitrate_kbps: u32,
+    source_target_ratio: f64,
+) -> Option<u32> {
+    source_bitrate_kbps.map(|source| {
+        ((source as f64 * source_target_ratio.clamp(0.1, 1.0)) as u32)
+            .saturating_sub(audio_bitrate_kbps)
+            .max(100)
+    })
+}
+
+fn split_plan_is_source_bitrate_capped(
+    config: &TranscodeSettings,
+    source_bitrate_kbps: Option<u32>,
+    bitrate: BitrateParams,
+) -> bool {
+    source_video_bitrate_cap(
+        source_bitrate_kbps,
+        bitrate.audio_bitrate_kbps,
+        config.split_target_ratio,
+    )
+    .is_some_and(|cap| bitrate.video_bitrate_kbps == cap)
 }
 
 fn split_plan_preserves_source_height(
@@ -434,7 +482,7 @@ mod tests {
 
     #[test]
     fn split_bitrate_uses_expected_audio_floor() {
-        let params = BitrateParams::compute_for_split(&TranscodeSettings::default(), 30.0)
+        let params = BitrateParams::compute_for_split(&TranscodeSettings::default(), 30.0, None)
             .expect("split params should be computed");
         assert_eq!(params.audio_bitrate_kbps, 128);
         assert!(params.video_bitrate_kbps >= 100);
@@ -452,7 +500,7 @@ mod tests {
             ..TranscodeSettings::default()
         };
 
-        let plan = SplitTranscodePlan::compute(&config, 60.0, None)
+        let plan = SplitTranscodePlan::compute(&config, 60.0, None, None)
             .expect("short input should produce a split-transcode plan");
 
         assert_eq!(plan.segment_duration, 60.0);
@@ -473,7 +521,7 @@ mod tests {
             ..TranscodeSettings::default()
         };
 
-        let plan = SplitTranscodePlan::compute(&config, 300.0, None)
+        let plan = SplitTranscodePlan::compute(&config, 300.0, None, None)
             .expect("long input should produce a split-transcode plan");
 
         assert_eq!(plan.segment_duration, 60.0);
@@ -484,13 +532,31 @@ mod tests {
 
     #[test]
     fn split_transcode_plan_uses_more_segments_to_preserve_720p() {
-        let plan = SplitTranscodePlan::compute(&TranscodeSettings::default(), 167.872, Some(720))
-            .expect("default config should produce a split-transcode plan");
+        let plan =
+            SplitTranscodePlan::compute(&TranscodeSettings::default(), 167.872, Some(720), None)
+                .expect("default config should produce a split-transcode plan");
 
         assert_eq!(plan.estimated_segments, 4);
         assert!(plan.segment_duration > 41.0);
         assert!(plan.segment_duration < 42.0);
         assert!(plan.bitrate.video_bitrate_kbps >= 1_000);
+    }
+
+    #[test]
+    fn split_transcode_plan_does_not_inflate_low_bitrate_sources() {
+        let plan = SplitTranscodePlan::compute(
+            &TranscodeSettings::default(),
+            190.566168,
+            Some(974),
+            Some(570),
+        )
+        .expect("low-bitrate long source should still produce a split-transcode plan");
+
+        assert_eq!(plan.estimated_segments, 2);
+        assert!(plan.segment_duration > 95.0);
+        assert!(plan.segment_duration < 96.0);
+        assert_eq!(plan.bitrate.audio_bitrate_kbps, 128);
+        assert_eq!(plan.bitrate.video_bitrate_kbps, 328);
     }
 
     #[test]
