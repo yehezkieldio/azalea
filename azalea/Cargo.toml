@@ -14,6 +14,10 @@ required-features = ["schemars"]
 name = "generate-config"
 path = "src/bin/generate_config.rs"
 
+[[bin]]
+name = "azalea-probe"
+path = "src/bin/azalea_probe.rs"
+
 [lints]
 workspace = true
 

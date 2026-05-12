@@ -18,6 +18,7 @@ pub mod download;
 pub mod errors;
 pub mod ffmpeg;
 pub mod optimize;
+pub mod probe;
 mod process;
 pub mod quality;
 pub mod resolve;

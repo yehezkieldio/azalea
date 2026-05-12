@@ -612,7 +612,6 @@ async fn try_transcode(
                 mode = "transcode",
                 size_bytes = size,
                 limit_bytes = ctx.config.transcode.max_upload_bytes,
-                ?scale_limit,
                 "Transcode completed and fit upload limit"
             );
             // Success path: keep the transcode output and attach temp guards.
@@ -630,7 +629,6 @@ async fn try_transcode(
                 mode = "transcode",
                 size_bytes = size,
                 limit_bytes = ctx.config.transcode.max_upload_bytes,
-                ?scale_limit,
                 "Transcode completed but still exceeded upload limit"
             );
             tracing::trace!(

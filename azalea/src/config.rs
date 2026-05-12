@@ -122,26 +122,16 @@ impl AppConfig {
     /// 2. `.env`
     /// 3. process environment
     pub fn load() -> anyhow::Result<LoadedConfig> {
-        let config_file_contents = match std::fs::read_to_string(CONFIG_FILE) {
-            Ok(contents) => {
-                tracing::info!(path = CONFIG_FILE, "Loaded configuration");
-                Some(contents)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!(path = CONFIG_FILE, "Config file not found, using defaults");
-                None
-            }
-            Err(err) => return Err(err.into()),
-        };
+        load_config_sources().and_then(load_from_sources)
+    }
 
-        let dotenv_entries = parse_dotenv_file(DOTENV_FILE)?;
-        let process_env = std::env::vars().collect::<Vec<_>>();
-        let sources = ConfigSources {
-            config_file_contents,
-            dotenv_entries,
-            process_env,
-        };
-        load_from_sources(sources)
+    /// Load configuration for local media probes that do not use Discord.
+    #[allow(dead_code)]
+    pub fn load_probe() -> anyhow::Result<Self> {
+        let sources = load_config_sources()?;
+        let config = extract_app_config(&sources)?;
+        config.validate_probe()?;
+        Ok(config)
     }
 
     /// Validate configuration values and enforce application constraints.
@@ -158,18 +148,11 @@ impl AppConfig {
             );
         }
 
-        if self.runtime.worker_threads == 0 {
-            anyhow::bail!("runtime.worker_threads must be at least 1");
-        }
+        self.validate_probe()
+    }
 
-        if self.runtime.max_blocking_threads == 0 {
-            anyhow::bail!("runtime.max_blocking_threads must be at least 1");
-        }
-
-        if self.runtime.thread_stack_size < 1024 * 1024 {
-            anyhow::bail!("runtime.thread_stack_size must be at least 1 MiB");
-        }
-
+    fn validate_probe(&self) -> anyhow::Result<()> {
+        validate_runtime(&self.runtime)?;
         self.engine.validate()?;
         Ok(())
     }
@@ -181,6 +164,45 @@ impl AppConfig {
     pub fn upload_timeout(&self) -> Duration {
         self.engine.upload_timeout()
     }
+}
+
+fn load_config_sources() -> anyhow::Result<ConfigSources> {
+    let config_file_contents = match std::fs::read_to_string(CONFIG_FILE) {
+        Ok(contents) => {
+            tracing::info!(path = CONFIG_FILE, "Loaded configuration");
+            Some(contents)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(path = CONFIG_FILE, "Config file not found, using defaults");
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let dotenv_entries = parse_dotenv_file(DOTENV_FILE)?;
+    let process_env = std::env::vars().collect::<Vec<_>>();
+    let sources = ConfigSources {
+        config_file_contents,
+        dotenv_entries,
+        process_env,
+    };
+    Ok(sources)
+}
+
+fn validate_runtime(runtime: &RuntimeConfig) -> anyhow::Result<()> {
+    if runtime.worker_threads == 0 {
+        anyhow::bail!("runtime.worker_threads must be at least 1");
+    }
+
+    if runtime.max_blocking_threads == 0 {
+        anyhow::bail!("runtime.max_blocking_threads must be at least 1");
+    }
+
+    if runtime.thread_stack_size < 1024 * 1024 {
+        anyhow::bail!("runtime.thread_stack_size must be at least 1 MiB");
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -512,10 +534,23 @@ const ENV_BINDINGS: &[EnvBinding] = &[
 ];
 
 fn load_from_sources(sources: ConfigSources) -> anyhow::Result<LoadedConfig> {
+    let config = extract_app_config(&sources)?;
+    config.validate()?;
+    let token = resolve_discord_token(&sources.dotenv_entries, &sources.process_env)?;
+
+    Ok(LoadedConfig {
+        app: config,
+        auth: AuthConfig {
+            discord_token: DiscordToken::new(token),
+        },
+    })
+}
+
+fn extract_app_config(sources: &ConfigSources) -> anyhow::Result<AppConfig> {
     let mut figment = Figment::new();
 
-    if let Some(contents) = sources.config_file_contents {
-        figment = figment.merge(Toml::string(&contents));
+    if let Some(contents) = &sources.config_file_contents {
+        figment = figment.merge(Toml::string(contents));
     }
 
     if let Some(dotenv_overrides) = build_env_overrides(&sources.dotenv_entries) {
@@ -527,15 +562,7 @@ fn load_from_sources(sources: ConfigSources) -> anyhow::Result<LoadedConfig> {
     }
 
     let config: AppConfig = figment.extract()?;
-    config.validate()?;
-
-    let token = resolve_discord_token(&sources.dotenv_entries, &sources.process_env)?;
-    Ok(LoadedConfig {
-        app: config,
-        auth: AuthConfig {
-            discord_token: DiscordToken::new(token),
-        },
-    })
+    Ok(config)
 }
 
 fn build_env_overrides(entries: &[(String, String)]) -> Option<Value> {
@@ -790,6 +817,19 @@ mod tests {
         };
 
         assert!(err.to_string().contains("DISCORD_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn probe_load_skips_discord_only_requirements() -> anyhow::Result<()> {
+        let config = extract_app_config(&ConfigSources {
+            config_file_contents: None,
+            dotenv_entries: Vec::new(),
+            process_env: Vec::new(),
+        })?;
+
+        assert_eq!(config.application_id.get(), 0);
+        assert!(config.validate_probe().is_ok());
         Ok(())
     }
 
