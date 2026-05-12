@@ -276,11 +276,7 @@ async fn upload_parts_sequential(
 
         send_upload_progress(progress_tx, index + 1, total_files).await;
         let (response, http_send_ms) = send_with_retry(&ctx, std::slice::from_ref(&attachment))
-            .instrument(tracing::info_span!(
-                "upload_part",
-                part = index + 1,
-                total = total_files
-            ))
+            .instrument(tracing::info_span!("upload_part"))
             .await?;
         metrics.http_send_ms = metrics.http_send_ms.saturating_add(http_send_ms);
         metrics.request_count = metrics.request_count.saturating_add(1);

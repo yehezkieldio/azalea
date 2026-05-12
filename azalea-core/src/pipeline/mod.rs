@@ -82,11 +82,7 @@ pub async fn run(
     let pipeline_span = tracing::info_span!("pipeline");
 
     async {
-        tracing::info!(
-            req = job.request_id.0,
-            tweet_id = job.tweet_url.tweet_id.0,
-            "Pipeline started"
-        );
+        tracing::info!("Pipeline started");
         let pipeline_start = Instant::now();
 
         tracing::trace!("Checking in-memory dedup admission cache");
@@ -240,16 +236,12 @@ pub async fn run(
             Ok(prepared) => {
                 tracing::info!(
                     elapsed_ms = pipeline_start.elapsed().as_millis(),
-                    req = job.request_id.0,
-                    tweet_id = job.tweet_url.tweet_id.0,
                     "Pipeline finished"
                 );
                 Ok(prepared)
             }
             Err(err) => {
                 tracing::warn!(
-                    req = job.request_id.0,
-                    tweet_id = job.tweet_url.tweet_id.0,
                     error = %err,
                     "Pipeline failed; clearing in-flight dedup marker"
                 );
