@@ -1020,6 +1020,7 @@ async fn split_parallel(
     let max_active_segments = (split_job.transcode_concurrency as usize).max(1);
     let mut next_segment = 0usize;
     while next_segment < total_segments && join_set.len() < max_active_segments {
+        let parent_span = tracing::Span::current();
         spawn_parallel_segment_task(
             &mut join_set,
             next_segment,
@@ -1032,6 +1033,7 @@ async fn split_parallel(
             split_job.transcode_concurrency,
             segment_video_kbps,
             segment_audio_kbps,
+            parent_span,
         );
         next_segment += 1;
     }
@@ -1059,6 +1061,7 @@ async fn split_parallel(
                     Progress::Transcoding(finished, total_segments),
                 );
                 while next_segment < total_segments && join_set.len() < max_active_segments {
+                    let parent_span = tracing::Span::current();
                     spawn_parallel_segment_task(
                         &mut join_set,
                         next_segment,
@@ -1071,6 +1074,7 @@ async fn split_parallel(
                         split_job.transcode_concurrency,
                         segment_video_kbps,
                         segment_audio_kbps,
+                        parent_span,
                     );
                     next_segment += 1;
                 }
@@ -1134,67 +1138,71 @@ fn spawn_parallel_segment_task(
     transcode_concurrency: u32,
     segment_video_kbps: u32,
     segment_audio_kbps: u32,
+    parent_span: tracing::Span,
 ) {
     let input_path = input_path.to_owned();
     let output_path = input_path.with_file_name(format!("{}_seg{:03}.mp4", stem, idx));
-    join_set.spawn(async move {
-        let started_at = Instant::now();
-        tracing::info!(
-            segment_index = idx,
-            start_secs = idx as f64 * segment_duration,
-            duration_secs = segment_duration,
-            input = %input_path.display(),
-            output = %output_path.display(),
-            "Started parallel segment transcode"
-        );
-        let permit = permits
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
-        let result = execute_with_hwacc_fallback(
-            &parallel_transcode.ffmpeg_path,
-            timeout,
-            TranscodeStage::Split,
-            &parallel_transcode.transcode_settings,
-            &parallel_transcode.transcode_runtime,
-            |active_settings| {
-                ffmpeg::transcode_segment_args(
-                    &input_path,
-                    &output_path,
-                    idx as f64 * segment_duration,
-                    segment_duration,
-                    segment_video_kbps,
-                    segment_audio_kbps,
-                    active_settings,
-                    transcode_concurrency,
-                )
-            },
-        )
-        .await;
-        drop(permit);
-        result?;
-        let size = fs::metadata(&output_path).await?.len();
-        if size == 0 {
-            return Err(Error::TranscodeFailed {
-                stage: TranscodeStage::Split,
-                exit_code: None,
-                stderr_tail: "split produced an empty segment".to_string(),
-            });
+    join_set.spawn(
+        async move {
+            let started_at = Instant::now();
+            tracing::info!(
+                segment_index = idx,
+                start_secs = idx as f64 * segment_duration,
+                duration_secs = segment_duration,
+                input = %input_path.display(),
+                output = %output_path.display(),
+                "Started parallel segment transcode"
+            );
+            let permit = permits
+                .acquire_owned()
+                .await
+                .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
+            let result = execute_with_hwacc_fallback(
+                &parallel_transcode.ffmpeg_path,
+                timeout,
+                TranscodeStage::Split,
+                &parallel_transcode.transcode_settings,
+                &parallel_transcode.transcode_runtime,
+                |active_settings| {
+                    ffmpeg::transcode_segment_args(
+                        &input_path,
+                        &output_path,
+                        idx as f64 * segment_duration,
+                        segment_duration,
+                        segment_video_kbps,
+                        segment_audio_kbps,
+                        active_settings,
+                        transcode_concurrency,
+                    )
+                },
+            )
+            .await;
+            drop(permit);
+            result?;
+            let size = fs::metadata(&output_path).await?.len();
+            if size == 0 {
+                return Err(Error::TranscodeFailed {
+                    stage: TranscodeStage::Split,
+                    exit_code: None,
+                    stderr_tail: "split produced an empty segment".to_string(),
+                });
+            }
+            tracing::info!(
+                segment_index = idx,
+                size_bytes = size,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "Parallel segment transcode completed"
+            );
+            Ok((
+                idx,
+                SegmentOutput {
+                    path: output_path,
+                    size,
+                },
+            ))
         }
-        tracing::info!(
-            segment_index = idx,
-            size_bytes = size,
-            elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "Parallel segment transcode completed"
-        );
-        Ok((
-            idx,
-            SegmentOutput {
-                path: output_path,
-                size,
-            },
-        ))
-    });
+        .instrument(parent_span),
+    );
 }
 
 async fn execute_with_hwacc_fallback<F>(
