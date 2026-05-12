@@ -7,9 +7,42 @@ All notable changes to this project will be documented in this file.
 > This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages.
 
 
+## 0.5.0 (May 12, 2026)
+
+### <!-- 11 -->🛠️ Miscellaneous
+- [`cacb4ef`](https://github.com/yehezkieldio/azalea/commit/cacb4ef2a5d961f7cfef2f124d3d41b42d3dda58) **logging**: Reduce duplicate pipeline fields
+
+### <!-- 12 -->🔒 Security
+- [`51861b7`](https://github.com/yehezkieldio/azalea/commit/51861b794d9cff3734dcd7dcd2b828a404083793) **pipeline**: Pin validated media addrs and reject empty segments
+
+### <!-- 3 -->🚀 New Features
+- [`ea2aca6`](https://github.com/yehezkieldio/azalea/commit/ea2aca6c8c44694042426283cb7e7431a233657f) **probe**: Add end-to-end pipeline probe
+- [`b18e459`](https://github.com/yehezkieldio/azalea/commit/b18e459b716085b8e3529241118b3f580904e538) **pipeline**: Add pinned media client cache for downloads
+- [`1082f99`](https://github.com/yehezkieldio/azalea/commit/1082f99c91007ac5d5f3d45520485a9963caba3f) **skills**: Add cargo-workflows and rust skill reference docs
+
+### <!-- 4 -->🐛 Bug Fixes
+- [`ab17799`](https://github.com/yehezkieldio/azalea/commit/ab17799cc49ca65a24d94a63951354d6f9664bc3) **pipeline**: Preserve portrait transcode width
+- [`871e5ee`](https://github.com/yehezkieldio/azalea/commit/871e5eea733eb116a8e0f8e895a38eacc77d1186) **upload**: Report progress at send time
+- [`4d6e252`](https://github.com/yehezkieldio/azalea/commit/4d6e25209316d36e23ee4cd781961c18bd3f5953) **commands**: Reserve dedup before deferring jobs
+- [`d3967d5`](https://github.com/yehezkieldio/azalea/commit/d3967d53c4ca70afc35a91e5c32c515d1594557c) **metrics**: Preserve stage samples during flush
+- [`e2b71f5`](https://github.com/yehezkieldio/azalea/commit/e2b71f5f8f63ce01e42834d4fe1243a153c76f02) **pipeline**: Preserve buffered download prefix
+- [`88d9fd8`](https://github.com/yehezkieldio/azalea/commit/88d9fd83745131784da2c23462d220ed8f4dc8a7) **app**: Restore queue depth when enqueue cancelled
+
+### <!-- 5 -->📚 Documentation
+- [`f9c5e32`](https://github.com/yehezkieldio/azalea/commit/f9c5e32364b98964c308397e031839e5d8abbaaf) **debug**: Remove DEBUG.md incident notes
+- [`22cd0a3`](https://github.com/yehezkieldio/azalea/commit/22cd0a38fa69d0dcc7ed6e7e847abc815ac438a2) **readme**: Update azalea media pipeline docs and config variables
+
+### <!-- 7 -->🚜 Refactor
+- [`f058dbb`](https://github.com/yehezkieldio/azalea/commit/f058dbb4097aefdfae76400291cc736a69298edd) **pipeline**: Add send_progress helper
+
+### <!-- 99 -->🌀 Other
+- [`e45c751`](https://github.com/yehezkieldio/azalea/commit/e45c751eabe077e78b69553c44196daa2a240115) **upload**: Bound attachment preparation memory
+- [`cfb2a87`](https://github.com/yehezkieldio/azalea/commit/cfb2a873897bd7eea49e0fd381286575b88be433) **pipeline**: Prefetch attachments with capped prepare concurrency
+
 ## 0.4.3 (May 5, 2026)
 
 ### <!-- 11 -->🛠️ Miscellaneous
+- [`e44a065`](https://github.com/yehezkieldio/azalea/commit/e44a065605050121e6b1735c559573361b039c9e) **release**: 0.4.3
 - [`8e3a79b`](https://github.com/yehezkieldio/azalea/commit/8e3a79b747648b6e277bfa1ee1c4453be490b736) Add agent skills
 
 ### <!-- 3 -->🚀 New Features
