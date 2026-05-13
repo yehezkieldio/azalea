@@ -487,6 +487,11 @@ const ENV_BINDINGS: &[EnvBinding] = &[
         path: &["pipeline", "ytdlp_timeout_secs"],
     },
     EnvBinding {
+        key: "YTDLP_INSECURE_NO_CHECK_CERTIFICATE",
+        aliases: &[],
+        path: &["pipeline", "ytdlp_insecure_no_check_certificate"],
+    },
+    EnvBinding {
         key: "USER_RATE_LIMIT_REQUESTS",
         aliases: &[],
         path: &["pipeline", "user_rate_limit_requests"],

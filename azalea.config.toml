@@ -63,6 +63,7 @@ min_disk_space_bytes = 524288000
 max_download_bytes = 524288000
 resolver_timeout_secs = 10
 ytdlp_timeout_secs = 30
+ytdlp_insecure_no_check_certificate = false
 user_rate_limit_requests = 10
 user_rate_limit_window_secs = 60
 channel_rate_limit_requests = 20

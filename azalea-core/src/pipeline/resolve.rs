@@ -71,7 +71,11 @@ impl ResolverChain {
 
         Self {
             vx: VxTwitter::new(pipeline.resolver_timeout_secs),
-            ytdlp: YtDlp::new(binaries.ytdlp.clone(), pipeline.ytdlp_timeout_secs),
+            ytdlp: YtDlp::new(
+                binaries.ytdlp.clone(),
+                pipeline.ytdlp_timeout_secs,
+                pipeline.ytdlp_insecure_no_check_certificate,
+            ),
             positive_cache,
             negative_cache,
         }
@@ -341,6 +345,7 @@ impl VxTwitter {
 struct YtDlp {
     path: std::path::PathBuf,
     timeout: Duration,
+    insecure_no_check_certificate: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,10 +378,15 @@ struct YtDlpFormat {
 }
 
 impl YtDlp {
-    fn new(path: std::path::PathBuf, timeout_secs: u64) -> Self {
+    fn new(
+        path: std::path::PathBuf,
+        timeout_secs: u64,
+        insecure_no_check_certificate: bool,
+    ) -> Self {
         Self {
             path,
             timeout: Duration::from_secs(timeout_secs),
+            insecure_no_check_certificate,
         }
     }
 
@@ -390,18 +400,7 @@ impl YtDlp {
         );
 
         async {
-            let mut command = Command::new(&self.path);
-            command.args([
-                "--dump-json",
-                "--no-warnings",
-                "--no-playlist",
-                "--no-check-certificate",
-                "--user-agent",
-                USER_AGENT,
-                "--extractor-args",
-                "twitter:api=syndication",
-                tweet_url.canonical_url(),
-            ]);
+            let mut command = self.command(tweet_url);
             let output = run_json_subprocess(
                 &mut command,
                 self.timeout,
@@ -469,6 +468,25 @@ impl YtDlp {
         }
         .instrument(resolve_span)
         .await
+    }
+
+    fn command(&self, tweet_url: &TweetLink) -> Command {
+        let mut command = Command::new(&self.path);
+        command.args([
+            "--dump-json",
+            "--no-warnings",
+            "--no-playlist",
+            "--user-agent",
+            USER_AGENT,
+            "--extractor-args",
+            "twitter:api=syndication",
+            tweet_url.canonical_url(),
+        ]);
+        if self.insecure_no_check_certificate {
+            tracing::warn!("yt-dlp certificate verification is disabled by configuration");
+            command.arg("--no-check-certificate");
+        }
+        command
     }
 }
 
@@ -652,10 +670,12 @@ fn should_negative_cache(error: &ResolveError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        YtDlpFormat, YtDlpOutput, extension_from_vxtwitter_metadata, select_best_format,
+        YtDlp, YtDlpFormat, YtDlpOutput, extension_from_vxtwitter_metadata, select_best_format,
         should_negative_cache,
     };
+    use crate::media::TweetLink;
     use crate::pipeline::errors::ResolveError;
+    use std::path::PathBuf;
 
     fn format(
         url: &str,
@@ -671,6 +691,40 @@ mod tests {
             acodec: acodec.map(Into::into),
             tbr,
         }
+    }
+
+    fn command_args(command: &tokio::process::Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn tweet_link() -> TweetLink {
+        TweetLink::new(
+            "rustlang".into(),
+            crate::media::TweetId(123456),
+            "https://x.com/rustlang/status/123456".into(),
+        )
+    }
+
+    #[test]
+    fn ytdlp_command_checks_certificates_by_default() {
+        let resolver = YtDlp::new(PathBuf::from("yt-dlp"), 30, false);
+        let command = resolver.command(&tweet_link());
+        let args = command_args(&command);
+
+        assert!(!args.iter().any(|arg| arg == "--no-check-certificate"));
+    }
+
+    #[test]
+    fn ytdlp_command_can_disable_certificate_checks_by_config() {
+        let resolver = YtDlp::new(PathBuf::from("yt-dlp"), 30, true);
+        let command = resolver.command(&tweet_link());
+        let args = command_args(&command);
+
+        assert!(args.iter().any(|arg| arg == "--no-check-certificate"));
     }
 
     #[test]

@@ -265,6 +265,10 @@
           "default": 60,
           "minimum": 0
         },
+        "ytdlp_insecure_no_check_certificate": {
+          "type": "boolean",
+          "default": false
+        },
         "ytdlp_timeout_secs": {
           "type": "integer",
           "format": "uint64",

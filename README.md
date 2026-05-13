@@ -94,6 +94,7 @@ max_upload_bytes = 8388608     # 8 MiB (Discord free tier default)
 [pipeline]
 upload_ready_buffer_max_bytes = 8388608
 batch_upload_multiple_media = true
+ytdlp_insecure_no_check_certificate = false
 user_rate_limit_requests = 10
 user_rate_limit_window_secs = 60
 channel_rate_limit_requests = 20
@@ -227,6 +228,7 @@ Selected environment variables:
 | `AZALEA_UPLOAD_READY_BUFFER_MAX_BYTES`     | `pipeline.upload_ready_buffer_max_bytes`  | `8388608`             |
 | `AZALEA_MAX_DOWNLOAD_BYTES`                | `pipeline.max_download_bytes`             | `524288000`           |
 | `AZALEA_BATCH_UPLOAD_MULTIPLE_MEDIA`       | `pipeline.batch_upload_multiple_media`    | `true`                |
+| `AZALEA_YTDLP_INSECURE_NO_CHECK_CERTIFICATE` | `pipeline.ytdlp_insecure_no_check_certificate` | `false`          |
 | `AZALEA_TEMP_DIR`                          | `storage.temp_dir`                        | system temp dir + `azalea` |
 | `AZALEA_DEDUP_PERSISTENT`                  | `storage.dedup_persistent`                | `true`                |
 | `AZALEA_DEDUP_TTL_HOURS`                   | `storage.dedup_ttl_hours`                 | `24`                  |
