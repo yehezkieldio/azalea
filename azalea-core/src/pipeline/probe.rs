@@ -3,17 +3,20 @@
 //! The probe runs the real resolve -> download -> optimize path but deliberately
 //! skips Discord upload. It returns structured timing and artifact data so CLI
 //! tools and agents can validate behavior without scraping logs.
+//!
+//! Probe runs deliberately avoid persistent metrics and dedup writes: without a
+//! Discord upload, success/failure counters would not match normal pipeline
+//! completion semantics.
 
 use crate::Engine;
 use crate::config::HardwareAcceleration;
 use crate::media::TweetLink;
-use crate::pipeline::errors::DownloadError;
 use crate::pipeline::types::{
     AudioCodec, DownloadedFile, Job, MediaContainer, MediaFacts, MediaType, PreparedUpload,
     Progress, RequestId, ResolvedMedia, VideoCodec,
 };
 use crate::pipeline::{download, optimize};
-use crate::storage::{ErrorCategory, Stage};
+use crate::storage::Stage;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -188,15 +191,8 @@ async fn resolve(
     let resolved = engine
         .resolver
         .resolve(&job.tweet_url, &engine.http, &engine.permits)
-        .await
-        .inspect_err(|_e| {
-            engine.metrics.record_error(ErrorCategory::ResolveFailed);
-            engine.metrics.record_failure();
-        })?;
+        .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
-    engine
-        .metrics
-        .record_stage_duration(Stage::Resolve, duration_ms);
     warn_if_slow(Stage::Resolve, duration_ms, RESOLVE_WARN_MS);
     Ok((resolved, duration_ms))
 }
@@ -218,20 +214,8 @@ async fn download(
         &engine.config,
         &engine.pinned_media_clients,
     )
-    .await
-    .inspect_err(|_e| {
-        match _e {
-            super::Error::DownloadFailed {
-                source: DownloadError::SsrfBlocked(_),
-            } => engine.metrics.record_error(ErrorCategory::SsrfBlocked),
-            _ => engine.metrics.record_error(ErrorCategory::DownloadFailed),
-        }
-        engine.metrics.record_failure();
-    })?;
+    .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
-    engine
-        .metrics
-        .record_stage_duration(Stage::Download, duration_ms);
     warn_if_slow(Stage::Download, duration_ms, DOWNLOAD_WARN_MS);
     Ok((downloaded, duration_ms))
 }
@@ -253,15 +237,8 @@ async fn optimize(
         &engine.transcode_runtime,
         progress,
     )
-    .await
-    .inspect_err(|_e| {
-        engine.metrics.record_error(ErrorCategory::OptimizeFailed);
-        engine.metrics.record_failure();
-    })?;
+    .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
-    engine
-        .metrics
-        .record_stage_duration(Stage::Optimize, duration_ms);
     warn_if_slow(Stage::Optimize, duration_ms, OPTIMIZE_WARN_MS);
     Ok((prepared, duration_ms))
 }
