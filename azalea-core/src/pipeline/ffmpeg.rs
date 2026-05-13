@@ -11,14 +11,16 @@
 
 use crate::config::{HardwareAcceleration, TranscodeSettings};
 use crate::pipeline::errors::{Error, TranscodeStage};
-use crate::pipeline::process::{SubprocessGuard, kill_process_group, read_bounded};
+use crate::pipeline::process::SubprocessGuard;
+use crate::pipeline::process::kill_process_group;
 use crate::pipeline::types::{AudioCodec, MediaFacts, VideoCodec};
 use smallvec::SmallVec;
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{Instrument as _, debug, info, trace, warn};
 
@@ -118,6 +120,62 @@ fn push_stderr_tail(output: &mut String, stderr_tail: &[u8]) {
         }
         output.push_str(line.strip_suffix('\r').unwrap_or(line));
     }
+}
+
+#[derive(Debug)]
+struct StderrTail {
+    data: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_stderr_tail_bounded<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<StderrTail> {
+    if limit == 0 {
+        let mut sink = [0u8; 8192];
+        let mut truncated = false;
+        while reader.read(&mut sink).await? != 0 {
+            truncated = true;
+        }
+        return Ok(StderrTail {
+            data: Vec::new(),
+            truncated,
+        });
+    }
+
+    let mut tail = VecDeque::with_capacity(limit);
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk = buffer.get(..read).unwrap_or_default();
+        if chunk.len() >= limit {
+            tail.clear();
+            if let Some(suffix) = chunk.get(chunk.len().saturating_sub(limit)..) {
+                tail.extend(suffix.iter().copied());
+            }
+            truncated = true;
+            continue;
+        }
+
+        let overflow = tail.len().saturating_add(chunk.len()).saturating_sub(limit);
+        if overflow > 0 {
+            truncated = true;
+            tail.drain(..overflow);
+        }
+        tail.extend(chunk.iter().copied());
+    }
+
+    Ok(StderrTail {
+        data: tail.into_iter().collect(),
+        truncated,
+    })
 }
 
 fn push_hw_device_input_args(args: &mut Args, config: &TranscodeSettings, split: bool) {
@@ -477,7 +535,9 @@ pub async fn execute(
             .ok_or_else(|| Error::Io(std::io::Error::other("ffmpeg stderr missing")))?;
 
         let mut stderr_handle =
-            tokio::spawn(async move { read_bounded(stderr, FFMPEG_STDERR_LIMIT, None).await });
+            tokio::spawn(
+                async move { read_stderr_tail_bounded(stderr, FFMPEG_STDERR_LIMIT).await },
+            );
 
         let start_time = std::time::Instant::now();
         let mut last_heartbeat = start_time;
@@ -556,12 +616,12 @@ pub async fn execute(
                 format_stderr_tail(
                     &output.data,
                     FFMPEG_ERROR_STDERR_TAIL_LINES,
-                    output.exceeded,
+                    output.truncated,
                 ),
                 format_stderr_tail(
                     &output.data,
                     FFMPEG_SUCCESS_STDERR_TAIL_LINES,
-                    output.exceeded,
+                    output.truncated,
                 ),
             ),
             Ok(Ok(Err(e))) => {
@@ -614,6 +674,7 @@ pub async fn execute(
 mod tests {
     use super::*;
     use std::path::Path;
+    use tokio::io::AsyncWriteExt;
 
     fn to_strings(args: &[OsString]) -> Vec<String> {
         args.iter()
@@ -623,6 +684,26 @@ mod tests {
 
     fn flag_count(args: &[String], flag: &str) -> usize {
         args.iter().filter(|arg| arg.as_str() == flag).count()
+    }
+
+    #[tokio::test]
+    async fn stderr_tail_bounded_keeps_final_failure_after_truncation() -> std::io::Result<()> {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            let noise = vec![b'x'; 512];
+            let _ = writer.write_all(&noise).await;
+            let _ = writer
+                .write_all(b"\n[h264_nvenc @ 0x1] Cannot load libcuda.so.1\n")
+                .await;
+        });
+
+        let tail = read_stderr_tail_bounded(reader, 128).await?;
+        let formatted = format_stderr_tail(&tail.data, 10, tail.truncated);
+
+        assert!(tail.truncated);
+        assert!(formatted.contains("Cannot load libcuda.so.1"));
+        assert!(formatted.contains("[stderr truncated]"));
+        Ok(())
     }
 
     #[test]
