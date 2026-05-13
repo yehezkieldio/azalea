@@ -370,6 +370,10 @@ struct YtDlpFormat {
     url: Option<Box<str>>,
     ext: Option<Box<str>>,
     #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
     vcodec: Option<Box<str>>,
     #[serde(default)]
     acodec: Option<Box<str>>,
@@ -448,21 +452,18 @@ impl YtDlp {
             let ytdlp_output: YtDlpOutput = serde_json::from_slice(output.stdout.as_slice())
                 .map_err(|e| ResolveError::ParseFailed(e.to_string()))?;
 
-            let (url, extension, is_image) = select_best_format(&ytdlp_output)?;
-            let extension = sanitize_extension(&extension);
+            let selected = select_best_format(&ytdlp_output)?;
+            let extension = sanitize_extension(&selected.extension);
 
             Ok(Arc::new(ResolvedMedia {
-                url: Cow::Owned(url.into()),
-                media_type: if is_image {
+                url: Cow::Owned(selected.url.into()),
+                media_type: if selected.is_image {
                     MediaType::Image
                 } else {
                     MediaType::Video
                 },
                 duration: ytdlp_output.duration,
-                resolution: match (ytdlp_output.width, ytdlp_output.height) {
-                    (Some(w), Some(h)) => Some((w, h)),
-                    _ => None,
-                },
+                resolution: selected.resolution,
                 extension: extension.into_boxed_str(),
             }))
         }
@@ -490,12 +491,25 @@ impl YtDlp {
     }
 }
 
-fn select_best_format(output: &YtDlpOutput) -> Result<(Box<str>, Box<str>, bool), ResolveError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedFormat {
+    url: Box<str>,
+    extension: Box<str>,
+    is_image: bool,
+    resolution: Option<(u32, u32)>,
+}
+
+fn select_best_format(output: &YtDlpOutput) -> Result<SelectedFormat, ResolveError> {
     if let Some(url) = &output.url {
         // Some yt-dlp outputs provide a direct URL; prefer it when present.
-        let ext = output.ext.clone().unwrap_or_else(|| "mp4".into());
-        let is_image = is_image_extension(ext.as_ref());
-        return Ok((url.clone(), ext, is_image));
+        let extension = output.ext.clone().unwrap_or_else(|| "mp4".into());
+        let is_image = is_image_extension(extension.as_ref());
+        return Ok(SelectedFormat {
+            url: url.clone(),
+            extension,
+            is_image,
+            resolution: resolution_from_dimensions(output.width, output.height),
+        });
     }
 
     let mut ranked_formats = output
@@ -518,17 +532,35 @@ fn select_best_format(output: &YtDlpOutput) -> Result<(Box<str>, Box<str>, bool)
             .url
             .clone()
             .ok_or_else(|| ResolveError::ParseFailed("format missing url".to_string()))?;
-        let ext = best.format.ext.clone().unwrap_or_else(|| "mp4".into());
-        return Ok((url, ext, false));
+        let extension = best.format.ext.clone().unwrap_or_else(|| "mp4".into());
+        return Ok(SelectedFormat {
+            url,
+            extension,
+            is_image: false,
+            resolution: resolution_from_dimensions(best.format.width, best.format.height)
+                .or_else(|| resolution_from_dimensions(output.width, output.height)),
+        });
     }
 
     // Fall back to thumbnail for image-only tweets.
     if let Some(thumbnail_url) = &output.thumbnail {
-        let ext = extension_from_url(thumbnail_url).unwrap_or_else(|| "jpg".into());
-        return Ok((thumbnail_url.clone(), ext, true));
+        let extension = extension_from_url(thumbnail_url).unwrap_or_else(|| "jpg".into());
+        return Ok(SelectedFormat {
+            url: thumbnail_url.clone(),
+            extension,
+            is_image: true,
+            resolution: None,
+        });
     }
 
     Err(ResolveError::ParseFailed("no formats".to_string()))
+}
+
+fn resolution_from_dimensions(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
+    match (width, height) {
+        (Some(width), Some(height)) => Some((width, height)),
+        _ => None,
+    }
 }
 
 fn is_upload_compatible(format: &YtDlpFormat) -> bool {
@@ -687,6 +719,8 @@ mod tests {
         YtDlpFormat {
             url: Some(url.into()),
             ext: Some(ext.into()),
+            width: None,
+            height: None,
             vcodec: vcodec.map(Into::into),
             acodec: acodec.map(Into::into),
             tbr,
@@ -754,11 +788,11 @@ mod tests {
             thumbnail: Some("https://example.invalid/thumb.jpg".into()),
         };
 
-        let (url, ext, is_image) = select_best_format(&output)?;
+        let selected = select_best_format(&output)?;
 
-        assert_eq!(url.as_ref(), "https://example.invalid/h264.mp4");
-        assert_eq!(ext.as_ref(), "mp4");
-        assert!(!is_image);
+        assert_eq!(selected.url.as_ref(), "https://example.invalid/h264.mp4");
+        assert_eq!(selected.extension.as_ref(), "mp4");
+        assert!(!selected.is_image);
         Ok(())
     }
 
@@ -781,11 +815,11 @@ mod tests {
             thumbnail: Some("https://example.invalid/thumb.jpg".into()),
         };
 
-        let (url, ext, is_image) = select_best_format(&output)?;
+        let selected = select_best_format(&output)?;
 
-        assert_eq!(url.as_ref(), "https://example.invalid/vp9.webm");
-        assert_eq!(ext.as_ref(), "webm");
-        assert!(!is_image);
+        assert_eq!(selected.url.as_ref(), "https://example.invalid/vp9.webm");
+        assert_eq!(selected.extension.as_ref(), "webm");
+        assert!(!selected.is_image);
         Ok(())
     }
 
@@ -816,11 +850,43 @@ mod tests {
             thumbnail: Some("https://example.invalid/thumb.jpg".into()),
         };
 
-        let (url, ext, is_image) = select_best_format(&output)?;
+        let selected = select_best_format(&output)?;
 
-        assert_eq!(url.as_ref(), "https://example.invalid/second.webm");
-        assert_eq!(ext.as_ref(), "webm");
-        assert!(!is_image);
+        assert_eq!(selected.url.as_ref(), "https://example.invalid/second.webm");
+        assert_eq!(selected.extension.as_ref(), "webm");
+        assert!(!selected.is_image);
+        Ok(())
+    }
+
+    #[test]
+    fn select_best_format_preserves_selected_format_resolution() -> Result<(), ResolveError> {
+        let mut selected_format = format(
+            "https://example.invalid/selected.mp4",
+            "mp4",
+            Some("avc1.640028"),
+            Some("mp4a.40.2"),
+            Some(2.0),
+        );
+        selected_format.width = Some(1280);
+        selected_format.height = Some(720);
+
+        let output = YtDlpOutput {
+            url: None,
+            formats: vec![selected_format],
+            duration: None,
+            width: Some(640),
+            height: Some(360),
+            ext: None,
+            thumbnail: None,
+        };
+
+        let selected = select_best_format(&output)?;
+
+        assert_eq!(
+            selected.url.as_ref(),
+            "https://example.invalid/selected.mp4"
+        );
+        assert_eq!(selected.resolution, Some((1280, 720)));
         Ok(())
     }
 
@@ -837,11 +903,11 @@ mod tests {
             thumbnail: Some("https://example.invalid/thumb.jpg".into()),
         };
 
-        let (url, ext, is_image) = select_best_format(&output)?;
+        let selected = select_best_format(&output)?;
 
-        assert_eq!(url.as_ref(), "https://example.invalid/thumb.jpg");
-        assert_eq!(ext.as_ref(), "jpg");
-        assert!(is_image);
+        assert_eq!(selected.url.as_ref(), "https://example.invalid/thumb.jpg");
+        assert_eq!(selected.extension.as_ref(), "jpg");
+        assert!(selected.is_image);
         Ok(())
     }
 
@@ -857,11 +923,11 @@ mod tests {
             thumbnail: None,
         };
 
-        let (url, ext, is_image) = select_best_format(&output)?;
+        let selected = select_best_format(&output)?;
 
-        assert_eq!(url.as_ref(), "https://example.invalid/image.jpg");
-        assert_eq!(ext.as_ref(), "jpg");
-        assert!(is_image);
+        assert_eq!(selected.url.as_ref(), "https://example.invalid/image.jpg");
+        assert_eq!(selected.extension.as_ref(), "jpg");
+        assert!(selected.is_image);
         Ok(())
     }
 
