@@ -30,6 +30,9 @@ use azalea_core::media;
 use azalea_core::pipeline as core_pipeline;
 use azalea_core::storage::{ErrorCategory, Stage};
 use config::AppConfig;
+#[cfg(miri)]
+use mimalloc as _;
+#[cfg(not(miri))]
 use mimalloc::MiMalloc;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -53,6 +56,7 @@ use twilight_model::gateway::{
     presence::{ActivityType, MinimalActivity, Status},
 };
 
+#[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 

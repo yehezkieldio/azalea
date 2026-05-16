@@ -286,13 +286,13 @@ fn remove_path_sync(path: &Path) {
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_temp_dir(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("azalea-{name}-{nanos}"))
+        let id = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("azalea-{name}-{}-{id}", std::process::id()))
     }
 
     #[test]
