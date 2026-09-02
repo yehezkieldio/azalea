@@ -225,7 +225,17 @@ impl Engine {
 /// Enforces timeouts and idle pool sizing to avoid resource exhaustion under
 /// untrusted input loads.
 fn build_http_client(config: &EngineSettings) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+    Ok(base_client_builder(config).build()?)
+}
+
+/// Shared `reqwest::ClientBuilder` baseline for every outbound HTTP client.
+///
+/// ## Rationale
+/// Timeout, pool, and HTTP/2 window tuning must stay identical across the
+/// general-purpose client and per-target pinned clients; a single builder
+/// keeps that tuning from drifting between call sites.
+pub(crate) fn base_client_builder(config: &EngineSettings) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(config.http.timeout_secs))
         .pool_max_idle_per_host(config.http.pool_max_idle_per_host)
@@ -239,7 +249,7 @@ fn build_http_client(config: &EngineSettings) -> anyhow::Result<reqwest::Client>
         .brotli(true)
         .user_agent(USER_AGENT);
 
-    builder = if config.http.http2_adaptive_window {
+    if config.http.http2_adaptive_window {
         builder.http2_adaptive_window(true)
     } else {
         builder
@@ -247,11 +257,7 @@ fn build_http_client(config: &EngineSettings) -> anyhow::Result<reqwest::Client>
             .http2_initial_connection_window_size(
                 config.http.http2_initial_connection_window_size_bytes,
             )
-    };
-
-    let http = builder.build()?;
-
-    Ok(http)
+    }
 }
 
 #[cfg(test)]

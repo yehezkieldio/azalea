@@ -809,6 +809,20 @@ fn split_transcode_settings(
     split_settings
 }
 
+/// Host logical CPU count, queried once and cached for the process lifetime.
+///
+/// ## Rationale
+/// `available_parallelism()` reflects a fixed host property; querying it per
+/// split job is pure overhead once the first split has run.
+fn available_cpus() -> u32 {
+    static CPUS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CPUS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(1)
+    })
+}
+
 fn split_transcode_concurrency(
     settings: &TranscodeSettings,
     effective_transcode_concurrency: u32,
@@ -818,11 +832,8 @@ fn split_transcode_concurrency(
     }
 
     let ffmpeg_threads = settings.effective_ffmpeg_threads(effective_transcode_concurrency.max(1));
-    let cpus = std::thread::available_parallelism()
-        .map(|value| value.get() as u32)
-        .unwrap_or(1);
 
-    (cpus / ffmpeg_threads.max(1))
+    (available_cpus() / ffmpeg_threads.max(1))
         .max(1)
         .min(effective_transcode_concurrency.max(1))
 }

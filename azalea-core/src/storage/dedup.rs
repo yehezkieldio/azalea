@@ -375,12 +375,16 @@ impl Cache {
         }
 
         let db = Arc::clone(db);
-        let writes_for_db = writes_to_flush.clone();
+        // Share the batch via `Arc` instead of deep-cloning it: the blocking
+        // closure gets a cheap pointer clone, and this scope retains its own
+        // handle to requeue on failure (including a panicked blocking task).
+        let writes_to_flush: Arc<[PendingWrite]> = writes_to_flush.into();
+        let writes_for_db = Arc::clone(&writes_to_flush);
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let write_txn = db.begin_write()?;
             {
                 let mut table = write_txn.open_table(DEDUP_TABLE)?;
-                for write in &writes_for_db {
+                for write in writes_for_db.iter() {
                     let _ = table.insert(write.key.as_slice(), write.timestamp);
                 }
             }
@@ -538,7 +542,7 @@ impl Cache {
         }
     }
 
-    async fn handle_flush_failure(&self, writes: Vec<PendingWrite>) {
+    async fn handle_flush_failure(&self, writes: Arc<[PendingWrite]>) {
         let failures = self.flush_failures.fetch_add(1, Ordering::Relaxed) + 1;
         let backoff_secs = self.compute_backoff_secs(failures);
         let backoff_until = now_secs().saturating_add(backoff_secs);
@@ -552,9 +556,7 @@ impl Cache {
         }
 
         let mut pending = self.pending_writes.write().await;
-        for write in writes {
-            pending.push_back(write);
-        }
+        pending.extend(writes.iter().cloned());
         self.enforce_pending_cap(&mut pending);
     }
 

@@ -11,7 +11,7 @@
 //! 3. Probe metadata via ffprobe if missing.
 
 use crate::concurrency::Permits;
-use crate::config::{EngineSettings, USER_AGENT};
+use crate::config::EngineSettings;
 use crate::media::TempFileCleanup;
 use crate::pipeline::disk::{ensure_disk_space, reserve_download_bytes};
 use crate::pipeline::errors::{DownloadError, Error};
@@ -503,34 +503,12 @@ fn pinned_media_client(
     config: &EngineSettings,
     target: &ValidatedMediaUrl,
 ) -> Result<reqwest::Client, Error> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(config.http.timeout_secs))
-        .pool_max_idle_per_host(config.http.pool_max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(config.http.pool_idle_timeout_secs))
-        .connect_timeout(Duration::from_secs(config.http.connect_timeout_secs))
-        .tcp_keepalive(Duration::from_secs(30))
-        .tcp_nodelay(true)
-        .http2_max_frame_size(config.http.http2_max_frame_size_bytes)
-        .deflate(true)
-        .gzip(true)
-        .brotli(true)
-        .user_agent(USER_AGENT)
-        .resolve_to_addrs(&target.host, &target.addrs);
-
-    builder = if config.http.http2_adaptive_window {
-        builder.http2_adaptive_window(true)
-    } else {
-        builder
-            .http2_initial_stream_window_size(config.http.http2_initial_stream_window_size_bytes)
-            .http2_initial_connection_window_size(
-                config.http.http2_initial_connection_window_size_bytes,
-            )
-    };
-
-    builder.build().map_err(|e| Error::DownloadFailed {
-        source: DownloadError::WriteFailed(std::io::Error::other(e)),
-    })
+    crate::engine::base_client_builder(config)
+        .resolve_to_addrs(&target.host, &target.addrs)
+        .build()
+        .map_err(|e| Error::DownloadFailed {
+            source: DownloadError::WriteFailed(std::io::Error::other(e)),
+        })
 }
 
 async fn fetch_with_redirects(
