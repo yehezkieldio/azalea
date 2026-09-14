@@ -67,6 +67,11 @@ pub struct ResolvedMedia {
     pub duration: Option<f64>,
     pub resolution: Option<(u32, u32)>,
     pub extension: Box<str>,
+    /// True for media from tweets caught in Twitter's Nov-Dec 2023 muxer bug
+    /// (see [`crate::pipeline::resolve::twitter_container_bug_window`]).
+    /// Affected media must not be passed through byte-for-byte without at
+    /// least a container remux, even when its codecs are otherwise upload-ready.
+    pub needs_container_fix: bool,
 }
 
 /// Container identity used to preflight stream-copy strategies.

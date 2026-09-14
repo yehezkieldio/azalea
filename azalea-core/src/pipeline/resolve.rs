@@ -14,6 +14,19 @@
 //! A negative cache reduces repeated slow failures but may hide transient
 //! outages; see [`should_negative_cache`] for rules.
 //!
+//! ## Rejected alternatives
+//! A resolver hitting Twitter's own GraphQL `TweetDetail` endpoint directly
+//! (guest-token auth, no third-party proxy) was tried and removed: `x.com`
+//! TLS-fingerprints clients and blocks non-browser TLS stacks at the edge
+//! (empty-body 404s, confirmed against this exact endpoint and independently
+//! corroborated by imputnet/cobalt's maintainer:
+//! <https://github.com/imputnet/cobalt/issues/573#issuecomment-2170380085>).
+//! `rustls` doesn't expose the cipher/extension-ordering and GREASE controls
+//! needed to mimic a real browser's ClientHello, so properly fixing this
+//! would mean vendoring an impersonation-capable TLS stack (e.g. BoringSSL)
+//! and then chasing Twitter's fingerprinting indefinitely — out of scope
+//! here. VxTwitter/yt-dlp remain the only resolvers.
+//!
 //! ## References
 //! - yt-dlp: <https://github.com/yt-dlp/yt-dlp>
 //! - VxTwitter: <https://github.com/dylanpdx/BetterTwitFix>
@@ -215,6 +228,44 @@ impl ResolverChain {
     }
 }
 
+/// Twitter's publicly documented Snowflake epoch (milliseconds since the
+/// Unix epoch); the same constant used by every Snowflake-ID decoder.
+const TWITTER_SNOWFLAKE_EPOCH_MS: u64 = 1_288_834_974_657;
+
+/// Media timestamp range affected by a Twitter muxer bug that produced
+/// broken video containers. The existence and duration of this bug is
+/// third-party-reported, not independently verified here; see
+/// `twitter_container_bug_window`'s docs for the source.
+const CONTAINER_BUG_WINDOW_START_MS: u64 = 1_701_446_400_000;
+const CONTAINER_BUG_WINDOW_END_MS: u64 = 1_702_605_600_000;
+
+/// Whether a tweet/media Snowflake ID falls in Twitter's Nov-Dec 2023
+/// broken-container window.
+///
+/// ## Algorithm overview
+/// Snowflake IDs embed a millisecond timestamp in their high 42 bits
+/// (`(id >> 22) + epoch`) — a public, widely-implemented technique (Twitter,
+/// Discord, Instagram, and others all use variants of it), not specific to
+/// any one project; decoding it needs no network round-trip.
+///
+/// ## Rationale
+/// It took Twitter over two weeks to fix a muxer bug that shipped broken
+/// containers for videos uploaded (or reposted media re-IDed) in this
+/// window. A byte-for-byte pass-through of affected media preserves the
+/// bug; forcing at least one remux fixes it (see `optimize`'s pass-through
+/// gate).
+///
+/// ## Attribution
+/// The window boundaries are reported by imputnet/cobalt (AGPL-3.0-only),
+/// which discovered and documented this bug; see the repo root `LEGAL.md`'s
+/// "Third-Party Code Attribution" section.
+/// This function is an independent reimplementation of a documented,
+/// publicly-known Snowflake-decoding technique, not copied code.
+pub(crate) fn twitter_container_bug_window(id: u64) -> bool {
+    let timestamp_ms = (id >> 22).saturating_add(TWITTER_SNOWFLAKE_EPOCH_MS);
+    (CONTAINER_BUG_WINDOW_START_MS..CONTAINER_BUG_WINDOW_END_MS).contains(&timestamp_ms)
+}
+
 #[derive(Debug, Clone)]
 struct VxTwitter {
     timeout: Duration,
@@ -302,6 +353,7 @@ impl VxTwitter {
                         _ => None,
                     },
                     extension: extension.into_boxed_str(),
+                    needs_container_fix: twitter_container_bug_window(tweet_url.tweet_id.0),
                 }))
             })
             .await;
@@ -465,6 +517,7 @@ impl YtDlp {
                 duration: ytdlp_output.duration,
                 resolution: selected.resolution,
                 extension: extension.into_boxed_str(),
+                needs_container_fix: twitter_container_bug_window(tweet_url.tweet_id.0),
             }))
         }
         .instrument(resolve_span)
@@ -701,9 +754,11 @@ fn should_negative_cache(error: &ResolveError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::{
-        YtDlp, YtDlpFormat, YtDlpOutput, extension_from_vxtwitter_metadata, select_best_format,
-        should_negative_cache,
+        TWITTER_SNOWFLAKE_EPOCH_MS, YtDlp, YtDlpFormat, YtDlpOutput,
+        extension_from_vxtwitter_metadata, select_best_format, should_negative_cache,
+        twitter_container_bug_window,
     };
     use crate::media::TweetLink;
     use crate::pipeline::errors::ResolveError;
@@ -1008,5 +1063,33 @@ mod tests {
         let error = ResolveError::ParseFailed("EOF while parsing a value".to_string());
 
         assert!(!should_negative_cache(&error));
+    }
+
+    /// Snowflake ID whose embedded timestamp is exactly `ms` milliseconds
+    /// since the Unix epoch.
+    fn snowflake_id_at(ms: u64) -> u64 {
+        (ms - TWITTER_SNOWFLAKE_EPOCH_MS) << 22
+    }
+
+    #[test]
+    fn container_bug_window_is_inclusive_start_exclusive_end() {
+        assert!(twitter_container_bug_window(snowflake_id_at(
+            1_701_446_400_000
+        )));
+        assert!(twitter_container_bug_window(snowflake_id_at(
+            1_702_605_599_999
+        )));
+        assert!(!twitter_container_bug_window(snowflake_id_at(
+            1_701_446_399_999
+        )));
+        assert!(!twitter_container_bug_window(snowflake_id_at(
+            1_702_605_600_000
+        )));
+    }
+
+    #[test]
+    fn container_bug_window_excludes_ids_outside_the_range() {
+        // A real, pre-bug-window tweet ID (early 2023).
+        assert!(!twitter_container_bug_window(1_600_000_000_000_000_000));
     }
 }

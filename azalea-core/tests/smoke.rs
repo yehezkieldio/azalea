@@ -89,6 +89,7 @@ async fn pass_through_local_fixture_smoke_flow() {
         duration: Some(1.0),
         resolution: Some((640, 360)),
         extension: "mp4".into(),
+        needs_container_fix: false,
     };
     let permits = Permits::new(&settings.concurrency);
     let runtime = TranscodeRuntime::new(settings.transcode.hardware_acceleration);
