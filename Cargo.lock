@@ -130,6 +130,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "azalea-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "azalea-core",
+ "tokio",
+ "tracing-subscriber",
+ "which",
+]
+
+[[package]]
 name = "azalea-core"
 version = "0.5.0"
 dependencies = [

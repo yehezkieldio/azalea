@@ -1,5 +1,5 @@
 [workspace]
-members = ["azalea", "azalea-core"]
+members = ["azalea", "azalea-core", "azalea-cli"]
 resolver = "3"
 
 [workspace.package]

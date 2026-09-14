@@ -1,0 +1,28 @@
+[package]
+name = "azalea-cli"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+azalea-core = { path = "../azalea-core" }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+    "process",
+    "sync",
+    "time",
+] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "ansi",
+    "env-filter",
+] }
+which = "8.0.0"
