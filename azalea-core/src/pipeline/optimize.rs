@@ -34,27 +34,6 @@ use tracing::Instrument as _;
 
 const PARALLEL_SEGMENT_HEARTBEAT_SECS: u64 = 30;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TranscodeOutcome {
-    encoder_used: &'static str,
-    backend_used: HardwareAcceleration,
-    used_hardware: bool,
-    fallback_occurred: bool,
-    duration_ms: u64,
-}
-
-impl TranscodeOutcome {
-    fn new(backend_used: HardwareAcceleration, fallback_occurred: bool, duration_ms: u64) -> Self {
-        Self {
-            encoder_used: backend_used.encoder(),
-            backend_used,
-            used_hardware: backend_used.is_hardware(),
-            fallback_occurred,
-            duration_ms,
-        }
-    }
-}
-
 struct TranscodeContext<'a> {
     permits: &'a Permits,
     config: &'a EngineSettings,
@@ -113,7 +92,10 @@ pub async fn optimize(
     );
     let max_upload_bytes = config.transcode.max_upload_bytes;
     tracing::trace!(max_upload_bytes, "Transcode limits");
-    if downloaded.size <= max_upload_bytes {
+    // `needs_container_fix` media must be re-muxed at least once: a byte-for-byte
+    // pass-through would preserve Twitter's broken container (see
+    // `resolve::twitter_container_bug_window`).
+    if downloaded.size <= max_upload_bytes && !resolved.needs_container_fix {
         // Fast path: already within upload limits, so keep original bits.
         tracing::trace!(
             size_bytes = downloaded.size,
@@ -701,7 +683,7 @@ async fn transcode(
     let effective_transcode_concurrency = ctx
         .runtime
         .effective_transcode_concurrency(ctx.config.concurrency.transcode);
-    execute_with_hwacc_fallback(
+    ffmpeg::execute_with_hwacc_fallback(
         &ctx.config.binaries.ffmpeg,
         Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
         TranscodeStage::Transcode,
@@ -924,7 +906,7 @@ async fn split_serial(
         let output_path = downloaded
             .path
             .with_file_name(format!("{prefix}{idx:03}.mp4"));
-        let result = execute_with_hwacc_fallback(
+        let result = ffmpeg::execute_with_hwacc_fallback(
             &ctx.config.binaries.ffmpeg,
             Duration::from_secs(ctx.config.transcode.ffmpeg_timeout_secs),
             TranscodeStage::Split,
@@ -1174,7 +1156,7 @@ fn spawn_parallel_segment_task(
                 .acquire_owned()
                 .await
                 .map_err(|_| Error::Io(std::io::Error::other("transcode semaphore closed")))?;
-            let result = execute_with_hwacc_fallback(
+            let result = ffmpeg::execute_with_hwacc_fallback(
                 &parallel_transcode.ffmpeg_path,
                 timeout,
                 TranscodeStage::Split,
@@ -1220,124 +1202,6 @@ fn spawn_parallel_segment_task(
         }
         .instrument(parent_span),
     );
-}
-
-async fn execute_with_hwacc_fallback<F>(
-    ffmpeg_path: &Path,
-    timeout: Duration,
-    stage: TranscodeStage,
-    base_settings: &TranscodeSettings,
-    transcode_runtime: &TranscodeRuntime,
-    build_args: F,
-) -> Result<TranscodeOutcome, Error>
-where
-    F: Fn(&TranscodeSettings) -> ffmpeg::Args,
-{
-    let started_at = Instant::now();
-    let active_settings = encode_settings_for_attempt(base_settings, transcode_runtime);
-    let args = build_args(&active_settings);
-
-    match ffmpeg::execute(ffmpeg_path, &args, timeout, stage).await {
-        Ok(()) => {
-            let outcome = TranscodeOutcome::new(
-                active_settings.hardware_acceleration,
-                false,
-                elapsed_ms(started_at),
-            );
-            record_transcode_outcome(transcode_runtime, stage, outcome);
-            Ok(outcome)
-        }
-        Err(error) if should_retry_with_software(&error, active_settings.hardware_acceleration) => {
-            let latched = transcode_runtime.activate_software_fallback();
-            let retry_settings = encode_settings_for_attempt(base_settings, transcode_runtime);
-            let Some(retry_timeout) = remaining_timeout_budget(started_at, timeout) else {
-                tracing::warn!(
-                    ?stage,
-                    elapsed_ms = elapsed_ms(started_at),
-                    timeout_ms = timeout.as_millis() as u64,
-                    "Hardware fallback skipped because the ffmpeg time budget was exhausted"
-                );
-                return Err(error);
-            };
-
-            tracing::warn!(
-                ?stage,
-                error = %error,
-                configured_backend = %transcode_runtime.configured_backend(),
-                failed_backend = %active_settings.hardware_acceleration,
-                fallback_encoder = retry_settings.hardware_acceleration.encoder(),
-                latched,
-                retry_timeout_ms = retry_timeout.as_millis() as u64,
-                "Hardware encoder failed; retrying with software encoder"
-            );
-
-            let retry_args = build_args(&retry_settings);
-            ffmpeg::execute(ffmpeg_path, &retry_args, retry_timeout, stage)
-                .await
-                .map(|()| {
-                    let outcome = TranscodeOutcome::new(
-                        retry_settings.hardware_acceleration,
-                        true,
-                        elapsed_ms(started_at),
-                    );
-                    record_transcode_outcome(transcode_runtime, stage, outcome);
-                    outcome
-                })
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn encode_settings_for_attempt(
-    base_settings: &TranscodeSettings,
-    transcode_runtime: &TranscodeRuntime,
-) -> TranscodeSettings {
-    if !base_settings.hardware_acceleration.is_hardware() {
-        return base_settings.clone();
-    }
-
-    transcode_runtime.effective_settings(base_settings)
-}
-
-fn elapsed_ms(started_at: Instant) -> u64 {
-    started_at.elapsed().as_millis() as u64
-}
-
-fn remaining_timeout_budget(started_at: Instant, timeout: Duration) -> Option<Duration> {
-    timeout.checked_sub(started_at.elapsed())
-}
-
-fn record_transcode_outcome(
-    transcode_runtime: &TranscodeRuntime,
-    stage: TranscodeStage,
-    outcome: TranscodeOutcome,
-) {
-    if outcome.used_hardware {
-        transcode_runtime.record_hw_encode(outcome.duration_ms);
-    } else {
-        transcode_runtime.record_sw_encode(outcome.duration_ms);
-    }
-
-    tracing::info!(
-        ?stage,
-        encoder = outcome.encoder_used,
-        backend = %outcome.backend_used,
-        used_hardware = outcome.used_hardware,
-        fallback_occurred = outcome.fallback_occurred,
-        duration_ms = outcome.duration_ms,
-        "Hardware acceleration diagnostics"
-    );
-}
-
-fn should_retry_with_software(error: &Error, backend: HardwareAcceleration) -> bool {
-    if !backend.is_hardware() {
-        return false;
-    }
-
-    match error {
-        Error::TranscodeFailed { stderr_tail, .. } => backend.matches_failure_output(stderr_tail),
-        _ => false,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1427,17 +1291,16 @@ mod tests {
 
     use super::{
         BitrateParams, SplitTranscodeJob, SplitTranscodeProgress, TranscodeContext,
-        TranscodeStrategy, build_strategy_plan, execute_with_hwacc_fallback, optimize,
-        predict_scale_limit, remaining_timeout_budget, send_progress_best_effort, split_parallel,
-        split_parallel_is_plausible, split_serial, split_transcode_concurrency,
-        split_transcode_settings,
+        TranscodeStrategy, build_strategy_plan, optimize, predict_scale_limit,
+        send_progress_best_effort, split_parallel, split_parallel_is_plausible, split_serial,
+        split_transcode_concurrency, split_transcode_settings,
     };
     use crate::concurrency::Permits;
     use crate::config::{EngineSettings, HardwareAcceleration, QualityPreset, TranscodeSettings};
     use crate::engine::TranscodeRuntime;
     use crate::media::TempFileCleanup;
     use crate::pipeline::errors::Error;
-    use crate::pipeline::ffmpeg::ScaleLimit;
+    use crate::pipeline::ffmpeg::{self, ScaleLimit};
     use crate::pipeline::types::{
         AudioCodec, DownloadedFile, MediaContainer, MediaFacts, MediaType, PreparedUpload,
         Progress, ResolvedMedia, VideoCodec,
@@ -1447,7 +1310,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
 
     fn downloaded_file(path: &str, size: u64, duration: f64, facts: MediaFacts) -> DownloadedFile {
@@ -1565,6 +1428,7 @@ mod tests {
             duration: Some(5.0),
             resolution: Some((1920, 1080)),
             extension: "mp4".into(),
+            needs_container_fix: false,
         };
         let config = EngineSettings::default();
         let permits = Permits::new(&config.concurrency);
@@ -2161,7 +2025,7 @@ mod tests {
             ..TranscodeSettings::default()
         };
 
-        let outcome = execute_with_hwacc_fallback(
+        let outcome = ffmpeg::execute_with_hwacc_fallback(
             &script_path,
             Duration::from_secs(1),
             TranscodeStage::Transcode,
@@ -2215,7 +2079,7 @@ mod tests {
             ..TranscodeSettings::default()
         };
 
-        let outcome = execute_with_hwacc_fallback(
+        let outcome = ffmpeg::execute_with_hwacc_fallback(
             &script_path,
             Duration::from_secs(1),
             TranscodeStage::Split,
@@ -2243,14 +2107,5 @@ mod tests {
 
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_file(log_path);
-    }
-
-    #[test]
-    fn remaining_timeout_budget_returns_none_after_budget_is_exhausted() {
-        let started_at = Instant::now() - Duration::from_secs(2);
-
-        let remaining = remaining_timeout_budget(started_at, Duration::from_secs(1));
-
-        assert_eq!(remaining, None);
     }
 }

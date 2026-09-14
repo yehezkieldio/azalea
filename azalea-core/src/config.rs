@@ -66,6 +66,21 @@ impl QualityPreset {
     }
 }
 
+/// Target video codec for an encode.
+///
+/// ## Rationale
+/// Decoupled from [`HardwareAcceleration`] so callers can independently pick
+/// "what codec" and "what backend encodes it" (see [`HardwareAcceleration::encoder_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum TargetVideoCodec {
+    #[default]
+    H264,
+    Hevc,
+    Av1,
+}
+
 /// Hardware acceleration provider.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -119,15 +134,41 @@ impl HardwareAcceleration {
         }
     }
 
-    /// Encoder name passed to ffmpeg for the selected acceleration backend.
+    /// Encoder name passed to ffmpeg for the selected acceleration backend, targeting H.264.
+    ///
+    /// Convenience wrapper for the only codec the pipeline encoded before
+    /// [`TargetVideoCodec`] existed; kept so existing call sites are unaffected.
     pub fn encoder(self) -> &'static str {
-        match self {
-            Self::None => "libx264",
-            Self::Nvenc => "h264_nvenc",
-            Self::Vaapi => "h264_vaapi",
-            Self::VideoToolbox => "h264_videotoolbox",
-            Self::Qsv => "h264_qsv",
-            Self::Amf => "h264_amf",
+        self.encoder_for(TargetVideoCodec::H264)
+    }
+
+    /// Encoder name passed to ffmpeg for the selected acceleration backend and target codec.
+    ///
+    /// ## Non-obvious behavior
+    /// `VideoToolbox` has no AV1 encoder on the hardware this project targets;
+    /// it returns the software `libsvtav1` encoder so callers still get a
+    /// working (if unaccelerated) encode rather than an invalid ffmpeg arg.
+    pub fn encoder_for(self, codec: TargetVideoCodec) -> &'static str {
+        match (self, codec) {
+            (Self::None, TargetVideoCodec::H264) => "libx264",
+            (Self::Nvenc, TargetVideoCodec::H264) => "h264_nvenc",
+            (Self::Vaapi, TargetVideoCodec::H264) => "h264_vaapi",
+            (Self::VideoToolbox, TargetVideoCodec::H264) => "h264_videotoolbox",
+            (Self::Qsv, TargetVideoCodec::H264) => "h264_qsv",
+            (Self::Amf, TargetVideoCodec::H264) => "h264_amf",
+
+            (Self::None, TargetVideoCodec::Hevc) => "libx265",
+            (Self::Nvenc, TargetVideoCodec::Hevc) => "hevc_nvenc",
+            (Self::Vaapi, TargetVideoCodec::Hevc) => "hevc_vaapi",
+            (Self::VideoToolbox, TargetVideoCodec::Hevc) => "hevc_videotoolbox",
+            (Self::Qsv, TargetVideoCodec::Hevc) => "hevc_qsv",
+            (Self::Amf, TargetVideoCodec::Hevc) => "hevc_amf",
+
+            (Self::None | Self::VideoToolbox, TargetVideoCodec::Av1) => "libsvtav1",
+            (Self::Nvenc, TargetVideoCodec::Av1) => "av1_nvenc",
+            (Self::Vaapi, TargetVideoCodec::Av1) => "av1_vaapi",
+            (Self::Qsv, TargetVideoCodec::Av1) => "av1_qsv",
+            (Self::Amf, TargetVideoCodec::Av1) => "av1_amf",
         }
     }
 
@@ -256,6 +297,7 @@ impl Default for StorageSettings {
 pub struct TranscodeSettings {
     pub quality_preset: QualityPreset,
     pub hardware_acceleration: HardwareAcceleration,
+    pub target_codec: TargetVideoCodec,
     pub ffmpeg_threads: u32,
     pub vaapi_device: Box<str>,
     pub max_upload_bytes: u64,
@@ -275,6 +317,7 @@ impl Default for TranscodeSettings {
         Self {
             quality_preset: QualityPreset::Fast,
             hardware_acceleration: HardwareAcceleration::None,
+            target_codec: TargetVideoCodec::H264,
             ffmpeg_threads: 0,
             vaapi_device: default_vaapi_device(),
             max_upload_bytes: 8 * 1024 * 1024,

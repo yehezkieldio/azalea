@@ -9,7 +9,8 @@
 //! This module executes an external process; all inputs are pre-sanitized
 //! and paths are derived from temp directories (see [`pipeline::download`]).
 
-use crate::config::{HardwareAcceleration, TranscodeSettings};
+use crate::config::{HardwareAcceleration, QualityPreset, TargetVideoCodec, TranscodeSettings};
+use crate::engine::TranscodeRuntime;
 use crate::pipeline::errors::{Error, TranscodeStage};
 use crate::pipeline::process::SubprocessGuard;
 use crate::pipeline::process::kill_process_group;
@@ -360,6 +361,156 @@ fn push_video_encoding_args(
     }
 }
 
+/// SVT-AV1's `-preset` is a numeric 0 (slowest/best) to 13 (fastest) scale,
+/// unlike x264/x265's named presets, and its `-crf` range is 0-63 (not 0-51).
+///
+/// ## Trade-off acknowledgment
+/// Biased toward the fast/low-memory end: the reference hardware for this
+/// path (see project notes) has no hardware AV1 encoder, so software AV1
+/// already costs the most CPU/RAM of any path here — `Quality` still asks
+/// for more, but none of these presets reach SVT-AV1's slow, memory-heavy
+/// low single digits.
+fn svt_av1_params(preset: QualityPreset) -> (u8, u8) {
+    match preset {
+        QualityPreset::Fast => (10, 40),
+        QualityPreset::Balanced => (8, 32),
+        QualityPreset::Quality => (6, 26),
+        QualityPreset::Size => (9, 40),
+    }
+}
+
+fn push_local_quality_args(
+    args: &mut Args,
+    hw: HardwareAcceleration,
+    codec: TargetVideoCodec,
+    quality: QualityPreset,
+    crf_override: Option<u8>,
+    threads: u32,
+) {
+    match (hw, codec) {
+        (HardwareAcceleration::None, TargetVideoCodec::Av1) => {
+            let (svt_preset, default_crf) = svt_av1_params(quality);
+            args.push("-preset".into());
+            args.push(svt_preset.to_string().into());
+            args.push("-crf".into());
+            args.push(crf_override.unwrap_or(default_crf).to_string().into());
+            if threads > 0 {
+                args.push("-svtav1-params".into());
+                args.push(format!("lp={threads}").into());
+            }
+        }
+        (HardwareAcceleration::None, TargetVideoCodec::H264 | TargetVideoCodec::Hevc) => {
+            args.push("-preset".into());
+            args.push(quality.ffmpeg_preset().into());
+            args.push("-crf".into());
+            args.push(crf_override.unwrap_or(quality.crf()).to_string().into());
+            if threads > 0 {
+                args.push("-threads".into());
+                args.push(threads.to_string().into());
+            }
+        }
+        // NVENC/QSV: constant-quality VBR via `-cq`; `-b:v 0` disables the
+        // bitrate cap so `-cq` alone governs output size.
+        (HardwareAcceleration::Nvenc | HardwareAcceleration::Qsv, _) => {
+            args.push("-rc".into());
+            args.push("vbr".into());
+            args.push("-cq".into());
+            args.push(crf_override.unwrap_or(quality.crf()).to_string().into());
+            args.push("-b:v".into());
+            args.push("0".into());
+        }
+        // VAAPI: `-qp` alone leaves `-rc_mode` at `auto`, which does not
+        // reliably select constant-QP — confirmed on Intel QSV/VAAPI
+        // hardware to fall back to a high-bitrate mode instead (the same
+        // class of bug found on AMF below). `-rc_mode CQP` makes it explicit.
+        (HardwareAcceleration::Vaapi, _) => {
+            args.push("-rc_mode".into());
+            args.push("CQP".into());
+            args.push("-qp".into());
+            args.push(crf_override.unwrap_or(quality.crf()).to_string().into());
+        }
+        // AMF: a bare `-qp` is not a valid AMF option at all — ffmpeg
+        // silently ignores it and AMF defaults to a high-bitrate VBR mode.
+        // Confirmed on real AMD hardware: this produced a ~20 Mbps 1080p
+        // HEVC file (vs. ~2 Mbps for the H.264 source) before this fix.
+        // AMF needs `-rc cqp` plus explicit per-frame-type QPs.
+        (HardwareAcceleration::Amf, _) => {
+            let qp = crf_override.unwrap_or(quality.crf()).to_string();
+            args.push("-rc".into());
+            args.push("cqp".into());
+            args.push("-qp_i".into());
+            args.push(qp.clone().into());
+            args.push("-qp_p".into());
+            args.push(qp.into());
+        }
+        (HardwareAcceleration::VideoToolbox, _) => {
+            args.push("-q:v".into());
+            args.push(crf_override.unwrap_or(quality.crf()).to_string().into());
+        }
+    }
+}
+
+/// Build args for a single-pass, constant-quality (CRF/CQ) local encode.
+///
+/// ## Rationale
+/// Unlike [`transcode_args`], this targets a *quality*, not a byte budget —
+/// there is no Discord upload cap to hit, so no bitrate ladder or split
+/// planning applies. Used by a local-download path, not the bot pipeline.
+///
+/// ## Preconditions
+/// `config.hardware_acceleration`/`config.target_codec` select the encoder
+/// via [`HardwareAcceleration::encoder_for`]; the caller is responsible for
+/// retrying with [`execute_with_hwacc_fallback`] if the hardware encoder
+/// fails at runtime.
+pub fn crf_encode_args(
+    input: &Path,
+    output: &Path,
+    scale_limit: Option<ScaleLimit>,
+    config: &TranscodeSettings,
+    crf_override: Option<u8>,
+    threads: u32,
+) -> Args {
+    let mut args = Args::new();
+    args.push("-y".into());
+
+    push_hw_device_input_args(&mut args, config, false);
+
+    args.push("-i".into());
+    args.push(input.as_os_str().into());
+
+    if let Some(filter) = video_filter(scale_limit, config.hardware_acceleration) {
+        args.push("-vf".into());
+        args.push(filter.into());
+    }
+
+    args.push("-c:v".into());
+    args.push(
+        config
+            .hardware_acceleration
+            .encoder_for(config.target_codec)
+            .into(),
+    );
+
+    push_local_quality_args(
+        &mut args,
+        config.hardware_acceleration,
+        config.target_codec,
+        config.quality_preset,
+        crf_override,
+        threads,
+    );
+
+    args.push("-c:a".into());
+    args.push("aac".into());
+    args.push("-b:a".into());
+    args.push("192k".into());
+    args.push("-ac".into());
+    args.push("2".into());
+    args.push(output.as_os_str().into());
+
+    args
+}
+
 /// Build args for a stream-copy remux.
 pub fn remux_args(input: &Path, output: &Path, threads: u32) -> Args {
     let mut args = Args::new();
@@ -389,7 +540,7 @@ pub fn transcode_args(
 ) -> Args {
     debug!(
         hardware_acceleration = ?config.hardware_acceleration,
-        encoder = config.hardware_acceleration.encoder(),
+        encoder = config.hardware_acceleration.encoder_for(config.target_codec),
         ?scale_limit,
         "Building ffmpeg transcode args"
     );
@@ -407,7 +558,12 @@ pub fn transcode_args(
     }
 
     args.push("-c:v".into());
-    args.push(config.hardware_acceleration.encoder().into());
+    args.push(
+        config
+            .hardware_acceleration
+            .encoder_for(config.target_codec)
+            .into(),
+    );
 
     push_video_encoding_args(&mut args, config, video_kbps, transcode_concurrency);
 
@@ -437,7 +593,7 @@ pub fn transcode_segment_args(
 ) -> Args {
     debug!(
         hardware_acceleration = ?config.hardware_acceleration,
-        encoder = config.hardware_acceleration.encoder(),
+        encoder = config.hardware_acceleration.encoder_for(config.target_codec),
         start_secs,
         duration_secs,
         "Building ffmpeg segment transcode args"
@@ -460,7 +616,12 @@ pub fn transcode_segment_args(
     }
 
     args.push("-c:v".into());
-    args.push(config.hardware_acceleration.encoder().into());
+    args.push(
+        config
+            .hardware_acceleration
+            .encoder_for(config.target_codec)
+            .into(),
+    );
 
     push_video_encoding_args(&mut args, config, video_kbps, transcode_concurrency);
 
@@ -670,11 +831,204 @@ pub async fn execute(
     .await
 }
 
+/// Outcome of an [`execute_with_hwacc_fallback`] attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscodeOutcome {
+    pub encoder_used: &'static str,
+    pub backend_used: HardwareAcceleration,
+    pub used_hardware: bool,
+    pub fallback_occurred: bool,
+    pub duration_ms: u64,
+}
+
+impl TranscodeOutcome {
+    fn new(
+        backend_used: HardwareAcceleration,
+        codec: TargetVideoCodec,
+        fallback_occurred: bool,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            encoder_used: backend_used.encoder_for(codec),
+            backend_used,
+            used_hardware: backend_used.is_hardware(),
+            fallback_occurred,
+            duration_ms,
+        }
+    }
+}
+
+fn elapsed_ms(started_at: std::time::Instant) -> u64 {
+    started_at.elapsed().as_millis() as u64
+}
+
+fn remaining_timeout_budget(started_at: std::time::Instant, timeout: Duration) -> Option<Duration> {
+    timeout.checked_sub(started_at.elapsed())
+}
+
+fn record_transcode_outcome(
+    transcode_runtime: &TranscodeRuntime,
+    stage: TranscodeStage,
+    outcome: TranscodeOutcome,
+) {
+    if outcome.used_hardware {
+        transcode_runtime.record_hw_encode(outcome.duration_ms);
+    } else {
+        transcode_runtime.record_sw_encode(outcome.duration_ms);
+    }
+
+    tracing::info!(
+        ?stage,
+        encoder = outcome.encoder_used,
+        backend = %outcome.backend_used,
+        used_hardware = outcome.used_hardware,
+        fallback_occurred = outcome.fallback_occurred,
+        duration_ms = outcome.duration_ms,
+        "Hardware acceleration diagnostics"
+    );
+}
+
+fn should_retry_with_software(error: &Error, backend: HardwareAcceleration) -> bool {
+    if !backend.is_hardware() {
+        return false;
+    }
+
+    match error {
+        Error::TranscodeFailed { stderr_tail, .. } => backend.matches_failure_output(stderr_tail),
+        _ => false,
+    }
+}
+
+fn encode_settings_for_attempt(
+    base_settings: &TranscodeSettings,
+    transcode_runtime: &TranscodeRuntime,
+) -> TranscodeSettings {
+    if !base_settings.hardware_acceleration.is_hardware() {
+        return base_settings.clone();
+    }
+
+    transcode_runtime.effective_settings(base_settings)
+}
+
+/// Run an ffmpeg encode, retrying once in software if the configured hardware
+/// backend fails at runtime.
+///
+/// ## Rationale
+/// Startup probes can pass while the first real encode still fails on a host
+/// (driver quirks, unsupported profile, VRAM exhaustion); latching the
+/// fallback in [`TranscodeRuntime`] avoids repeating a doomed hardware attempt
+/// on every subsequent job.
+///
+/// ## Shared by
+/// Both the Discord-shaped strategy ladder in [`crate::pipeline::optimize`]
+/// and any leaner, non-Discord transcode path use this so hardware-fallback
+/// behavior stays in one place.
+pub async fn execute_with_hwacc_fallback<F>(
+    ffmpeg_path: &Path,
+    timeout: Duration,
+    stage: TranscodeStage,
+    base_settings: &TranscodeSettings,
+    transcode_runtime: &TranscodeRuntime,
+    build_args: F,
+) -> Result<TranscodeOutcome, Error>
+where
+    F: Fn(&TranscodeSettings) -> Args,
+{
+    let started_at = std::time::Instant::now();
+    let active_settings = encode_settings_for_attempt(base_settings, transcode_runtime);
+    let args = build_args(&active_settings);
+
+    match execute(ffmpeg_path, &args, timeout, stage).await {
+        Ok(()) => {
+            let outcome = TranscodeOutcome::new(
+                active_settings.hardware_acceleration,
+                active_settings.target_codec,
+                false,
+                elapsed_ms(started_at),
+            );
+            record_transcode_outcome(transcode_runtime, stage, outcome);
+            Ok(outcome)
+        }
+        Err(error) if should_retry_with_software(&error, active_settings.hardware_acceleration) => {
+            let latched = transcode_runtime.activate_software_fallback();
+            let retry_settings = encode_settings_for_attempt(base_settings, transcode_runtime);
+            let Some(retry_timeout) = remaining_timeout_budget(started_at, timeout) else {
+                tracing::warn!(
+                    ?stage,
+                    elapsed_ms = elapsed_ms(started_at),
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Hardware fallback skipped because the ffmpeg time budget was exhausted"
+                );
+                return Err(error);
+            };
+
+            tracing::warn!(
+                ?stage,
+                error = %error,
+                configured_backend = %transcode_runtime.configured_backend(),
+                failed_backend = %active_settings.hardware_acceleration,
+                fallback_encoder = retry_settings
+                    .hardware_acceleration
+                    .encoder_for(retry_settings.target_codec),
+                latched,
+                retry_timeout_ms = retry_timeout.as_millis() as u64,
+                "Hardware encoder failed; retrying with software encoder"
+            );
+
+            let retry_args = build_args(&retry_settings);
+            execute(ffmpeg_path, &retry_args, retry_timeout, stage)
+                .await
+                .map(|()| {
+                    let outcome = TranscodeOutcome::new(
+                        retry_settings.hardware_acceleration,
+                        retry_settings.target_codec,
+                        true,
+                        elapsed_ms(started_at),
+                    );
+                    record_transcode_outcome(transcode_runtime, stage, outcome);
+                    outcome
+                })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Generalized stream-copy viability check: is `facts` already encoded as `codec`
+/// in a container/audio combination that can be remuxed without re-encoding?
+///
+/// ## Rationale
+/// [`mp4_stream_copy_viable`] only ever checked H.264/AAC because the bot's
+/// stream-copy path always wrote MP4. A local-download path may target any of
+/// H.264/HEVC/AV1 and either MP4 or MKV, so the check is parameterized.
+pub fn stream_copy_viable_for(facts: MediaFacts, codec: TargetVideoCodec) -> bool {
+    let video_matches = match codec {
+        TargetVideoCodec::H264 => matches!(facts.video_codec, VideoCodec::H264),
+        TargetVideoCodec::Hevc => matches!(facts.video_codec, VideoCodec::H265),
+        TargetVideoCodec::Av1 => matches!(facts.video_codec, VideoCodec::Av1),
+    };
+
+    video_matches
+        && matches!(
+            facts.audio_codec,
+            AudioCodec::Aac | AudioCodec::Opus | AudioCodec::None
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::time::Instant;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn remaining_timeout_budget_returns_none_after_budget_is_exhausted() {
+        let started_at = Instant::now() - Duration::from_secs(2);
+
+        let remaining = remaining_timeout_budget(started_at, Duration::from_secs(1));
+
+        assert_eq!(remaining, None);
+    }
 
     fn to_strings(args: &[OsString]) -> Vec<String> {
         args.iter()
