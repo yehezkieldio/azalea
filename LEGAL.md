@@ -57,3 +57,13 @@ Azalea depends on external tools and services for URL resolution, media retrieva
 ## Project Intent
 
 Azalea is intended for educational and experimental use and for convenience within a private server. It is not intended to facilitate copyright infringement, circumvent platform rules, or enable systematic scraping, archiving, or redistribution of content.
+
+## Third-Party Code Attribution
+
+Azalea (MIT OR Apache-2.0) does not include source code from any AGPL-3.0-licensed project. Where research into another project informed a design decision or a fix, that influence is documented here and in the relevant source comments, distinguishing facts/techniques (not copyrightable) from original expression (which is not copied).
+
+- **[imputnet/cobalt](https://github.com/imputnet/cobalt)** (AGPL-3.0-only) — a media downloader whose `api/` package was reviewed for ideas applicable to Azalea's own Twitter/X resolver (`azalea-core/src/pipeline/resolve.rs`):
+  - **Used, independently reimplemented**: detection of a Twitter video-muxer bug (Nov-Dec 2023) that produced broken containers, via decoding the affected media's Snowflake-ID timestamp. cobalt discovered and documented this bug and its date window; Azalea's `twitter_container_bug_window` function decodes the same publicly-documented Snowflake ID format (a technique used by many platforms, not original to cobalt) independently, in different code structure, to apply the same fix (force a remux instead of a byte-for-byte pass-through) in Azalea's own pipeline.
+  - **Investigated and rejected**: a resolver hitting Twitter's GraphQL `TweetDetail` endpoint directly, modeled on cobalt's `twitter.js`. This was implemented, live-tested, found to be blocked by Twitter's TLS-fingerprinting (consistent with a maintainer-documented cobalt issue, [#573](https://github.com/imputnet/cobalt/issues/573)), and removed rather than pursuing TLS-impersonation to work around it. No code from this attempt remains; see the removal's rationale in `resolve.rs`'s module docs.
+
+If any future change incorporates a nontrivial, original portion of AGPL-3.0 (or other copyleft) source rather than an independently-written reimplementation of a documented technique, that code must be either rewritten from scratch, isolated and relicensed under compatible terms with the upstream author's permission, or not merged — maintainers should treat this as a hard gate, not a documentation afterthought.
