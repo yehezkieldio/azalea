@@ -147,6 +147,7 @@ pub async fn run(
                     &engine.temp_files,
                     &engine.config,
                     &engine.pinned_media_clients,
+                    None,
                 )
                 .await
                 .inspect_err(|_e| {

@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use azalea_core::Engine;
 use azalea_core::config::EngineSettings;
 use azalea_core::media::TweetLink;
+use azalea_core::pipeline::download::DownloadProgress;
 use azalea_core::pipeline::types::sanitize_extension;
 use azalea_core::pipeline::{Job, PreparedUpload, RequestId, download, optimize};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::task::JoinSet;
 
@@ -41,6 +43,15 @@ pub async fn run(args: CliArgs) -> Result<()> {
     Ok(())
 }
 
+/// The bot's timeouts (`pipeline.download_timeout_secs` defaults to 60s,
+/// tuned for Discord's own upload urgency) are too tight for a CLI
+/// downloading large files or transcoding slowly on weak hardware — see
+/// the target-hardware notes on software AV1 encode time. `EngineSettings`
+/// has no "no timeout" option, and `validate` hard-caps every timeout at
+/// this value, so this is the longest a stage can run rather than truly
+/// unbounded.
+const MAX_STAGE_TIMEOUT_SECS: u64 = 3600;
+
 fn build_engine(args: &CliArgs) -> Result<Engine> {
     let mut engine_config = EngineSettings::default();
     engine_config.storage.dedup_persistent = false;
@@ -48,6 +59,12 @@ fn build_engine(args: &CliArgs) -> Result<Engine> {
     engine_config.concurrency.download = args.concurrency;
     engine_config.concurrency.transcode = args.concurrency;
     engine_config.concurrency.pipeline = args.concurrency;
+    engine_config.pipeline.download_timeout_secs = MAX_STAGE_TIMEOUT_SECS;
+    engine_config.pipeline.resolver_timeout_secs = MAX_STAGE_TIMEOUT_SECS;
+    engine_config.pipeline.ytdlp_timeout_secs = MAX_STAGE_TIMEOUT_SECS;
+    engine_config.pipeline.upload_timeout_secs = MAX_STAGE_TIMEOUT_SECS;
+    engine_config.transcode.ffmpeg_timeout_secs = MAX_STAGE_TIMEOUT_SECS;
+    engine_config.transcode.ffprobe_timeout_secs = MAX_STAGE_TIMEOUT_SECS;
     // `Engine::new` seeds `TranscodeRuntime`'s configured backend from this
     // value; `execute_with_hwacc_fallback` substitutes the runtime's active
     // backend into every hardware encode attempt (see
@@ -163,6 +180,39 @@ async fn run_interactive(engine: &Engine, args: &CliArgs) {
     println!("bye!");
 }
 
+/// Poll `progress` on an interval and print a self-overwriting line, so a
+/// long download shows live movement instead of a single static
+/// "downloading..." message. Caller aborts the returned task once the
+/// download completes (success or failure).
+fn spawn_download_ticker(
+    job_id: u64,
+    progress: Arc<DownloadProgress>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            let downloaded = progress.downloaded.load(Ordering::Relaxed);
+            let total = progress.total.load(Ordering::Relaxed);
+            let downloaded_mb = downloaded as f64 / 1024.0 / 1024.0;
+
+            let line = if total > 0 {
+                let percent = (downloaded as f64 / total as f64 * 100.0).min(100.0);
+                let total_mb = total as f64 / 1024.0 / 1024.0;
+                format!(
+                    "[{job_id}] downloading... {downloaded_mb:.1} MB / {total_mb:.1} MB ({percent:.0}%)"
+                )
+            } else {
+                format!("[{job_id}] downloading... {downloaded_mb:.1} MB")
+            };
+            // Left-aligned padding to 80 columns overwrites any leftover
+            // characters from a longer previous line.
+            eprint!("\r{line:80}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+    })
+}
+
 async fn collect_urls(args: &CliArgs) -> Result<Vec<TweetLink>> {
     let mut content = args.urls.join("\n");
     if let Some(path) = &args.input_file {
@@ -195,6 +245,9 @@ async fn process_one(
         resolved.media_type
     );
 
+    let progress = Arc::new(DownloadProgress::default());
+    let ticker = spawn_download_ticker(job_id, Arc::clone(&progress));
+
     let downloaded = download::download(
         resolved.as_ref(),
         &job,
@@ -203,9 +256,14 @@ async fn process_one(
         &engine.temp_files,
         &engine.config,
         &engine.pinned_media_clients,
+        Some(progress.as_ref()),
     )
-    .await
-    .with_context(|| format!("download {}", job.tweet_url.original_url()))?;
+    .await;
+
+    ticker.abort();
+    eprint!("\r{:80}\r", "");
+    let downloaded =
+        downloaded.with_context(|| format!("download {}", job.tweet_url.original_url()))?;
 
     eprintln!(
         "[{job_id}] downloaded {} bytes — {}...",

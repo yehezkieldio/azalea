@@ -213,6 +213,7 @@ async fn download(
         &engine.temp_files,
         &engine.config,
         &engine.pinned_media_clients,
+        None,
     )
     .await?;
     let duration_ms = started.elapsed().as_millis() as u64;

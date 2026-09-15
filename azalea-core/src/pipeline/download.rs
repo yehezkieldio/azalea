@@ -27,12 +27,28 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::process::Command;
 use tracing::Instrument as _;
+
+/// Live byte counters a caller can poll from another task to show download
+/// progress; see [`download`]'s "Live progress" docs.
+///
+/// Named `DownloadProgress` rather than plain `Progress` to stay distinct
+/// from [`crate::pipeline::types::Progress`] (the coarse per-stage enum),
+/// which callers commonly import alongside this module.
+#[derive(Debug, Default)]
+#[allow(clippy::module_name_repetitions)]
+pub struct DownloadProgress {
+    pub downloaded: AtomicU64,
+    pub total: AtomicU64,
+}
 
 /// Download media to a temp file while enforcing size and safety constraints.
 ///
@@ -43,6 +59,15 @@ use tracing::Instrument as _;
 /// ## Postconditions
 /// - The returned [`DownloadedFile`] owns a temp guard for cleanup.
 /// - File size is bounded by `pipeline.max_download_bytes`.
+///
+/// ## Live progress
+/// `progress`, when given, is updated as the stream is read — a caller can
+/// poll it from a separate task to show live progress without this
+/// function needing to know how that progress should be displayed (stderr
+/// line, progress bar, Discord message edit, ...). `progress.total` stays
+/// `0` until the server's `Content-Length` is known, which may never
+/// happen for a chunked response.
+#[allow(clippy::too_many_arguments)]
 pub async fn download(
     resolved: &ResolvedMedia,
     job: &Job,
@@ -51,6 +76,7 @@ pub async fn download(
     temp_files: &TempFileCleanup,
     config: &EngineSettings,
     pinned_clients: &PinnedMediaClientCache,
+    progress: Option<&DownloadProgress>,
 ) -> Result<DownloadedFile, Error> {
     tracing::trace!(
         request_id = job.request_id.0,
@@ -107,6 +133,9 @@ pub async fn download(
         let total_size = response.content_length();
         let must_probe = total_size.is_none();
         if let Some(total) = total_size {
+            if let Some(progress) = progress {
+                progress.total.store(total, Ordering::Relaxed);
+            }
             tracing::trace!(total_bytes = total, "Content length provided");
         } else {
             tracing::trace!("Content length unavailable");
@@ -199,6 +228,9 @@ pub async fn download(
             }
 
             downloaded = next_downloaded;
+            if let Some(progress) = progress {
+                progress.downloaded.store(downloaded, Ordering::Relaxed);
+            }
 
             if max_download > 0 && downloaded > max_download {
                 if let Some(file) = file.take() {
