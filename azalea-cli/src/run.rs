@@ -256,7 +256,7 @@ async fn process_one(
         &engine.temp_files,
         &engine.config,
         &engine.pinned_media_clients,
-        Some(progress.as_ref()),
+        Some(Arc::clone(&progress)),
     )
     .await;
 

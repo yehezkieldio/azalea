@@ -22,9 +22,12 @@ use crate::pipeline::types::{
     VideoCodec, sanitize_extension,
 };
 use futures_util::StreamExt;
+use reqwest::StatusCode;
+use reqwest::header::{CONTENT_RANGE, RANGE};
 use serde::Deserialize;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{
@@ -33,8 +36,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::process::Command;
+use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 /// Live byte counters a caller can poll from another task to show download
@@ -49,6 +53,16 @@ pub struct DownloadProgress {
     pub downloaded: AtomicU64,
     pub total: AtomicU64,
 }
+
+/// Below this size, a single range request covers the whole file (still
+/// retry-capable, just not parallel) — not worth the connection overhead
+/// of splitting further.
+const PARALLEL_CHUNK_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
+/// Concurrent connections used for files at or above the threshold.
+const PARALLEL_CHUNK_COUNT: u64 = 4;
+/// Attempts per byte range before giving up; each retry resumes from the
+/// exact offset already written, rather than restarting the range.
+const MAX_RANGE_ATTEMPTS: u32 = 3;
 
 /// Download media to a temp file while enforcing size and safety constraints.
 ///
@@ -76,7 +90,7 @@ pub async fn download(
     temp_files: &TempFileCleanup,
     config: &EngineSettings,
     pinned_clients: &PinnedMediaClientCache,
-    progress: Option<&DownloadProgress>,
+    progress: Option<Arc<DownloadProgress>>,
 ) -> Result<DownloadedFile, Error> {
     tracing::trace!(
         request_id = job.request_id.0,
@@ -119,9 +133,15 @@ pub async fn download(
         // SSRF guardrails: validate and canonicalize before any network I/O.
         let validated_url = validate_media_url(resolved.url.as_ref()).await?;
 
-        let response = fetch_with_redirects(config, pinned_clients, validated_url)
-            .instrument(tracing::info_span!("download.redirects"))
-            .await?;
+        // A single-byte range probes both range support and the true total
+        // size in one round trip: a 206 response means chunk fetches with
+        // retry-on-failure (and, past the size threshold, parallelism) are
+        // available; a 200 means the server ignored the header and this is
+        // the ordinary full response, handled exactly as before.
+        let (response, validated_used) =
+            fetch_with_redirects(config, pinned_clients, validated_url, Some((0, 0)))
+                .instrument(tracing::info_span!("download.redirects"))
+                .await?;
 
         if !response.status().is_success() {
             return Err(Error::DownloadFailed {
@@ -129,21 +149,26 @@ pub async fn download(
             });
         }
 
+        let is_partial = response.status() == StatusCode::PARTIAL_CONTENT;
         let header_content_length = content_length_header_bytes(response.headers());
-        let total_size = response.content_length();
+        let total_size = if is_partial {
+            parse_content_range_total(response.headers())
+        } else {
+            response.content_length()
+        };
         let must_probe = total_size.is_none();
         if let Some(total) = total_size {
-            if let Some(progress) = progress {
+            if let Some(progress) = progress.as_ref() {
                 progress.total.store(total, Ordering::Relaxed);
             }
-            tracing::trace!(total_bytes = total, "Content length provided");
+            tracing::trace!(total_bytes = total, is_partial, "Content length provided");
         } else {
             tracing::trace!("Content length unavailable");
         }
         let max_download = config.pipeline.max_download_bytes;
-        // Early reject using the raw Content-Length header before streaming any bytes.
+        // Early reject using the known total before streaming any more bytes.
         if max_download > 0
-            && let Some(total) = header_content_length
+            && let Some(total) = total_size
             && total > max_download
         {
             return Err(Error::DownloadFailed {
@@ -159,112 +184,156 @@ pub async fn download(
             || resolved.resolution.is_none()
             || (resolved.media_type == MediaType::Video
                 && total_size.is_some_and(|size| size > config.transcode.max_upload_bytes));
-        let memory_only = can_keep_download_memory_only(total_size, should_probe, config);
 
-        let reserve_bytes = if memory_only {
-            0
-        } else {
-            header_content_length
-                .or(total_size)
-                .filter(|size| *size > 0)
-                .or_else(|| (max_download > 0).then_some(max_download))
-                .unwrap_or(0)
-        };
-        tracing::trace!(reserve_bytes, "Reserving disk budget for download");
-        let _download_reservation = if reserve_bytes > 0 {
-            Some(
-                reserve_download_bytes(
-                    &config.storage.temp_dir,
-                    config.pipeline.min_disk_space_bytes,
-                    reserve_bytes,
-                    reserved_download_bytes,
-                )
-                .await?,
-            )
-        } else {
-            ensure_disk_space(
+        let (downloaded, upload_ready_bytes) = if is_partial {
+            let Some(total_size) = total_size else {
+                return Err(Error::DownloadFailed {
+                    source: DownloadError::WriteFailed(std::io::Error::other(
+                        "server returned a partial response without a usable Content-Range total",
+                    )),
+                });
+            };
+            // The 1-byte probe body is unread and cheap to discard; the real
+            // data comes from the range fetches below, which cover the
+            // whole file (including byte 0) so nothing is lost.
+            drop(response);
+
+            let _download_reservation = reserve_download_bytes(
                 &config.storage.temp_dir,
                 config.pipeline.min_disk_space_bytes,
+                total_size.max(1),
+                reserved_download_bytes,
             )
             .await?;
-            None
-        };
+            // Ensures the file exists and is correctly sized before any
+            // chunk task opens it without truncating.
+            drop(open_download_file(&output_path, Some(total_size), config).await?);
 
-        let mut stream = response.bytes_stream();
-        let mut upload_ready_bytes = bounded_upload_ready_buffer(total_size, config);
-        let mut file = if memory_only {
-            None
+            let client = pinned_clients.client(config, &validated_used).await?;
+            download_ranges_parallel(
+                &client,
+                &validated_used.url,
+                &output_path,
+                total_size,
+                progress.clone(),
+            )
+            .instrument(tracing::info_span!("download.ranges", total_size))
+            .await?;
+
+            (total_size, None)
         } else {
-            Some(open_download_file(&output_path, total_size, config).await?)
-        };
+            let memory_only = can_keep_download_memory_only(total_size, should_probe, config);
 
-        let mut downloaded = 0u64;
-        let upload_ready_buffer_limit = upload_ready_buffer_limit(config);
-        let mut last_log = std::time::Instant::now();
-        let log_interval = Duration::from_secs(5);
+            let reserve_bytes = if memory_only {
+                0
+            } else {
+                header_content_length
+                    .or(total_size)
+                    .filter(|size| *size > 0)
+                    .or_else(|| (max_download > 0).then_some(max_download))
+                    .unwrap_or(0)
+            };
+            let _download_reservation = if reserve_bytes > 0 {
+                Some(
+                    reserve_download_bytes(
+                        &config.storage.temp_dir,
+                        config.pipeline.min_disk_space_bytes,
+                        reserve_bytes,
+                        reserved_download_bytes,
+                    )
+                    .await?,
+                )
+            } else {
+                ensure_disk_space(
+                    &config.storage.temp_dir,
+                    config.pipeline.min_disk_space_bytes,
+                )
+                .await?;
+                None
+            };
 
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| Error::DownloadFailed {
-                source: DownloadError::WriteFailed(std::io::Error::other(e)),
-            })?;
+            let mut stream = response.bytes_stream();
+            let mut upload_ready_bytes = bounded_upload_ready_buffer(total_size, config);
+            let mut file = if memory_only {
+                None
+            } else {
+                Some(open_download_file(&output_path, total_size, config).await?)
+            };
 
-            let next_downloaded = downloaded.saturating_add(chunk.len() as u64);
-            if let Some(bytes) = upload_ready_bytes.as_mut() {
-                if next_downloaded <= upload_ready_buffer_limit {
-                    bytes.extend_from_slice(&chunk);
-                } else {
-                    let buffered = upload_ready_bytes.take();
-                    if file.is_none() {
-                        transition_memory_download_to_file(
-                            &mut file,
-                            &output_path,
-                            total_size,
-                            config,
-                            buffered,
-                        )
-                        .await?;
+            let mut downloaded = 0u64;
+            let upload_ready_buffer_limit = upload_ready_buffer_limit(config);
+            let mut last_log = std::time::Instant::now();
+            let log_interval = Duration::from_secs(5);
+
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result.map_err(|e| Error::DownloadFailed {
+                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
+                })?;
+
+                let next_downloaded = downloaded.saturating_add(chunk.len() as u64);
+                if let Some(bytes) = upload_ready_bytes.as_mut() {
+                    if next_downloaded <= upload_ready_buffer_limit {
+                        bytes.extend_from_slice(&chunk);
+                    } else {
+                        let buffered = upload_ready_bytes.take();
+                        if file.is_none() {
+                            transition_memory_download_to_file(
+                                &mut file,
+                                &output_path,
+                                total_size,
+                                config,
+                                buffered,
+                            )
+                            .await?;
+                        }
                     }
                 }
-            }
 
-            downloaded = next_downloaded;
-            if let Some(progress) = progress {
-                progress.downloaded.store(downloaded, Ordering::Relaxed);
-            }
-
-            if max_download > 0 && downloaded > max_download {
-                if let Some(file) = file.take() {
-                    drop(file);
-                    let _ = fs::remove_file(&output_path).await;
+                downloaded = next_downloaded;
+                if let Some(progress) = progress.as_ref() {
+                    progress.downloaded.store(downloaded, Ordering::Relaxed);
                 }
-                return Err(Error::DownloadFailed {
-                    source: DownloadError::TooLarge {
-                        size_mb: downloaded / 1024 / 1024,
-                        max_mb: max_download / 1024 / 1024,
-                    },
-                });
+
+                if max_download > 0 && downloaded > max_download {
+                    if let Some(file) = file.take() {
+                        drop(file);
+                        let _ = fs::remove_file(&output_path).await;
+                    }
+                    return Err(Error::DownloadFailed {
+                        source: DownloadError::TooLarge {
+                            size_mb: downloaded / 1024 / 1024,
+                            max_mb: max_download / 1024 / 1024,
+                        },
+                    });
+                }
+
+                if let Some(file) = file.as_mut() {
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|e| Error::DownloadFailed {
+                            source: DownloadError::WriteFailed(e),
+                        })?;
+                }
+
+                if last_log.elapsed() >= log_interval {
+                    let percent = total_size
+                        .map(|total| (downloaded as f64 / total as f64 * 100.0) as u32)
+                        .unwrap_or(0);
+                    tracing::info!(
+                        percent,
+                        downloaded_mb = %format!("{:.2}", downloaded as f64 / 1024.0 / 1024.0),
+                        "Downloading media..."
+                    );
+                    last_log = std::time::Instant::now();
+                }
             }
 
-            if let Some(file) = file.as_mut() {
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| Error::DownloadFailed {
-                        source: DownloadError::WriteFailed(e),
-                    })?;
+            if let Some(file) = file {
+                finish_download_file(file, downloaded).await?;
             }
 
-            if last_log.elapsed() >= log_interval {
-                let percent = total_size
-                    .map(|total| (downloaded as f64 / total as f64 * 100.0) as u32)
-                    .unwrap_or(0);
-                tracing::info!(
-                    percent,
-                    downloaded_mb = %format!("{:.2}", downloaded as f64 / 1024.0 / 1024.0),
-                    "Downloading media..."
-                );
-                last_log = std::time::Instant::now();
-            }
-        }
+            (downloaded, upload_ready_bytes)
+        };
 
         if downloaded == 0 {
             return Err(Error::DownloadFailed {
@@ -279,10 +348,6 @@ pub async fn download(
             return Err(Error::DownloadFailed {
                 source: DownloadError::WriteFailed(std::io::Error::other("download incomplete")),
             });
-        }
-
-        if let Some(file) = file {
-            finish_download_file(file, downloaded).await?;
         }
 
         let mut duration = resolved.duration;
@@ -328,7 +393,7 @@ pub async fn download(
             duration_ms = download_start.elapsed().as_millis(),
             size_bytes = downloaded,
             path = %output_path.display(),
-            memory_only,
+            parallel = is_partial,
             "Download finished"
         );
 
@@ -543,25 +608,37 @@ fn pinned_media_client(
         })
 }
 
+/// Follows redirects (re-validating each hop for SSRF) to a final response.
+///
+/// `range`, when given, is sent as a `Range: bytes=start-end` header on
+/// every hop — used to make the very first request double as both an
+/// SSRF-safe range-support probe and (when supported) real chunk data,
+/// instead of spending a separate round trip on each.
+///
+/// Returns the response alongside the exact [`ValidatedMediaUrl`] (host +
+/// pinned addresses) used for the successful request, so a caller doing
+/// further range requests against the same resource can reuse the same
+/// DNS-pinned target instead of re-resolving it.
 async fn fetch_with_redirects(
     config: &EngineSettings,
     pinned_clients: &PinnedMediaClientCache,
     start_url: ValidatedMediaUrl,
-) -> Result<reqwest::Response, Error> {
+    range: Option<(u64, u64)>,
+) -> Result<(reqwest::Response, ValidatedMediaUrl), Error> {
     fetch_with_redirects_inner(
         start_url,
         |validated| async move {
             let client = pinned_clients.client(config, &validated).await?;
-            let response = client
-                .get(validated.url.clone())
-                .send()
-                .await
-                .map_err(|e| Error::DownloadFailed {
-                    source: DownloadError::WriteFailed(std::io::Error::other(e)),
-                })?;
+            let mut request = client.get(validated.url.clone());
+            if let Some((start, end)) = range {
+                request = request.header(RANGE, format!("bytes={start}-{end}"));
+            }
+            let response = request.send().await.map_err(|e| Error::DownloadFailed {
+                source: DownloadError::WriteFailed(std::io::Error::other(e)),
+            })?;
 
             if !response.status().is_redirection() {
-                return Ok(FetchStep::Complete(response));
+                return Ok(FetchStep::Complete((response, validated)));
             }
 
             let location = response
@@ -816,6 +893,195 @@ fn preallocate_file(path: &Path, size: u64) -> std::io::Result<()> {
     }
 }
 
+/// Parse a `Content-Range: bytes start-end/total` header's total, or `None`
+/// if the server doesn't know the total (`total` is `*`) or the header is
+/// missing/malformed.
+fn parse_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?;
+    let (_, total) = value.rsplit_once('/')?;
+    if total == "*" {
+        return None;
+    }
+    total.parse::<u64>().ok()
+}
+
+/// Split `[0, total_size)` into concurrent byte ranges and fetch them into
+/// `output_path` (already created and sized by the caller), each with its
+/// own retry-with-resume.
+///
+/// ## Preconditions
+/// `output_path` exists and is at least `total_size` bytes long.
+///
+/// ## Postconditions
+/// On success, every byte of `output_path` in `[0, total_size)` has been
+/// written by exactly one chunk.
+async fn download_ranges_parallel(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    output_path: &Path,
+    total_size: u64,
+    progress: Option<Arc<DownloadProgress>>,
+) -> Result<(), Error> {
+    let chunk_count = if total_size < PARALLEL_CHUNK_THRESHOLD_BYTES {
+        1
+    } else {
+        PARALLEL_CHUNK_COUNT
+    };
+    let chunk_size = total_size.div_ceil(chunk_count).max(1);
+
+    let mut tasks = JoinSet::new();
+    let mut start = 0u64;
+    while start < total_size {
+        let end = (start + chunk_size - 1).min(total_size - 1);
+        let client = client.clone();
+        let url = url.clone();
+        let output_path = output_path.to_path_buf();
+        let progress = progress.clone();
+        tasks.spawn(async move {
+            fetch_range_with_retry(&client, &url, start, end, &output_path, progress.as_ref()).await
+        });
+        start = end + 1;
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tasks.abort_all();
+                return Err(error);
+            }
+            Err(join_error) => {
+                tasks.abort_all();
+                return Err(Error::DownloadFailed {
+                    source: DownloadError::WriteFailed(std::io::Error::other(join_error)),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Fetch `[range_start, range_end]` (inclusive) from `url`, writing to
+/// `output_path` at that byte offset, retrying up to
+/// [`MAX_RANGE_ATTEMPTS`] times on a transient stream failure or short
+/// read. Each retry resumes from the exact byte already written rather
+/// than restarting the whole range — the failure this was built for
+/// (`error decoding response body` mid-transfer, observed in practice on a
+/// flaky connection) otherwise means a much larger re-download or an
+/// outright failure for what was actually a brief hiccup.
+async fn fetch_range_with_retry(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    range_start: u64,
+    range_end: u64,
+    output_path: &Path,
+    progress: Option<&Arc<DownloadProgress>>,
+) -> Result<(), Error> {
+    let mut resume_from = range_start;
+    let mut last_error = None;
+
+    for attempt in 1..=MAX_RANGE_ATTEMPTS {
+        match fetch_range_once(client, url, resume_from, range_end, output_path, progress).await {
+            Ok(written) => {
+                resume_from = resume_from.saturating_add(written);
+                if resume_from > range_end {
+                    return Ok(());
+                }
+                tracing::warn!(
+                    attempt,
+                    resume_from,
+                    range_end,
+                    "Range fetch closed early without an error; retrying the remainder"
+                );
+                last_error = None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    error = %error,
+                    start = resume_from,
+                    end = range_end,
+                    "Range fetch attempt failed"
+                );
+                last_error = Some(error);
+            }
+        }
+
+        if attempt < MAX_RANGE_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(300 * u64::from(attempt))).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| Error::DownloadFailed {
+        source: DownloadError::WriteFailed(std::io::Error::other("range fetch exhausted retries")),
+    }))
+}
+
+/// Single attempt at `[start, end]` (inclusive); returns the number of
+/// bytes actually written, which may be less than the range's size on a
+/// short read (the caller decides whether/how to retry the remainder).
+async fn fetch_range_once(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    start: u64,
+    end: u64,
+    output_path: &Path,
+    progress: Option<&Arc<DownloadProgress>>,
+) -> Result<u64, Error> {
+    let response = client
+        .get(url.clone())
+        .header(RANGE, format!("bytes={start}-{end}"))
+        .send()
+        .await
+        .map_err(|e| Error::DownloadFailed {
+            source: DownloadError::WriteFailed(std::io::Error::other(e)),
+        })?;
+
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(Error::DownloadFailed {
+            source: DownloadError::HttpStatus(response.status().as_u16()),
+        });
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(output_path)
+        .await
+        .map_err(|e| Error::DownloadFailed {
+            source: DownloadError::WriteFailed(e),
+        })?;
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(|e| Error::DownloadFailed {
+            source: DownloadError::WriteFailed(e),
+        })?;
+
+    let mut stream = response.bytes_stream();
+    let mut written = 0u64;
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| Error::DownloadFailed {
+            source: DownloadError::WriteFailed(std::io::Error::other(e)),
+        })?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| Error::DownloadFailed {
+                source: DownloadError::WriteFailed(e),
+            })?;
+        written += chunk.len() as u64;
+        if let Some(progress) = progress {
+            progress
+                .downloaded
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        }
+    }
+    file.flush().await.map_err(|e| Error::DownloadFailed {
+        source: DownloadError::WriteFailed(e),
+    })?;
+
+    Ok(written)
+}
+
 fn content_length_header_bytes(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
         .get(reqwest::header::CONTENT_LENGTH)
@@ -858,14 +1124,14 @@ mod tests {
     use super::{
         FetchStep, MAX_REDIRECTS, bounded_upload_ready_buffer, can_keep_download_memory_only,
         content_length_header_bytes, estimate_bitrate_kbps, fetch_with_redirects_inner,
-        finish_download_file, parse_bitrate_kbps, transition_memory_download_to_file,
-        upload_ready_buffer_limit,
+        finish_download_file, parse_bitrate_kbps, parse_content_range_total,
+        transition_memory_download_to_file, upload_ready_buffer_limit,
     };
     use crate::config::EngineSettings;
     use crate::pipeline::errors::{DownloadError, Error};
     use crate::pipeline::ssrf::ValidatedMediaUrl;
     use reqwest::Url;
-    use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
+    use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderValue};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -901,6 +1167,32 @@ mod tests {
         headers.insert(CONTENT_LENGTH, HeaderValue::from_static("abc"));
 
         assert_eq!(content_length_header_bytes(&headers), None);
+    }
+
+    #[test]
+    fn parses_content_range_total() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-999/12345678"),
+        );
+
+        assert_eq!(parse_content_range_total(&headers), Some(12_345_678));
+    }
+
+    #[test]
+    fn content_range_with_unknown_total_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-999/*"));
+
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn missing_content_range_header_returns_none() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(parse_content_range_total(&headers), None);
     }
 
     #[test]
