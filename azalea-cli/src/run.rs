@@ -84,6 +84,7 @@ async fn run_batch(engine: &Engine, args: &CliArgs, urls: Vec<TweetLink>) {
             let args = args.clone();
             tasks.spawn(async move {
                 let id = job_id.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[{id}] got {} — resolving...", tweet_url.original_url());
                 process_one(&engine, &args, tweet_url, id).await
             });
         }
@@ -151,6 +152,7 @@ async fn run_interactive(engine: &Engine, args: &CliArgs) {
 
         for tweet_url in urls {
             job_id += 1;
+            eprintln!("[{job_id}] got {} — resolving...", tweet_url.original_url());
             match process_one(engine, args, tweet_url, job_id).await {
                 Ok(outcome) => println!("{outcome}"),
                 Err(error) => eprintln!("error: {error:#}"),
@@ -188,6 +190,11 @@ async fn process_one(
         .await
         .with_context(|| format!("resolve {}", job.tweet_url.original_url()))?;
 
+    eprintln!(
+        "[{job_id}] resolved ({:?}) — downloading...",
+        resolved.media_type
+    );
+
     let downloaded = download::download(
         resolved.as_ref(),
         &job,
@@ -199,6 +206,16 @@ async fn process_one(
     )
     .await
     .with_context(|| format!("download {}", job.tweet_url.original_url()))?;
+
+    eprintln!(
+        "[{job_id}] downloaded {} bytes — {}...",
+        downloaded.size,
+        if args.discord_cap {
+            "optimizing"
+        } else {
+            "transcoding"
+        }
+    );
 
     if args.discord_cap {
         let prepared = optimize::optimize(
