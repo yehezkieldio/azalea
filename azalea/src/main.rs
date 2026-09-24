@@ -221,7 +221,7 @@ impl Drop for QueueDepthGuard {
         // Best-effort: queue depth is a heuristic for status output.
         let _ = self
             .0
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_sub(1))
             });
     }

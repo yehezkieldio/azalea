@@ -92,10 +92,7 @@ pub async fn optimize(
     );
     let max_upload_bytes = config.transcode.max_upload_bytes;
     tracing::trace!(max_upload_bytes, "Transcode limits");
-    // `needs_container_fix` media must be re-muxed at least once: a byte-for-byte
-    // pass-through would preserve Twitter's broken container (see
-    // `resolve::twitter_container_bug_window`).
-    if downloaded.size <= max_upload_bytes && !resolved.needs_container_fix {
+    if downloaded.size <= max_upload_bytes {
         // Fast path: already within upload limits, so keep original bits.
         tracing::trace!(
             size_bytes = downloaded.size,
@@ -1428,7 +1425,6 @@ mod tests {
             duration: Some(5.0),
             resolution: Some((1920, 1080)),
             extension: "mp4".into(),
-            needs_container_fix: false,
         };
         let config = EngineSettings::default();
         let permits = Permits::new(&config.concurrency);
