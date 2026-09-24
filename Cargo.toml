@@ -66,10 +66,16 @@ indexing_slicing = "warn"
 # Warns if a function returns Result/Option but never fails.
 unnecessary_wraps = "warn"
 
+# This binary is built once per release and then runs continuously as a
+# long-lived service (Discord bot + media pipeline), so release build time is
+# cheap relative to runtime throughput. Fat LTO with a single codegen unit
+# removes cross-crate inlining barriers across the whole dependency graph;
+# thin LTO with multiple units was leaving that optimization on the table for
+# no benefit this profile actually needs.
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 4
+lto = "fat"
+codegen-units = 1
 strip = true
 panic = "abort"
 overflow-checks = true
