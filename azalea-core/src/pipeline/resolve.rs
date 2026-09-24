@@ -233,6 +233,15 @@ struct VxMedia {
     media_type: Box<str>,
     #[serde(default)]
     duration_millis: Option<u64>,
+    /// VxTwitter nests dimensions under `size`. A missing resolution forces an
+    /// ffprobe pass and disables the in-memory download path, so this must
+    /// track the API shape.
+    #[serde(default)]
+    size: Option<VxSize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VxSize {
     #[serde(default)]
     width: Option<u32>,
     #[serde(default)]
@@ -297,10 +306,10 @@ impl VxTwitter {
                         MediaType::Video
                     },
                     duration: media.duration_millis.map(|d| d as f64 / 1000.0),
-                    resolution: match (media.width, media.height) {
-                        (Some(w), Some(h)) => Some((w, h)),
-                        _ => None,
-                    },
+                    resolution: media
+                        .size
+                        .as_ref()
+                        .and_then(|size| Some((size.width?, size.height?))),
                     extension: extension.into_boxed_str(),
                 }))
             })
@@ -702,8 +711,8 @@ fn should_negative_cache(error: &ResolveError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        YtDlp, YtDlpFormat, YtDlpOutput, extension_from_vxtwitter_metadata, select_best_format,
-        should_negative_cache,
+        VxResponse, YtDlp, YtDlpFormat, YtDlpOutput, extension_from_vxtwitter_metadata,
+        select_best_format, should_negative_cache,
     };
     use crate::media::TweetLink;
     use crate::pipeline::errors::ResolveError;
@@ -1008,5 +1017,22 @@ mod tests {
         let error = ResolveError::ParseFailed("EOF while parsing a value".to_string());
 
         assert!(!should_negative_cache(&error));
+    }
+
+    #[test]
+    fn vxtwitter_media_reads_nested_size() -> Result<(), serde_json::Error> {
+        let response: VxResponse = serde_json::from_str(
+            r#"{"media_extended":[{"type":"video","url":"https://video.twimg.com/a.mp4",
+                "duration_millis":9301,"size":{"height":1080,"width":1920}}]}"#,
+        )?;
+        let size = response
+            .media_extended
+            .first()
+            .and_then(|m| m.size.as_ref());
+        assert_eq!(
+            size.map(|s| (s.width, s.height)),
+            Some((Some(1920), Some(1080)))
+        );
+        Ok(())
     }
 }

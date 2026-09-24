@@ -292,8 +292,6 @@ fn push_video_encoding_args(
             args.push(threads.to_string().into());
             args.push("-x264-params".into());
             args.push(x264_params.into());
-            args.push("-tune".into());
-            args.push("zerolatency".into());
         }
         HardwareAcceleration::Nvenc => {
             let cq = match config.quality_preset {
@@ -526,6 +524,43 @@ pub fn remux_args(input: &Path, output: &Path, threads: u32) -> Args {
     args.push("-movflags".into());
     args.push("+faststart".into());
     args.push(output.as_os_str().into());
+    args
+}
+
+/// Build args for a keyframe-aligned stream-copy split into `pattern`
+/// (a `%03d` output template) at the given cut times.
+///
+/// `-segment_times` cuts at the first keyframe at or after each time; callers
+/// pass times just before planned keyframes.
+pub fn copy_segment_args(input: &Path, pattern: &Path, cut_times: &[f64]) -> Args {
+    let mut args = Args::new();
+    args.push("-y".into());
+    args.push("-i".into());
+    args.push(input.as_os_str().into());
+    args.push("-map".into());
+    args.push("0:v:0".into());
+    args.push("-map".into());
+    args.push("0:a:0?".into());
+    args.push("-c".into());
+    args.push("copy".into());
+    args.push("-f".into());
+    args.push("segment".into());
+    if !cut_times.is_empty() {
+        let times = cut_times
+            .iter()
+            .map(|time| format!("{time:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        args.push("-segment_times".into());
+        args.push(times.into());
+    }
+    args.push("-reset_timestamps".into());
+    args.push("1".into());
+    args.push("-segment_format".into());
+    args.push("mp4".into());
+    args.push("-segment_format_options".into());
+    args.push("movflags=+faststart".into());
+    args.push(pattern.as_os_str().into());
     args
 }
 

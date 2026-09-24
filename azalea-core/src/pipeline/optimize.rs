@@ -2,8 +2,11 @@
 //! Optimization and transcoding stage with size-aware strategy ladder.
 //!
 //! ## Algorithm overview
-//! Tries strategies from cheapest to most expensive (remux → transcode → split)
-//! until the output fits the configured upload size cap.
+//! Tries strategies from cheapest to most expensive (remux → transcode →
+//! stream-copy split → transcode split) until the output fits the configured
+//! upload size cap. Single-file outputs are preferred over splits; among
+//! splits, a keyframe-aligned stream copy (see [`super::stream_split`]) is
+//! tried before re-encoding whenever the codecs allow it.
 //!
 //! ## Trade-off acknowledgment
 //! The strategy ladder prioritizes latency over perfect quality; see
@@ -19,7 +22,10 @@ use crate::media::{TempFileCleanup, TempFileGuard};
 use crate::pipeline::disk::ensure_disk_space;
 use crate::pipeline::errors::{Error, TranscodeStage};
 use crate::pipeline::ffmpeg;
-use crate::pipeline::quality::{BitrateParams, Ladder, SplitTranscodePlan};
+use crate::pipeline::quality::{
+    BitrateParams, Ladder, MAX_SPLIT_ATTACHMENTS_PER_BATCH, SplitTranscodePlan,
+};
+use crate::pipeline::stream_split;
 use crate::pipeline::types::{
     AudioCodec, DownloadedFile, MediaType, PreparedPart, PreparedUpload, Progress, ResolvedMedia,
     VideoCodec,
@@ -259,6 +265,27 @@ pub async fn optimize(
                 }
                 downloaded._dir_guard = dir_guard;
             }
+            TranscodeStrategy::SplitCopy { max_parts } => {
+                match stream_split::split(&downloaded.path, config, max_parts)
+                    .instrument(tracing::info_span!(
+                        "optimize.strategy.split_copy",
+                        max_parts
+                    ))
+                    .await
+                {
+                    Ok(Some(segments)) => {
+                        let dir_guard = downloaded._dir_guard.take().ok_or_else(|| {
+                            Error::Io(std::io::Error::other("missing temp dir guard"))
+                        })?;
+                        return Ok(PreparedUpload::split(
+                            into_prepared_parts(segments, temp_files),
+                            dir_guard,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %e, "Stream-copy split failed"),
+                }
+            }
             TranscodeStrategy::SplitTranscode => {
                 let split_transcode_plan = strategy_plan.split_transcode.ok_or_else(|| {
                     Error::Io(std::io::Error::other("missing split-transcode plan"))
@@ -300,6 +327,10 @@ enum TranscodeStrategy {
     Remux,
     TranscodeBalanced,
     TranscodeAggressive,
+    /// Keyframe stream-copy split, accepted only with at most `max_parts`.
+    SplitCopy {
+        max_parts: u32,
+    },
     SplitTranscode,
     ImageCompress,
 }
@@ -311,6 +342,7 @@ impl std::fmt::Display for TranscodeStrategy {
             Self::Remux => "remux",
             Self::TranscodeBalanced => "transcode-balanced",
             Self::TranscodeAggressive => "transcode-aggressive",
+            Self::SplitCopy { .. } => "split-copy",
             Self::SplitTranscode => "split-transcode",
             Self::ImageCompress => "image-compress",
         };
@@ -388,20 +420,55 @@ fn build_strategy_plan(
         None
     };
 
-    let strategy_candidates = [
-        remux,
-        transcode_balanced,
-        transcode_aggressive,
-        split_transcode_strategy,
-        None,
-        None,
+    // Same rule as `SplitTranscodePlan::compute`: spend attachments before
+    // accepting a visible downshift. A source-quality stream-copy split that
+    // fits one message therefore runs before the first step that downscales
+    // or splits below the source height. Otherwise it runs just before the
+    // transcode split and may not need more parts than that split would.
+    let mut split_copy = ffmpeg::mp4_stream_copy_viable(downloaded.facts);
+    let steps = [
+        (transcode_balanced, balanced_scale_limit.is_some()),
+        (transcode_aggressive, aggressive_scale_limit.is_some()),
+        (
+            split_transcode_strategy,
+            split_transcode.is_some_and(|plan| plan.downshifts),
+        ),
     ];
     let mut strategies = [None; STRATEGY_PLAN_CAPACITY];
-    for (slot, strategy) in strategies
-        .iter_mut()
-        .zip(strategy_candidates.into_iter().flatten())
-    {
-        *slot = Some(strategy);
+    let mut slots = strategies.iter_mut();
+    let mut push = |strategy| {
+        if let Some(slot) = slots.next() {
+            *slot = Some(strategy);
+        }
+    };
+    if let Some(remux) = remux {
+        push(remux);
+    }
+    for (step, downshifts) in steps {
+        let Some(step) = step else {
+            continue;
+        };
+        if split_copy && downshifts {
+            split_copy = false;
+            push(TranscodeStrategy::SplitCopy {
+                max_parts: MAX_SPLIT_ATTACHMENTS_PER_BATCH,
+            });
+        }
+        if split_copy
+            && step == TranscodeStrategy::SplitTranscode
+            && let Some(plan) = split_transcode
+        {
+            split_copy = false;
+            push(TranscodeStrategy::SplitCopy {
+                max_parts: plan.estimated_segments,
+            });
+        }
+        push(step);
+    }
+    if split_copy {
+        push(TranscodeStrategy::SplitCopy {
+            max_parts: MAX_SPLIT_ATTACHMENTS_PER_BATCH,
+        });
     }
 
     StrategyPlan {
@@ -1202,9 +1269,9 @@ fn spawn_parallel_segment_task(
 }
 
 #[derive(Debug, Clone)]
-struct SegmentOutput {
-    path: PathBuf,
-    size: u64,
+pub(super) struct SegmentOutput {
+    pub(super) path: PathBuf,
+    pub(super) size: u64,
 }
 
 fn into_prepared_parts(
@@ -1455,9 +1522,17 @@ mod tests {
         }
     }
 
+    /// Planner expectations below were derived for an 8 MiB upload cap.
+    fn eight_mib_config() -> EngineSettings {
+        let mut config = EngineSettings::default();
+        config.transcode.max_upload_bytes = 8 * 1024 * 1024;
+        config.pipeline.upload_ready_buffer_max_bytes = 8 * 1024 * 1024;
+        config
+    }
+
     #[test]
     fn strategy_plan_skips_remux_for_already_h264_mp4() {
-        let config = EngineSettings::default();
+        let config = eight_mib_config();
         let downloaded = downloaded_file(
             "already-h264.mp4",
             20 * 1024 * 1024,
@@ -1481,10 +1556,10 @@ mod tests {
         assert_eq!(
             plan.strategies,
             [
+                Some(TranscodeStrategy::SplitCopy { max_parts: 10 }),
                 Some(TranscodeStrategy::TranscodeBalanced),
                 Some(TranscodeStrategy::TranscodeAggressive),
                 Some(TranscodeStrategy::SplitTranscode),
-                None,
                 None,
                 None,
             ]
@@ -1494,6 +1569,42 @@ mod tests {
             .expect("split-transcode plan should be computed");
         assert_eq!(split_transcode.segment_duration, 20.0);
         assert_eq!(split_transcode.estimated_segments, 3);
+    }
+
+    #[test]
+    fn strategy_plan_tries_stream_copy_before_first_downscale() {
+        let config = EngineSettings::default();
+        let downloaded = downloaded_file(
+            "h264.mp4",
+            40 * 1024 * 1024,
+            60.0,
+            MediaFacts {
+                container: MediaContainer::Mp4,
+                video_codec: VideoCodec::H264,
+                audio_codec: AudioCodec::Aac,
+                bitrate_kbps: Some(5_600),
+            },
+        );
+
+        let plan = build_strategy_plan(
+            &downloaded,
+            60.0,
+            None,
+            Some(ScaleLimit::Height(480)),
+            &config,
+        );
+
+        assert_eq!(
+            plan.strategies,
+            [
+                Some(TranscodeStrategy::TranscodeBalanced),
+                Some(TranscodeStrategy::SplitCopy { max_parts: 10 }),
+                Some(TranscodeStrategy::TranscodeAggressive),
+                Some(TranscodeStrategy::SplitTranscode),
+                None,
+                None,
+            ]
+        );
     }
 
     #[test]
@@ -1560,7 +1671,7 @@ mod tests {
 
     #[test]
     fn strategy_plan_skips_full_transcodes_for_long_oversized_video() {
-        let config = EngineSettings::default();
+        let config = eight_mib_config();
         let downloaded = downloaded_file(
             "long.mp4",
             120 * 1024 * 1024,
@@ -1584,8 +1695,8 @@ mod tests {
         assert_eq!(
             plan.strategies,
             [
+                Some(TranscodeStrategy::SplitCopy { max_parts: 10 }),
                 Some(TranscodeStrategy::SplitTranscode),
-                None,
                 None,
                 None,
                 None,
@@ -1689,7 +1800,7 @@ mod tests {
 
     #[test]
     fn portrait_predict_scale_limit_targets_width_not_height() {
-        let config = EngineSettings::default();
+        let config = eight_mib_config();
 
         let scale_limit =
             predict_scale_limit(53.986395, Some((1080, 1920)), &config, QualityPreset::Fast);
