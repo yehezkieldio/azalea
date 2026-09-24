@@ -292,8 +292,6 @@ fn push_video_encoding_args(
             args.push(threads.to_string().into());
             args.push("-x264-params".into());
             args.push(x264_params.into());
-            args.push("-tune".into());
-            args.push("zerolatency".into());
         }
         HardwareAcceleration::Nvenc => {
             let cq = match config.quality_preset {
