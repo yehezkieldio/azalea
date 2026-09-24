@@ -28,6 +28,9 @@ pub struct SplitTranscodePlan {
     pub segment_duration: f64,
     pub estimated_segments: u32,
     pub bitrate: BitrateParams,
+    /// No plan within the attachment budget kept both the source height and
+    /// the source bitrate, so this one visibly downshifts.
+    pub downshifts: bool,
 }
 
 pub(crate) const MAX_SPLIT_ATTACHMENTS_PER_BATCH: u32 = 10;
@@ -148,16 +151,18 @@ impl SplitTranscodePlan {
                 segment_duration,
                 estimated_segments: segments,
                 bitrate,
+                downshifts: false,
             };
-            fallback = Some(plan);
 
-            if split_plan_is_source_bitrate_capped(config, source_bitrate_kbps, bitrate) {
+            if split_plan_is_source_bitrate_capped(config, source_bitrate_kbps, bitrate)
+                || split_plan_preserves_source_height(config, source_height, bitrate)
+            {
                 return Ok(plan);
             }
-
-            if split_plan_preserves_source_height(config, source_height, bitrate) {
-                return Ok(plan);
-            }
+            fallback = Some(Self {
+                downshifts: true,
+                ..plan
+            });
         }
 
         fallback.ok_or_else(|| Error::TranscodeFailed {
@@ -532,9 +537,12 @@ mod tests {
 
     #[test]
     fn split_transcode_plan_uses_more_segments_to_preserve_720p() {
-        let plan =
-            SplitTranscodePlan::compute(&TranscodeSettings::default(), 167.872, Some(720), None)
-                .expect("default config should produce a split-transcode plan");
+        let config = TranscodeSettings {
+            max_upload_bytes: 8 * 1024 * 1024,
+            ..TranscodeSettings::default()
+        };
+        let plan = SplitTranscodePlan::compute(&config, 167.872, Some(720), None)
+            .expect("8 MiB config should produce a split-transcode plan");
 
         assert_eq!(plan.estimated_segments, 4);
         assert!(plan.segment_duration > 41.0);

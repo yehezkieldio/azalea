@@ -89,7 +89,7 @@ pipeline = 8
 [transcode]
 quality_preset = "fast"        # fast | balanced | quality | size
 hardware_acceleration = "none" # none | vaapi | nvenc | videotoolbox | qsv | amf
-max_upload_bytes = 8388608     # 8 MiB (Discord free tier default)
+max_upload_bytes = 20971520    # 20 MiB (Discord default per-file limit)
 
 [pipeline]
 upload_ready_buffer_max_bytes = 8388608
@@ -223,7 +223,7 @@ Selected environment variables:
 | `AZALEA_QUALITY_PRESET`                    | `transcode.quality_preset`                | `fast`                |
 | `AZALEA_HARDWARE_ACCELERATION`             | `transcode.hardware_acceleration`         | `none`                |
 | `AZALEA_FFMPEG_THREADS`                    | `transcode.ffmpeg_threads`                | `0` (auto)            |
-| `AZALEA_MAX_UPLOAD_BYTES`                  | `transcode.max_upload_bytes`              | `8388608`             |
+| `AZALEA_MAX_UPLOAD_BYTES`                  | `transcode.max_upload_bytes`              | `20971520`            |
 | `AZALEA_VAAPI_DEVICE`                      | `transcode.vaapi_device`                  | `/dev/dri/renderD128` on Unix, empty on non-Unix |
 | `AZALEA_UPLOAD_READY_BUFFER_MAX_BYTES`     | `pipeline.upload_ready_buffer_max_bytes`  | `8388608`             |
 | `AZALEA_MAX_DOWNLOAD_BYTES`                | `pipeline.max_download_bytes`             | `524288000`           |

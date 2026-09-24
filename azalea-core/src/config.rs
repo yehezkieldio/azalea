@@ -320,7 +320,8 @@ impl Default for TranscodeSettings {
             target_codec: TargetVideoCodec::H264,
             ffmpeg_threads: 0,
             vaapi_device: default_vaapi_device(),
-            max_upload_bytes: 8 * 1024 * 1024,
+            // Discord's default per-file attachment limit; boosted guilds allow more.
+            max_upload_bytes: 20 * 1024 * 1024,
             container_overhead_ratio: 0.03,
             vbr_safety_margin: 0.05,
             transcode_target_ratio: 0.85,

@@ -455,7 +455,7 @@
         "max_upload_bytes": {
           "type": "integer",
           "format": "uint64",
-          "default": 8388608,
+          "default": 20971520,
           "minimum": 0
         },
         "min_bitrate_kbps": {
