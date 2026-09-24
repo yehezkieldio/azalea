@@ -199,6 +199,20 @@
           "default": 60,
           "minimum": 0
         },
+        "download_chunk_bytes": {
+          "description": "Range chunk size; files at or below it are fetched in one request.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 8388608,
+          "minimum": 0
+        },
+        "download_connections": {
+          "description": "Parallel connections per download; `1` disables ranged downloads.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
         "download_timeout_secs": {
           "type": "integer",
           "format": "uint64",
@@ -388,6 +402,15 @@
         }
       }
     },
+    "TargetVideoCodec": {
+      "description": "Target video codec for an encode.\n\n## Rationale\nDecoupled from [`HardwareAcceleration`] so callers can independently pick\n\"what codec\" and \"what backend encodes it\" (see [`HardwareAcceleration::encoder_for`]).",
+      "type": "string",
+      "enum": [
+        "h264",
+        "hevc",
+        "av1"
+      ]
+    },
     "TranscodeSettings": {
       "description": "Transcoding configuration.",
       "type": "object",
@@ -448,6 +471,9 @@
           "type": "number",
           "format": "double",
           "default": 0.8
+        },
+        "target_codec": {
+          "$ref": "#/$defs/TargetVideoCodec"
         },
         "transcode_target_ratio": {
           "type": "number",

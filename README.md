@@ -227,6 +227,8 @@ Selected environment variables:
 | `AZALEA_VAAPI_DEVICE`                      | `transcode.vaapi_device`                  | `/dev/dri/renderD128` on Unix, empty on non-Unix |
 | `AZALEA_UPLOAD_READY_BUFFER_MAX_BYTES`     | `pipeline.upload_ready_buffer_max_bytes`  | `8388608`             |
 | `AZALEA_MAX_DOWNLOAD_BYTES`                | `pipeline.max_download_bytes`             | `524288000`           |
+| `AZALEA_DOWNLOAD_CONNECTIONS`              | `pipeline.download_connections`           | `1` (single connection) |
+| `AZALEA_DOWNLOAD_CHUNK_BYTES`              | `pipeline.download_chunk_bytes`           | `8388608`             |
 | `AZALEA_BATCH_UPLOAD_MULTIPLE_MEDIA`       | `pipeline.batch_upload_multiple_media`    | `true`                |
 | `AZALEA_YTDLP_INSECURE_NO_CHECK_CERTIFICATE` | `pipeline.ytdlp_insecure_no_check_certificate` | `false`          |
 | `AZALEA_TEMP_DIR`                          | `storage.temp_dir`                        | system temp dir + `azalea` |

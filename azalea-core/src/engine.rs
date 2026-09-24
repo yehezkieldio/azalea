@@ -9,7 +9,7 @@
 use crate::concurrency::Permits;
 use crate::config::{EngineSettings, HardwareAcceleration, TranscodeSettings, USER_AGENT};
 use crate::media::TempFileCleanup;
-use crate::pipeline::{ResolverChain, download::PinnedMediaClientCache};
+use crate::pipeline::{ResolverChain, download::build_media_client};
 use crate::storage::{DedupCache, Metrics};
 use std::sync::{
     Arc,
@@ -179,7 +179,9 @@ pub struct Engine {
     pub config: EngineSettings,
     pub transcode_runtime: TranscodeRuntime,
     pub http: reqwest::Client,
-    pub pinned_media_clients: PinnedMediaClientCache,
+    /// SSRF-guarded HTTP/1.1 client for media bytes; see
+    /// [`crate::pipeline::download::build_media_client`].
+    pub media_http: reqwest::Client,
     pub permits: Permits,
     pub reserved_download_bytes: Arc<AtomicU64>,
     pub dedup: DedupCache,
@@ -195,7 +197,7 @@ impl Engine {
     /// persistence is unavailable so media processing can still continue.
     pub fn new(config: EngineSettings) -> anyhow::Result<Self> {
         let http = build_http_client(&config)?;
-        let pinned_media_clients = PinnedMediaClientCache::new(&config);
+        let media_http = build_media_client(&config)?;
         let transcode_runtime = TranscodeRuntime::new(config.transcode.hardware_acceleration);
         let permits = Permits::new(&config.concurrency);
         let reserved_download_bytes = Arc::new(AtomicU64::new(0));
@@ -208,7 +210,7 @@ impl Engine {
             config,
             transcode_runtime,
             http,
-            pinned_media_clients,
+            media_http,
             permits,
             reserved_download_bytes,
             dedup,
@@ -232,7 +234,7 @@ fn build_http_client(config: &EngineSettings) -> anyhow::Result<reqwest::Client>
 ///
 /// ## Rationale
 /// Timeout, pool, and HTTP/2 window tuning must stay identical across the
-/// general-purpose client and per-target pinned clients; a single builder
+/// general-purpose client and the media client; a single builder
 /// keeps that tuning from drifting between call sites.
 pub(crate) fn base_client_builder(config: &EngineSettings) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder()

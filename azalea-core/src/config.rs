@@ -387,6 +387,10 @@ pub struct PipelineSettings {
     pub queue_backpressure_timeout_ms: u64,
     pub download_timeout_secs: u64,
     pub download_write_buffer_bytes: usize,
+    /// Parallel connections per download; `1` disables ranged downloads.
+    pub download_connections: u32,
+    /// Range chunk size; files at or below it are fetched in one request.
+    pub download_chunk_bytes: u64,
     pub upload_ready_buffer_max_bytes: u64,
     pub upload_timeout_secs: u64,
     pub attachment_prepare_concurrency: usize,
@@ -409,6 +413,12 @@ impl Default for PipelineSettings {
             queue_backpressure_timeout_ms: 1_000,
             download_timeout_secs: 60,
             download_write_buffer_bytes: 1024 * 1024,
+            // Measured against the X video CDN: splitting a 21 MB file saved
+            // ~10-30% of a ~200 ms warm-edge transfer and nothing on edge cache
+            // misses, where origin fetch dominates. Worth raising only on hosts
+            // whose single-connection CDN throughput is far below link capacity.
+            download_connections: 1,
+            download_chunk_bytes: 8 * 1024 * 1024,
             upload_ready_buffer_max_bytes: 8 * 1024 * 1024,
             upload_timeout_secs: 120,
             attachment_prepare_concurrency: 4,
@@ -566,6 +576,21 @@ impl EngineSettings {
         )?;
         if self.pipeline.download_write_buffer_bytes == 0 {
             anyhow::bail!("pipeline.download_write_buffer_bytes must be at least 1");
+        }
+        const MAX_DOWNLOAD_CONNECTIONS: u32 = 16;
+        if !(1..=MAX_DOWNLOAD_CONNECTIONS).contains(&self.pipeline.download_connections) {
+            anyhow::bail!(
+                "pipeline.download_connections must be between 1 and {}",
+                MAX_DOWNLOAD_CONNECTIONS
+            );
+        }
+        // Below this, per-chunk request round-trips dominate transfer time.
+        const MIN_DOWNLOAD_CHUNK_BYTES: u64 = 256 * 1024;
+        if self.pipeline.download_chunk_bytes < MIN_DOWNLOAD_CHUNK_BYTES {
+            anyhow::bail!(
+                "pipeline.download_chunk_bytes must be at least {}",
+                MIN_DOWNLOAD_CHUNK_BYTES
+            );
         }
         if self.pipeline.upload_ready_buffer_max_bytes > self.transcode.max_upload_bytes {
             anyhow::bail!(

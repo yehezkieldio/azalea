@@ -452,6 +452,16 @@ const ENV_BINDINGS: &[EnvBinding] = &[
         path: &["pipeline", "download_write_buffer_bytes"],
     },
     EnvBinding {
+        key: "DOWNLOAD_CONNECTIONS",
+        aliases: &[],
+        path: &["pipeline", "download_connections"],
+    },
+    EnvBinding {
+        key: "DOWNLOAD_CHUNK_BYTES",
+        aliases: &[],
+        path: &["pipeline", "download_chunk_bytes"],
+    },
+    EnvBinding {
         key: "UPLOAD_READY_BUFFER_MAX_BYTES",
         aliases: &[],
         path: &["pipeline", "upload_ready_buffer_max_bytes"],

@@ -2,12 +2,21 @@
 //!
 //! ## Security-sensitive paths
 //! This module defends against local network access via crafted URLs. It is
-//! called before any outbound request in the download/resolve pipeline.
+//! applied to every outbound media request, including each redirect hop.
 //!
 //! ## Algorithm overview
-//! 1. Parse URL and enforce HTTPS.
-//! 2. Reject localhost, local suffixes, and IP literals.
-//! 3. Resolve DNS and reject private/link-local ranges.
+//! 1. [`validate_media_url`]: parse the URL, enforce HTTPS, allowed ports, and
+//!    the media host allowlist; reject localhost, local suffixes, and IP literals.
+//! 2. [`Resolver`]: resolve DNS inside the HTTP client's connector and reject
+//!    private/link-local ranges for allowlisted media hosts.
+//!
+//! ## Rejected alternative
+//! Resolving in a separate pre-flight step and pinning a dedicated client to
+//! the answer cost a second DNS lookup per hop, a ~5 ms client (root store)
+//! build whenever the CDN rotated its answer, and a cold TCP+TLS handshake
+//! because each pinned client had its own pool. Validating inside the
+//! connector's resolver checks exactly the addresses that get connected, so it
+//! closes the DNS-rebinding window without defeating connection reuse.
 //!
 //! ## References
 //! - SSRF guidance: <https://owasp.org/www-community/attacks/Server_Side_Request_Forgery>
@@ -15,6 +24,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use reqwest::Url;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::net::lookup_host;
 
 use crate::pipeline::errors::{DownloadError, Error};
@@ -29,28 +39,79 @@ const ALLOWED_MEDIA_HOSTS: [&str; 4] = [
     "abs.twimg.com",
 ];
 
+/// A media URL whose structure passed [`validate_media_url`].
+///
+/// Address validation happens later, in [`Resolver`], at connect time.
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedMediaUrl {
     pub(crate) url: Url,
-    pub(crate) host: String,
-    pub(crate) addrs: Vec<SocketAddr>,
 }
 
-pub(crate) async fn validate_media_url(url: &str) -> Result<ValidatedMediaUrl, Error> {
-    let (parsed, host, port) = validate_url_structure(url)?;
-    let addrs = lookup_host((host.as_str(), port))
-        .await
-        .map_err(|e| validation_error(e.to_string()))?;
-    let addrs = validate_resolved_addrs(addrs)?;
-
-    Ok(ValidatedMediaUrl {
-        url: parsed,
-        host,
-        addrs,
-    })
+pub(crate) fn validate_media_url(url: &str) -> Result<ValidatedMediaUrl, Error> {
+    let (url, _) = validate_url_structure(url)?;
+    Ok(ValidatedMediaUrl { url })
 }
 
-fn validate_url_structure(url: &str) -> Result<(Url, String, u16), Error> {
+/// DNS resolver for the media client that refuses blocked addresses.
+///
+/// ## Invariant
+/// Names outside the media allowlist are resolved without address checks:
+/// [`validate_media_url`] guarantees the media client only targets allowlisted
+/// hosts, so any other name the connector resolves is an operator-configured
+/// proxy.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Resolver;
+
+impl Resolve for Resolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
+        Box::pin(async move {
+            let addrs = lookup_host((host.as_str(), 0)).await?;
+            let addrs = if is_allowed_media_host(&host) {
+                validate_resolved_addrs(addrs).map_err(|_| BlockedAddress)?
+            } else {
+                addrs.collect()
+            };
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// Connector error raised when an allowlisted host resolves to a blocked or
+/// empty address set; recovered from reqwest's error chain by
+/// [`is_blocked_address`] so SSRF blocks keep their own error category.
+#[derive(Debug)]
+struct BlockedAddress;
+
+impl std::fmt::Display for BlockedAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("resolved to blocked ip")
+    }
+}
+
+impl std::error::Error for BlockedAddress {}
+
+pub(crate) fn is_blocked_address(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<BlockedAddress>() {
+            return true;
+        }
+        // `io::Error::source` skips its payload, so step into it explicitly.
+        let io_payload = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|payload| payload as &(dyn std::error::Error + 'static));
+        current = io_payload.or_else(|| error.source());
+    }
+    false
+}
+
+pub(crate) fn blocked_address_error() -> Error {
+    validation_error(BlockedAddress.to_string())
+}
+
+fn validate_url_structure(url: &str) -> Result<(Url, u16), Error> {
     // Security-sensitive: do not accept non-HTTPS or local network targets.
     let parsed = Url::parse(url).map_err(|e| validation_error(e.to_string()))?;
 
@@ -62,8 +123,7 @@ fn validate_url_structure(url: &str) -> Result<(Url, String, u16), Error> {
     let host = parsed
         .host_str()
         .ok_or_else(|| validation_error("missing url host"))?
-        .trim_end_matches('.')
-        .to_string();
+        .trim_end_matches('.');
     let host_lower = host.to_ascii_lowercase();
 
     if host_lower == "localhost"
@@ -89,7 +149,7 @@ fn validate_url_structure(url: &str) -> Result<(Url, String, u16), Error> {
         return Err(validation_error("port not allowed"));
     }
 
-    Ok((parsed, host, port))
+    Ok((parsed, port))
 }
 
 fn validate_resolved_addrs(
@@ -108,25 +168,6 @@ fn validate_resolved_addrs(
     }
 
     Ok(validated)
-}
-
-#[cfg(test)]
-fn validate_resolved_ips(ips: impl IntoIterator<Item = IpAddr>) -> Result<(), Error> {
-    let mut resolved_any = false;
-    for ip in ips {
-        resolved_any = true;
-        if is_blocked_ip(ip) {
-            // Block link-local, private, loopback, and multicast ranges.
-            return Err(validation_error("resolved to blocked ip"));
-        }
-    }
-
-    if !resolved_any {
-        // Some resolvers return zero addresses; treat as invalid input.
-        return Err(validation_error("dns lookup returned no addresses"));
-    }
-
-    Ok(())
 }
 
 fn is_blocked_ip(ip: IpAddr) -> bool {
@@ -178,13 +219,13 @@ mod tests {
         url: &str,
         ips: impl IntoIterator<Item = IpAddr>,
     ) -> Result<Url, Error> {
-        let (parsed, _, _) = validate_url_structure(url)?;
-        validate_resolved_ips(ips)?;
+        let (parsed, port) = validate_url_structure(url)?;
+        validate_resolved_addrs(ips.into_iter().map(|ip| SocketAddr::new(ip, port)))?;
         Ok(parsed)
     }
 
-    #[tokio::test]
-    async fn rejects_denylist_urls_with_expected_reasons() {
+    #[test]
+    fn rejects_denylist_urls_with_expected_reasons() {
         let cases = [
             ("http://pbs.twimg.com/media/test.mp4", "non-https url"),
             (
@@ -199,9 +240,7 @@ mod tests {
         ];
 
         for (url, reason) in cases {
-            let err = validate_media_url(url)
-                .await
-                .expect_err("denylisted url must be rejected");
+            let err = validate_media_url(url).expect_err("denylisted url must be rejected");
             assert!(
                 err.to_string().contains(reason),
                 "expected reason `{reason}` for `{url}`, got `{err}`"
@@ -209,18 +248,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn rejects_disallowed_hosts_without_dns_lookup() {
+    #[test]
+    fn rejects_disallowed_hosts_without_dns_lookup() {
         let err = validate_media_url("https://example.com/media/test.mp4")
-            .await
             .expect_err("host not on allowlist must be rejected");
         assert!(err.to_string().contains("host not on allowlist"));
     }
 
-    #[tokio::test]
-    async fn rejects_unapproved_ports() {
+    #[test]
+    fn rejects_unapproved_ports() {
         let err = validate_media_url("https://pbs.twimg.com:444/media/test.mp4")
-            .await
             .expect_err("port should be rejected");
         assert!(err.to_string().contains("port not allowed"));
     }
@@ -247,5 +284,42 @@ mod tests {
         )
         .expect_err("rfc1918 dns result must be rejected");
         assert!(err.to_string().contains("resolved to blocked ip"));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct BlockingResolver;
+
+    impl Resolve for BlockingResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            Box::pin(async { Err(Box::new(BlockedAddress) as Box<_>) })
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_address_survives_reqwest_error_chain() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(BlockingResolver)
+            .build()
+            .expect("test client");
+        let error = client
+            .get("http://media.invalid/a.mp4")
+            .send()
+            .await
+            .expect_err("blocked resolution must fail the request");
+
+        assert!(is_blocked_address(&error));
+        assert!(is_blocked_address(&std::io::Error::other(BlockedAddress)));
+        assert!(!is_blocked_address(&std::io::Error::other("refused")));
+    }
+
+    #[tokio::test]
+    async fn resolver_passes_through_names_outside_the_media_allowlist() {
+        let name = "localhost".parse::<Name>().expect("valid name");
+        let addrs = Resolver
+            .resolve(name)
+            .await
+            .expect("proxy-style names resolve without address checks");
+        assert!(addrs.count() > 0);
     }
 }

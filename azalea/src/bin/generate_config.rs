@@ -118,6 +118,8 @@ const ENV_REFERENCES: &[(&str, &[&str], &str)] = &[
         &[],
         "pipeline.download_write_buffer_bytes",
     ),
+    ("DOWNLOAD_CONNECTIONS", &[], "pipeline.download_connections"),
+    ("DOWNLOAD_CHUNK_BYTES", &[], "pipeline.download_chunk_bytes"),
     (
         "UPLOAD_READY_BUFFER_MAX_BYTES",
         &[],
@@ -485,6 +487,20 @@ fn render_template() -> String {
         &format!(
             "download_write_buffer_bytes = {}",
             engine.pipeline.download_write_buffer_bytes
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "download_connections = {}",
+            engine.pipeline.download_connections
+        ),
+    );
+    line(
+        &mut out,
+        &format!(
+            "download_chunk_bytes = {}",
+            engine.pipeline.download_chunk_bytes
         ),
     );
     line(
