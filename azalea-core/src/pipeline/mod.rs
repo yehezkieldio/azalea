@@ -23,6 +23,7 @@ mod process;
 pub mod quality;
 pub mod resolve;
 mod ssrf;
+mod stream_split;
 pub mod types;
 
 pub use errors::Error;

@@ -2,8 +2,11 @@
 //! Optimization and transcoding stage with size-aware strategy ladder.
 //!
 //! ## Algorithm overview
-//! Tries strategies from cheapest to most expensive (remux → transcode → split)
-//! until the output fits the configured upload size cap.
+//! Tries strategies from cheapest to most expensive (remux → transcode →
+//! stream-copy split → transcode split) until the output fits the configured
+//! upload size cap. Single-file outputs are preferred over splits; among
+//! splits, a keyframe-aligned stream copy (see [`super::stream_split`]) is
+//! tried before re-encoding whenever the codecs allow it.
 //!
 //! ## Trade-off acknowledgment
 //! The strategy ladder prioritizes latency over perfect quality; see
@@ -19,7 +22,10 @@ use crate::media::{TempFileCleanup, TempFileGuard};
 use crate::pipeline::disk::ensure_disk_space;
 use crate::pipeline::errors::{Error, TranscodeStage};
 use crate::pipeline::ffmpeg;
-use crate::pipeline::quality::{BitrateParams, Ladder, SplitTranscodePlan};
+use crate::pipeline::quality::{
+    BitrateParams, Ladder, MAX_SPLIT_ATTACHMENTS_PER_BATCH, SplitTranscodePlan,
+};
+use crate::pipeline::stream_split;
 use crate::pipeline::types::{
     AudioCodec, DownloadedFile, MediaType, PreparedPart, PreparedUpload, Progress, ResolvedMedia,
     VideoCodec,
@@ -259,6 +265,34 @@ pub async fn optimize(
                 }
                 downloaded._dir_guard = dir_guard;
             }
+            TranscodeStrategy::SplitCopy => {
+                // Never produce more parts than the transcode split would, so
+                // choosing the copy path cannot change the upload shape.
+                let max_parts = strategy_plan
+                    .split_transcode
+                    .map_or(MAX_SPLIT_ATTACHMENTS_PER_BATCH, |plan| {
+                        plan.estimated_segments
+                    });
+                match stream_split::split(&downloaded.path, config, max_parts)
+                    .instrument(tracing::info_span!(
+                        "optimize.strategy.split_copy",
+                        max_parts
+                    ))
+                    .await
+                {
+                    Ok(Some(segments)) => {
+                        let dir_guard = downloaded._dir_guard.take().ok_or_else(|| {
+                            Error::Io(std::io::Error::other("missing temp dir guard"))
+                        })?;
+                        return Ok(PreparedUpload::split(
+                            into_prepared_parts(segments, temp_files),
+                            dir_guard,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %e, "Stream-copy split failed"),
+                }
+            }
             TranscodeStrategy::SplitTranscode => {
                 let split_transcode_plan = strategy_plan.split_transcode.ok_or_else(|| {
                     Error::Io(std::io::Error::other("missing split-transcode plan"))
@@ -300,6 +334,7 @@ enum TranscodeStrategy {
     Remux,
     TranscodeBalanced,
     TranscodeAggressive,
+    SplitCopy,
     SplitTranscode,
     ImageCompress,
 }
@@ -311,6 +346,7 @@ impl std::fmt::Display for TranscodeStrategy {
             Self::Remux => "remux",
             Self::TranscodeBalanced => "transcode-balanced",
             Self::TranscodeAggressive => "transcode-aggressive",
+            Self::SplitCopy => "split-copy",
             Self::SplitTranscode => "split-transcode",
             Self::ImageCompress => "image-compress",
         };
@@ -388,12 +424,15 @@ fn build_strategy_plan(
         None
     };
 
+    let split_copy =
+        ffmpeg::mp4_stream_copy_viable(downloaded.facts).then_some(TranscodeStrategy::SplitCopy);
+
     let strategy_candidates = [
         remux,
         transcode_balanced,
         transcode_aggressive,
+        split_copy,
         split_transcode_strategy,
-        None,
         None,
     ];
     let mut strategies = [None; STRATEGY_PLAN_CAPACITY];
@@ -1202,9 +1241,9 @@ fn spawn_parallel_segment_task(
 }
 
 #[derive(Debug, Clone)]
-struct SegmentOutput {
-    path: PathBuf,
-    size: u64,
+pub(super) struct SegmentOutput {
+    pub(super) path: PathBuf,
+    pub(super) size: u64,
 }
 
 fn into_prepared_parts(
@@ -1483,8 +1522,8 @@ mod tests {
             [
                 Some(TranscodeStrategy::TranscodeBalanced),
                 Some(TranscodeStrategy::TranscodeAggressive),
+                Some(TranscodeStrategy::SplitCopy),
                 Some(TranscodeStrategy::SplitTranscode),
-                None,
                 None,
                 None,
             ]
@@ -1584,8 +1623,8 @@ mod tests {
         assert_eq!(
             plan.strategies,
             [
+                Some(TranscodeStrategy::SplitCopy),
                 Some(TranscodeStrategy::SplitTranscode),
-                None,
                 None,
                 None,
                 None,

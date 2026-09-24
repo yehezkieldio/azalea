@@ -30,7 +30,7 @@ pub struct SplitTranscodePlan {
     pub bitrate: BitrateParams,
 }
 
-const MAX_SPLIT_ATTACHMENTS_PER_BATCH: u32 = 10;
+pub(crate) const MAX_SPLIT_ATTACHMENTS_PER_BATCH: u32 = 10;
 
 impl BitrateParams {
     /// Compute bitrate targets given duration and size constraints.
