@@ -13,7 +13,9 @@
 //!    video keyframe in demux order.
 //! 2. Greedily cut at the furthest keyframe that keeps the current part under
 //!    the byte budget. Furthest-fit is optimal for the minimum number of
-//!    contiguous parts under a maximum size.
+//!    contiguous parts under a maximum size. Then binary-search the smallest
+//!    budget that still yields that count, which minimizes the largest part so
+//!    parts come out balanced instead of full-full-remainder.
 //! 3. Cut with ffmpeg's segment muxer at exactly those keyframe times.
 //! 4. Verify every output against the upload limit; any miss returns `None` so
 //!    the caller falls back to the transcode split.
@@ -57,7 +59,7 @@ pub(super) async fn split(
     let scan = scan_packets(input, config).await?;
     let budget = (config.transcode.max_upload_bytes as f64
         * (1.0 - config.transcode.container_overhead_ratio)) as u64;
-    let Some(cuts) = plan_cuts(&scan, budget) else {
+    let Some(cuts) = plan_balanced_cuts(&scan, budget) else {
         tracing::info!(
             budget,
             "Stream-copy split skipped: a keyframe interval exceeds the part budget"
@@ -181,6 +183,28 @@ fn parse_packets(stdout: &[u8]) -> PacketScan {
     scan
 }
 
+/// Minimum-part-count cuts with the smallest possible largest part.
+///
+/// ## Complexity
+/// O(k · log budget) for k keyframes; ~60 greedy passes over a few hundred
+/// keyframes, negligible next to the packet scan.
+fn plan_balanced_cuts(scan: &PacketScan, budget: u64) -> Option<Vec<f64>> {
+    let mut best = plan_cuts(scan, budget)?;
+    let parts = best.len();
+    let (mut low, mut high) = (scan.total_bytes.div_ceil(parts as u64 + 1), budget);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match plan_cuts(scan, mid) {
+            Some(cuts) if cuts.len() == parts => {
+                high = mid;
+                best = cuts;
+            }
+            _ => low = mid + 1,
+        }
+    }
+    Some(best)
+}
+
 /// Furthest-fit cut planning: returns cut times, or `None` when some
 /// keyframe interval alone exceeds `budget`.
 fn plan_cuts(scan: &PacketScan, budget: u64) -> Option<Vec<f64>> {
@@ -207,7 +231,7 @@ fn plan_cuts(scan: &PacketScan, budget: u64) -> Option<Vec<f64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CUT_EPSILON_SECS, PacketScan, parse_packets, plan_cuts};
+    use super::{CUT_EPSILON_SECS, PacketScan, parse_packets, plan_balanced_cuts, plan_cuts};
 
     #[test]
     fn parses_keyframe_offsets_in_demux_order() {
@@ -257,5 +281,20 @@ codec_type=audio|pts_time=2.000000|size=10|flags=K__\n";
             total_bytes: 200,
         };
         assert_eq!(plan_cuts(&tail, 100), None);
+    }
+
+    #[test]
+    fn balanced_cuts_keep_minimum_count_and_even_sizes() {
+        let scan = PacketScan {
+            keyframes: (1..20u32)
+                .map(|i| (f64::from(i), u64::from(i) * 10))
+                .collect(),
+            total_bytes: 200,
+        };
+        assert_eq!(plan_cuts(&scan, 190).map(|cuts| cuts.len()), Some(1));
+        assert_eq!(
+            plan_balanced_cuts(&scan, 190),
+            Some(vec![10.0 - CUT_EPSILON_SECS])
+        );
     }
 }
